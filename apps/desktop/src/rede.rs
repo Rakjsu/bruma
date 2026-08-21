@@ -38,12 +38,38 @@ pub enum Msg {
         servidor: String,
         entrada: blog::Entry,
     },
+    /// "Estou (ou deixei de estar) neste canal de voz."
+    Presenca {
+        servidor: String,
+        canal: Option<String>,
+    },
+    /// Sinalizacao WebRTC. O conteudo e opaco para o Rust: e SDP ou candidatos ICE que
+    /// so a webview sabe interpretar. Aqui so se encaminha para o peer certo.
+    Sinal {
+        servidor: String,
+        canal: String,
+        dados: String,
+    },
+}
+
+/// O que sai daqui para as sessoes abertas.
+#[derive(Clone, Debug)]
+pub enum Saida {
+    Entrada(String, blog::Entry),
+    Presenca(String, Option<String>),
+    /// Dirigido a UM peer. As outras sessoes ignoram.
+    Sinal {
+        para: String,
+        servidor: String,
+        canal: String,
+        dados: String,
+    },
 }
 
 pub struct Rede {
     pub endpoint: Endpoint,
     /// Entradas criadas localmente, para as sessões abertas difundirem.
-    pub tx: broadcast::Sender<(String, blog::Entry)>,
+    pub tx: broadcast::Sender<Saida>,
 }
 
 impl Rede {
@@ -113,7 +139,20 @@ impl Rede {
     pub fn difundir(&self, servidor: &str, entrada: blog::Entry) {
         // Falha em silêncio se ninguém estiver ligado, e está certo: fica no log local
         // e vai no próximo sync de quem aparecer.
-        let _ = self.tx.send((servidor.to_string(), entrada));
+        let _ = self.tx.send(Saida::Entrada(servidor.to_string(), entrada));
+    }
+
+    pub fn anunciar_presenca(&self, servidor: &str, canal: Option<String>) {
+        let _ = self.tx.send(Saida::Presenca(servidor.to_string(), canal));
+    }
+
+    pub fn enviar_sinal(&self, para: &str, servidor: &str, canal: &str, dados: String) {
+        let _ = self.tx.send(Saida::Sinal {
+            para: para.to_string(),
+            servidor: servidor.to_string(),
+            canal: canal.to_string(),
+            dados,
+        });
     }
 }
 
@@ -194,6 +233,22 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
                         &peer_leitura,
                     );
                 }
+                Ok(Msg::Presenca { servidor, canal }) => {
+                    let _ = leitura_janela.emit(
+                        "presenca",
+                        serde_json::json!({ "peer": &peer_leitura, "servidor": servidor, "canal": canal }),
+                    );
+                }
+                Ok(Msg::Sinal {
+                    servidor,
+                    canal,
+                    dados,
+                }) => {
+                    let _ = leitura_janela.emit(
+                        "sinal",
+                        serde_json::json!({ "de": &peer_leitura, "servidor": servidor, "canal": canal, "dados": dados }),
+                    );
+                }
                 Err(_) => break,
             }
         }
@@ -204,9 +259,20 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
         tokio::select! {
             _ = &mut leitor => break,
             got = sub.recv() => match got {
-                Ok((servidor, entrada)) => {
-                    if escrever(&mut envia, &Msg::Nova { servidor, entrada }).await.is_err() {
-                        break;
+                Ok(saida) => {
+                    let msg = match saida {
+                        Saida::Entrada(servidor, entrada) => Some(Msg::Nova { servidor, entrada }),
+                        Saida::Presenca(servidor, canal) => Some(Msg::Presenca { servidor, canal }),
+                        // Sinalizacao e dirigida: as outras sessoes deixam passar.
+                        Saida::Sinal { para, servidor, canal, dados } if para == peer => {
+                            Some(Msg::Sinal { servidor, canal, dados })
+                        }
+                        Saida::Sinal { .. } => None,
+                    };
+                    if let Some(m) = msg {
+                        if escrever(&mut envia, &m).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {

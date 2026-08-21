@@ -314,6 +314,39 @@ pub fn mensagens(servidor: String, canal: String, app: State<Arc<App>>) -> R<Vec
     Ok(srv.mensagens(&canal))
 }
 
+/// Anuncia a toda a gente que entrei (ou saí) de um canal de voz.
+///
+/// A presença é deliberadamente EFÉMERA: não vai para o log. Quem está numa sala agora não
+/// é história, é estado — e escrever isso no log encheria o histórico de ruído que ninguém
+/// quer reler.
+#[tauri::command]
+pub fn presenca_de_voz(servidor: String, canal: Option<String>, rede: State<Arc<Rede>>) -> R<()> {
+    rede.anunciar_presenca(&servidor, canal);
+    Ok(())
+}
+
+/// Encaminha sinalização WebRTC para UM peer.
+///
+/// O `dados` é opaco aqui: é SDP ou candidatos ICE que só a webview sabe ler. O Rust nunca
+/// os interpreta, só os entrega a quem é destinado.
+#[tauri::command]
+pub fn enviar_sinal(
+    para: String,
+    servidor: String,
+    canal: String,
+    dados: String,
+    rede: State<Arc<Rede>>,
+) -> R<()> {
+    rede.enviar_sinal(&para, &servidor, &canal, dados);
+    Ok(())
+}
+
+/// Quem sou eu na rede — os peers identificam-se por este valor na sinalização.
+#[tauri::command]
+pub fn meu_endereco(rede: State<Arc<Rede>>) -> R<String> {
+    Ok(rede.id().to_string())
+}
+
 /// Diagnóstico honesto: quantas entradas há e quantas estão sem pai.
 /// Enquanto houver órfãs, o histórico tem buracos e a interface deve dizê-lo.
 #[tauri::command]

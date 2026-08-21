@@ -45,6 +45,9 @@ fn main() {
             comandos::entrar_com_convite,
             comandos::enviar,
             comandos::mensagens,
+            comandos::presenca_de_voz,
+            comandos::enviar_sinal,
+            comandos::meu_endereco,
             comandos::saude,
         ])
         .run(tauri::generate_context!())

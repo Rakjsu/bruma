@@ -104,6 +104,7 @@ function desenharCanais() {
 
     for (const c of canais) {
       const b = elemento('button', 'chan');
+      b.dataset.canal = c.id;
       if (c.id === canalAtual) b.classList.add('is-active');
       const glifo = elemento('span', 'chan__glyph', tipo === 'voz' ? '♪' : '#');
       b.append(glifo, document.createTextNode(c.nome));
@@ -116,6 +117,21 @@ function desenharCanais() {
       b.append(x);
       b.onclick = () => escolherCanal(c.id);
       g.append(b);
+      if (tipo === 'voz') {
+        const dentro = [...voz.presentes.entries()].filter(([, k]) => k === c.id).map(([p]) => p);
+        if (voz.canal === c.id) dentro.unshift(voz.eu);
+        if (dentro.length) {
+          const lista = elemento('div', 'voice-members');
+          for (const p of dentro) {
+            const linha = elemento('div', 'vm');
+            const av = elemento('span', 'ident');
+            pintar(av, p);
+            linha.append(av, document.createTextNode(p === voz.eu ? 'tu' : nomeDoPeer(p)));
+            lista.append(linha);
+          }
+          g.append(lista);
+        }
+      }
     }
     lista.append(g);
   }
@@ -130,6 +146,7 @@ function desenharMembros() {
     s.membros.length === 1 ? '1 membro' : `${s.membros.length} membros`;
   for (const m of s.membros) {
     const linha = elemento('div', 'member');
+    linha.dataset.chave = m.chave;
     const av = elemento('span', 'ident');
     pintar(av, m.chave);
     const bloco = elemento('span');
@@ -171,15 +188,13 @@ async function desenharMensagens() {
 
   if (canal.tipo === 'voz') {
     stream.textContent = '';
-    const v = elemento('div', 'vazio');
-    v.append(elemento('h3', null, canal.nome));
-    v.append(elemento('p', null,
-      'Os canais de voz e a partilha de ecrã ainda não estão ligados nesta versão. ' +
-      'A captura já foi validada, falta o transporte entre peers.'));
-    stream.append(v);
+    stream.hidden = true;
     $('#composer').hidden = true;
+    desenharVoz();
     return;
   }
+  stream.hidden = false;
+  $('#vista-voz').hidden = true;
 
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
@@ -488,9 +503,384 @@ async function procurarAtualizacao() {
   }
 }
 
+/* ==========================================================================
+   Menu de contexto próprio.
+
+   O menu do WebView2 oferece "Guardar como", "Imprimir", "Enviar a guia para os
+   teus dispositivos" e "Inspecionar" — vocabulário de browser, não de aplicação.
+   Suprime-se e põe-se um que fale das coisas que existem aqui.
+   ========================================================================== */
+
+const menu = $('#menu');
+
+function abrirMenu(x, y, itens) {
+  menu.textContent = '';
+  for (const it of itens) {
+    if (it === '-') { menu.append(document.createElement('hr')); continue; }
+    const b = elemento('button', it.perigo ? 'perigo' : null, it.rotulo);
+    b.onclick = () => { menu.hidden = true; it.accao(); };
+    menu.append(b);
+  }
+  menu.hidden = false;
+  // Encostar ao rato, mas nunca sair do ecrã.
+  const l = Math.min(x, innerWidth - menu.offsetWidth - 8);
+  const t = Math.min(y, innerHeight - menu.offsetHeight - 8);
+  menu.style.left = `${Math.max(8, l)}px`;
+  menu.style.top = `${Math.max(8, t)}px`;
+}
+
+document.addEventListener('contextmenu', ev => {
+  ev.preventDefault();          // <- é isto que mata o menu do browser
+  const itens = [];
+
+  const msg = ev.target.closest('.msg');
+  const canal = ev.target.closest('.chan');
+  const membro = ev.target.closest('.member');
+  const seleccao = String(getSelection()).trim();
+
+  if (seleccao) {
+    itens.push({ rotulo: 'Copiar', accao: () => navigator.clipboard.writeText(seleccao) });
+  }
+  if (msg && !seleccao) {
+    const p = msg.querySelector('p');
+    const texto = p ? p.textContent : '';
+    itens.push({ rotulo: 'Copiar mensagem', accao: () => navigator.clipboard.writeText(texto) });
+  }
+  if (membro && membro.dataset.chave) {
+    const chave = membro.dataset.chave;
+    itens.push({ rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(chave) });
+  }
+  if (canal && canal.dataset.canal) {
+    const id = canal.dataset.canal;
+    if (itens.length) itens.push('-');
+    itens.push({
+      rotulo: 'Apagar canal', perigo: true,
+      accao: () => invoke('apagar_canal', { servidor: servidorAtual, canal: id }).catch(console.error),
+    });
+  }
+  if (servidorAtual && !canal && !msg && !membro) {
+    itens.push({ rotulo: 'Convidar alguém', accao: () => $('#btn-convite').click() });
+  }
+  if (itens.length) itens.push('-');
+  itens.push({ rotulo: 'Servidores de ligação…', accao: abrirDefinicoesDeRede });
+
+  abrirMenu(ev.clientX, ev.clientY, itens);
+});
+
+document.addEventListener('click', () => { menu.hidden = true; }, true);
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') menu.hidden = true; });
+
+/* ==========================================================================
+   Voz e partilha de ecrã.
+
+   A sinalização vai por cima do iroh, que já resolveu o NAT para o chat. O WebRTC
+   faz o seu próprio caminho para a média, e por isso pode precisar de TURN — daí
+   as definições de ligação.
+   ========================================================================== */
+
+const voz = {
+  eu: null,
+  servidor: null,
+  canal: null,
+  micro: null,
+  ecra: null,
+  pcs: new Map(),        // peer -> ligação
+  presentes: new Map(),  // peer -> canal em que está
+};
+
+function servidoresDeGelo() {
+  const bruto = (localStorage.getItem('bruma.ice') || '').trim();
+  if (!bruto) return [];
+  return bruto.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    // turn:utilizador:segredo@host:porta  ->  { urls, username, credential }
+    const m = l.match(/^(turns?):([^:@]+):([^@]+)@(.+)$/i);
+    if (m) return { urls: `${m[1]}:${m[4]}`, username: m[2], credential: m[3] };
+    return { urls: l };
+  });
+}
+
+function abrirDefinicoesDeRede() {
+  $('#in-ice').value = localStorage.getItem('bruma.ice') || '';
+  erroEm('erro-rede', '');
+  abrir('veu-rede');
+}
+$('#fechar-rede').onclick = () => fechar('veu-rede');
+$('#ok-rede').onclick = () => {
+  localStorage.setItem('bruma.ice', $('#in-ice').value.trim());
+  fechar('veu-rede');
+  desenharVoz();
+};
+
+async function entrarEmVoz(servidor, canal) {
+  if (voz.canal === canal) return;
+  await sairDeVoz(false);
+  voz.servidor = servidor;
+  voz.canal = canal;
+  // Desenhar JA, antes de pedir o microfone. O pedido de autorizacao pode ficar minutos
+  // a espera de resposta -- ou nunca ser respondido -- e ate la a app parecia presa a
+  // dizer "nao estas nesta sala" quando ja estava.
+  desenharVoz();
+  desenharCanais();
+  await invoke('presenca_de_voz', { servidor, canal }).catch(console.error);
+
+  try {
+    // Com limite de tempo: se ninguem responder ao pedido, entra-se sem microfone em vez
+    // de ficar pendurado para sempre.
+    voz.micro = await Promise.race([
+      navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('sem resposta ao pedido')), 20000)),
+    ]);
+    if (voz.canal !== canal) {          // saiu enquanto se esperava
+      voz.micro.getTracks().forEach(t => t.stop());
+      voz.micro = null;
+      return;
+    }
+    // O microfone chegou depois das ligacoes: junta-se a elas.
+    for (const [, l] of voz.pcs) {
+      voz.micro.getTracks().forEach(t => l.pc.addTrack(t, voz.micro));
+    }
+  } catch (e) {
+    // Sem microfone continua a dar para ouvir e para partilhar ecra.
+    console.warn('sem microfone:', e);
+    voz.micro = null;
+  }
+  // Quem já lá estava: liga-se agora.
+  for (const [peer, c] of voz.presentes) {
+    if (c === canal) garantirLigacao(peer);
+  }
+  desenharVoz();
+}
+
+async function sairDeVoz(anunciar = true) {
+  if (anunciar && voz.canal) {
+    await invoke('presenca_de_voz', { servidor: voz.servidor, canal: null }).catch(() => {});
+  }
+  for (const [, l] of voz.pcs) l.pc.close();
+  voz.pcs.clear();
+  if (voz.micro) voz.micro.getTracks().forEach(t => t.stop());
+  if (voz.ecra) voz.ecra.getTracks().forEach(t => t.stop());
+  voz.micro = null; voz.ecra = null;
+  voz.canal = null;
+  desenharVoz();
+}
+
+function garantirLigacao(peer) {
+  if (voz.pcs.has(peer)) return voz.pcs.get(peer);
+  const pc = new RTCPeerConnection({ iceServers: servidoresDeGelo() });
+  // "Negociação perfeita": quem tem o identificador maior cede em caso de choque.
+  // Sem isto, duas ofertas em simultâneo deixam a ligação num estado impossível.
+  const l = { pc, educado: voz.eu > peer, aFazerOferta: false, ignorarOferta: false, stream: null };
+  voz.pcs.set(peer, l);
+
+  if (voz.micro) voz.micro.getTracks().forEach(t => pc.addTrack(t, voz.micro));
+  if (voz.ecra) voz.ecra.getTracks().forEach(t => pc.addTrack(t, voz.ecra));
+
+  pc.onicecandidate = e => {
+    if (e.candidate) sinalizar(peer, { tipo: 'ice', candidato: e.candidate });
+  };
+  pc.ontrack = e => { l.stream = e.streams[0]; desenharVoz(); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      voz.pcs.delete(peer);
+      desenharVoz();
+    }
+  };
+  pc.onnegotiationneeded = async () => {
+    try {
+      l.aFazerOferta = true;
+      await pc.setLocalDescription();
+      sinalizar(peer, { tipo: 'sdp', sdp: pc.localDescription });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      l.aFazerOferta = false;
+    }
+  };
+  return l;
+}
+
+function sinalizar(peer, dados) {
+  invoke('enviar_sinal', {
+    para: peer, servidor: voz.servidor, canal: voz.canal, dados: JSON.stringify(dados),
+  }).catch(console.error);
+}
+
+async function receberSinal(de, dados) {
+  const l = garantirLigacao(de);
+  const pc = l.pc;
+  try {
+    if (dados.tipo === 'sdp') {
+      const desc = dados.sdp;
+      const choque = desc.type === 'offer' && (l.aFazerOferta || pc.signalingState !== 'stable');
+      l.ignorarOferta = !l.educado && choque;
+      if (l.ignorarOferta) return;
+      await pc.setRemoteDescription(desc);
+      if (desc.type === 'offer') {
+        await pc.setLocalDescription();
+        sinalizar(de, { tipo: 'sdp', sdp: pc.localDescription });
+      }
+    } else if (dados.tipo === 'ice') {
+      try {
+        await pc.addIceCandidate(dados.candidato);
+      } catch (e) {
+        if (!l.ignorarOferta) throw e;
+      }
+    }
+  } catch (e) {
+    console.error('sinal:', e);
+  }
+}
+
+async function alternarEcra() {
+  if (voz.ecra) {
+    voz.ecra.getTracks().forEach(t => t.stop());
+    voz.ecra = null;
+    for (const [, l] of voz.pcs) {
+      l.pc.getSenders()
+        .filter(s => s.track && s.track.kind === 'video')
+        .forEach(s => l.pc.removeTrack(s));
+    }
+    desenharVoz();
+    return;
+  }
+  try {
+    voz.ecra = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30 } }, audio: true,
+    });
+  } catch (e) {
+    return;   // cancelou o picker
+  }
+  // O hint diz ao encoder que isto é conteúdo de ecrã, não uma câmara.
+  voz.ecra.getVideoTracks().forEach(t => { t.contentHint = 'text'; });
+  voz.ecra.getVideoTracks()[0].addEventListener('ended', () => {
+    voz.ecra = null;
+    desenharVoz();
+  });
+  for (const [, l] of voz.pcs) {
+    voz.ecra.getTracks().forEach(t => l.pc.addTrack(t, voz.ecra));
+  }
+  desenharVoz();
+}
+
+function nomeDoPeer(peer) {
+  const s = servidor();
+  const m = s && s.membros.find(x => x.chave === peer);
+  return m ? m.nome : `${peer.slice(0, 6)}…`;
+}
+
+function painelDeVoz(chave, rotulo, stream) {
+  const t = elemento('div', 'tile');
+  const temVideo = stream && stream.getVideoTracks().length > 0;
+  if (temVideo) {
+    const el = document.createElement('video');
+    el.autoplay = true;
+    el.playsInline = true;
+    el.muted = chave === voz.eu;      // nunca ouvir o próprio microfone
+    el.srcObject = stream;
+    t.append(el);
+  } else {
+    const sem = elemento('div', 'tile__sem-video');
+    const av = elemento('span', 'ident');
+    pintar(av, chave);
+    sem.append(av, elemento('span', null, stream ? 'só áudio' : 'a ligar…'));
+    t.append(sem);
+    if (stream) {
+      const a = document.createElement('audio');
+      a.autoplay = true;
+      a.srcObject = stream;
+      a.muted = chave === voz.eu;
+      t.append(a);
+    }
+  }
+  t.append(elemento('span', 'tile__nome', rotulo));
+  return t;
+}
+
+function desenharVoz() {
+  const s = servidor();
+  const canal = s && s.canais.find(c => c.id === canalAtual);
+  const eDeVoz = canal && canal.tipo === 'voz';
+  $('#vista-voz').hidden = !eDeVoz;
+  if (!eDeVoz) return;
+
+  const ligado = voz.canal === canal.id;
+  const outros = [...voz.presentes.entries()].filter(([, c]) => c === canal.id).map(([p]) => p);
+
+  $('#voz-estado').textContent = ligado
+    ? (outros.length
+        ? `Na sala com ${outros.length === 1 ? '1 pessoa' : outros.length + ' pessoas'}.`
+        : 'Estás sozinho nesta sala. Quando alguém entrar, ligam-se automaticamente.')
+    : 'Não estás nesta sala.';
+
+  const trackMicro = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  $('#btn-micro').textContent = trackMicro
+    ? (trackMicro.enabled ? 'Microfone ligado' : 'Microfone silenciado')
+    : 'Sem microfone';
+  $('#btn-micro').disabled = !ligado || !trackMicro;
+  $('#btn-ecra').textContent = voz.ecra ? 'Parar de partilhar' : 'Partilhar ecrã';
+  $('#btn-ecra').disabled = !ligado;
+  $('#btn-sair-voz').style.display = ligado ? '' : 'none';
+
+  const grelha = $('#voz-grelha');
+  grelha.textContent = '';
+
+  if (!ligado) {
+    const v = elemento('div', 'vazio');
+    v.append(elemento('h3', null, canal.nome));
+    v.append(elemento('p', null, 'Entra para falar e partilhar o ecrã com quem estiver aqui.'));
+    const b = elemento('button', 'btn btn--primary', 'Entrar na sala');
+    b.onclick = () => entrarEmVoz(s.id, canal.id);
+    v.append(b);
+    grelha.append(v);
+    $('#voz-nota').textContent = '';
+    return;
+  }
+
+  grelha.append(painelDeVoz(voz.eu, voz.ecra ? 'tu · a partilhar' : 'tu', voz.ecra || voz.micro));
+  for (const p of outros) {
+    const l = voz.pcs.get(p);
+    grelha.append(painelDeVoz(p, nomeDoPeer(p), l ? l.stream : null));
+  }
+
+  const ice = servidoresDeGelo().length;
+  $('#voz-nota').textContent = ice
+    ? `${ice} servidor(es) de ligação configurado(s).`
+    : 'Sem servidores de ligação, isto só liga entre máquinas na mesma rede local. ' +
+      'Botão direito → Servidores de ligação para configurar um TURN.';
+}
+
+$('#btn-micro').onclick = () => {
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  if (t) { t.enabled = !t.enabled; desenharVoz(); }
+};
+$('#btn-ecra').onclick = alternarEcra;
+$('#btn-sair-voz').onclick = () => sairDeVoz();
+
+listen('presenca', ev => {
+  const { peer, canal } = ev.payload;
+  if (canal) voz.presentes.set(peer, canal); else voz.presentes.delete(peer);
+  if (voz.canal && canal === voz.canal) garantirLigacao(peer);
+  if (voz.canal && !canal && voz.pcs.has(peer)) {
+    voz.pcs.get(peer).pc.close();
+    voz.pcs.delete(peer);
+  }
+  desenharVoz();
+  desenharCanais();
+});
+
+listen('sinal', ev => {
+  const { de, canal, dados } = ev.payload;
+  if (canal !== voz.canal) return;
+  try { receberSinal(de, JSON.parse(dados)); } catch (e) { console.error(e); }
+});
+
 /* ---------- arranque ---------- */
 
+
 (async () => {
+  voz.eu = await invoke('meu_endereco').catch(() => null);
   await desenharTudo();
   if (!vista.nome) {
     abrir('veu-bemvindo');

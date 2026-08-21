@@ -63,6 +63,20 @@
 
     <section class="stream" id="stream"></section>
 
+    <!-- vista de voz -->
+    <section class="voz" id="vista-voz" hidden>
+      <div class="voz__barra">
+        <span class="voz__estado" id="voz-estado">—</span>
+        <div class="voz__acoes">
+          <button class="btn" id="btn-micro" title="Silenciar o microfone">Microfone ligado</button>
+          <button class="btn btn--primary" id="btn-ecra">Partilhar ecrã</button>
+          <button class="btn" id="btn-sair-voz">Sair</button>
+        </div>
+      </div>
+      <div class="voz__grelha" id="voz-grelha"></div>
+      <div class="voz__nota" id="voz-nota"></div>
+    </section>
+
     <footer class="composer" id="composer" hidden>
       <div class="composer__box">
         <input id="entrada" placeholder="Mensagem" autocomplete="off">
@@ -85,6 +99,9 @@
     <button class="btn btn--primary" id="btn-update">Atualizar e reiniciar</button>
     <button class="btn" id="adiar-update">Agora não</button>
   </div>
+
+  <!-- menu de contexto proprio: o do browser nao pertence a uma app -->
+  <div class="menu" id="menu" hidden></div>
 
   <div class="explica" id="explica" hidden>
     <div class="explica__titulo" id="explica-titulo"></div>
@@ -158,6 +175,27 @@
       <span class="copiado" id="copiado"></span>
       <button class="btn" id="fechar-convite">Fechar</button>
       <button class="btn btn--primary" id="copiar-convite">Copiar</button>
+    </div>
+  </div>
+</div>
+
+<div class="veu" id="veu-rede" hidden>
+  <div class="caixa">
+    <h2>Servidores de ligação</h2>
+    <p>
+      A voz e o ecrã usam WebRTC, que precisa de ajuda para atravessar routers. Sem isto só
+      funciona entre máquinas na mesma rede local.
+    </p>
+    <div class="aviso">
+      Para funcionar entre casas — sobretudo <b>EUA ↔ Brasil</b> — é preciso um servidor TURN.
+      Um <code>coturn</code> numa VPS resolve, e o tráfego que passa por lá vai cifrado.
+    </div>
+    <label for="in-ice">Um por linha: <code>stun:host:porta</code> ou <code>turn:user:pass@host:porta</code></label>
+    <textarea id="in-ice" placeholder="turn:bruma:segredo@exemplo.com:3478"></textarea>
+    <div class="caixa__erro" id="erro-rede"></div>
+    <div class="caixa__acoes">
+      <button class="btn" id="fechar-rede">Cancelar</button>
+      <button class="btn btn--primary" id="ok-rede">Guardar</button>
     </div>
   </div>
 </div>
