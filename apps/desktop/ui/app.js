@@ -147,6 +147,7 @@ function desenharMembros() {
   for (const m of s.membros) {
     const linha = elemento('div', 'member');
     linha.dataset.chave = m.chave;
+    if (voz.falando.has(m.chave)) linha.classList.add('a-falar');
     const av = elemento('span', 'ident');
     pintar(av, m.chave);
     const bloco = elemento('span');
@@ -588,6 +589,12 @@ const voz = {
   camara: null,
   pcs: new Map(),        // peer -> ligação
   presentes: new Map(),  // peer -> canal em que está
+  falando: new Set(),    // quem está a emitir som agora
+  silenciados: new Set(),// pessoas silenciadas uma a uma
+  aPartilhar: new Set(), // quem está a transmitir o ecrã
+  aVer: null,            // de quem estou a ver a transmissão
+  analisadores: new Map(),
+  audioCtx: null,
 };
 
 function servidoresDeGelo() {
@@ -643,6 +650,8 @@ async function entrarEmVoz(servidor, canal) {
     for (const [, l] of voz.pcs) {
       voz.micro.getTracks().forEach(t => l.pc.addTrack(t, voz.micro));
     }
+    vigiarAudio(voz.eu, voz.micro);
+    desenharVoz();
   } catch (e) {
     // Sem microfone continua a dar para ouvir e para partilhar ecra.
     console.warn('sem microfone:', e);
@@ -664,6 +673,10 @@ async function sairDeVoz(anunciar = true) {
   if (voz.micro) voz.micro.getTracks().forEach(t => t.stop());
   if (voz.ecra) voz.ecra.getTracks().forEach(t => t.stop());
   if (voz.camara) voz.camara.getTracks().forEach(t => t.stop());
+  for (const chave of [...voz.analisadores.keys()]) pararDeVigiar(chave);
+  voz.falando.clear();
+  voz.aPartilhar.clear();
+  voz.aVer = null;
   voz.micro = null; voz.ecra = null; voz.camara = null;
   voz.canal = null;
   desenharVoz();
@@ -685,7 +698,11 @@ function garantirLigacao(peer) {
   pc.onicecandidate = e => {
     if (e.candidate) sinalizar(peer, { tipo: 'ice', candidato: e.candidate });
   };
-  pc.ontrack = e => { l.stream = e.streams[0]; desenharVoz(); };
+  pc.ontrack = e => {
+    l.stream = e.streams[0];
+    vigiarAudio(peer, l.stream);
+    desenharVoz();
+  };
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       voz.pcs.delete(peer);
@@ -703,6 +720,8 @@ function garantirLigacao(peer) {
       l.aFazerOferta = false;
     }
   };
+  // Um peer que chega tem de saber o que ja estou a enviar.
+  setTimeout(() => sinalizar(peer, { tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara }), 400);
   return l;
 }
 
@@ -726,6 +745,11 @@ async function receberSinal(de, dados) {
         await pc.setLocalDescription();
         sinalizar(de, { tipo: 'sdp', sdp: pc.localDescription });
       }
+    } else if (dados.tipo === 'estado') {
+      if (dados.ecra) voz.aPartilhar.add(de); else voz.aPartilhar.delete(de);
+      if (voz.aVer === de && !dados.ecra) voz.aVer = null;
+      desenharVoz();
+      return;
     } else if (dados.tipo === 'ice') {
       try {
         await pc.addIceCandidate(dados.candidato);
@@ -747,6 +771,7 @@ async function alternarEcra() {
         .filter(s => s.track && s.track.kind === 'video')
         .forEach(s => l.pc.removeTrack(s));
     }
+    anunciarEstado();
     desenharVoz();
     return;
   }
@@ -766,44 +791,157 @@ async function alternarEcra() {
   for (const [, l] of voz.pcs) {
     voz.ecra.getTracks().forEach(t => l.pc.addTrack(t, voz.ecra));
   }
+  anunciarEstado();
   desenharVoz();
 }
 
 function nomeDoPeer(peer) {
+  if (peer === voz.eu) return 'tu';
   const s = servidor();
   const m = s && s.membros.find(x => x.chave === peer);
   return m ? m.nome : `${peer.slice(0, 6)}…`;
 }
 
-function painelDeVoz(chave, rotulo, stream) {
+/** Um painel da grelha da chamada.
+ *
+ *  Três estados possíveis, e são mesmo diferentes:
+ *   - a transmitir: a foto sai da frente e fica o convite para assistir;
+ *   - com vídeo a ser visto: o vídeo ocupa tudo;
+ *   - sem vídeo: a foto, com anel verde quando a pessoa fala.
+ */
+function painelDeVoz(chave, stream, opcoes = {}) {
   const t = elemento('div', 'tile');
+  t.dataset.chave = chave;
+  if (voz.falando.has(chave)) t.classList.add('a-falar');
+
+  const transmite = voz.aPartilhar.has(chave) || (chave === voz.eu && !!voz.ecra);
+  const aVer = opcoes.aVer;
   const temVideo = stream && stream.getVideoTracks().length > 0;
-  if (temVideo) {
+
+  if (transmite && !aVer) {
+    // Enquanto não se carrega em Assistir, não se descodifica nada: poupa CPU de quem
+    // está na sala só para ouvir, que é a maioria das vezes.
+    const bloco = elemento('div', 'tile__transmite');
+    const marca = elemento('span', 'ident');
+    pintar(marca, chave);
+    bloco.append(marca);
+    bloco.append(elemento('b', null, `${nomeDoPeer(chave)} está a transmitir`));
+    if (chave !== voz.eu) {
+      const b = elemento('button', 'btn btn--primary', 'Assistir');
+      b.onclick = () => assistir(chave);
+      bloco.append(b);
+    } else {
+      bloco.append(elemento('span', 'tile__dica', 'os outros veem o teu ecrã'));
+    }
+    t.append(bloco);
+  } else if (temVideo) {
     const el = document.createElement('video');
     el.autoplay = true;
     el.playsInline = true;
-    el.muted = chave === voz.eu;      // nunca ouvir o próprio microfone
-    if (chave === voz.eu) el.dataset.proprio = '1';
-    else el.muted = surdo;
+    if (chave === voz.eu) { el.muted = true; el.dataset.proprio = '1'; }
+    else el.muted = surdo || voz.silenciados.has(chave);
     el.srcObject = stream;
     t.append(el);
   } else {
     const sem = elemento('div', 'tile__sem-video');
     const av = elemento('span', 'ident');
     pintar(av, chave);
-    sem.append(av, elemento('span', null, stream ? 'só áudio' : 'a ligar…'));
+    sem.append(av);
+    // Só se escreve alguma coisa quando ainda NÃO há ligação. "Só áudio" seria
+    // ruído: a foto sozinha já diz que não há vídeo.
+    if (!stream) sem.append(elemento('span', null, 'a ligar…'));
     t.append(sem);
-    if (stream) {
-      const a = document.createElement('audio');
-      a.autoplay = true;
-      a.srcObject = stream;
-      a.muted = chave === voz.eu || surdo;
-      if (chave === voz.eu) a.dataset.proprio = '1';
-      t.append(a);
-    }
   }
-  t.append(elemento('span', 'tile__nome', rotulo));
+
+  t.append(elemento('span', 'tile__nome', nomeDoPeer(chave)));
+  t.append(accoesDoPainel(chave, { transmite, aVer, temVideo }));
   return t;
+}
+
+/** Dimensiona a grelha da chamada.
+ *
+ *  O CSS sozinho não chega: com `auto-fit` uma pessoa sozinha ficava com um painel do
+ *  tamanho do ecrã e a foto perdida no meio. Aqui calcula-se quantas colunas fazem sentido
+ *  e qual o lado máximo que ainda deixa todas as linhas caberem na altura disponível —
+ *  portanto os painéis encolhem sozinhos à medida que as pessoas entram, e nunca há scroll.
+ */
+function ajustarGrelha(n) {
+  const g = $('#voz-grelha');
+  if (!g || n < 1) return;
+  const ESPACO = 12;
+  const RACIO = 16 / 10;
+  const MAXIMO = 460;   // uma pessoa sozinha não precisa de um painel gigante
+
+  const colunas = Math.ceil(Math.sqrt(n));
+  const linhas = Math.ceil(n / colunas);
+  const alturaUtil = (g.clientHeight - (linhas - 1) * ESPACO) / linhas;
+  const larguraUtil = (g.clientWidth - (colunas - 1) * ESPACO) / colunas;
+  const lado = Math.min(alturaUtil * RACIO, larguraUtil, MAXIMO);
+
+  g.style.setProperty('--colunas', colunas);
+  g.style.setProperty('--lado', `${Math.max(140, Math.floor(lado))}px`);
+}
+
+/** Mantém um <audio> por peer, fora da grelha e imune a redesenhos. */
+function sincronizarAudios() {
+  const caixa = $('#audios');
+  if (!caixa) return;
+  const vivos = new Set();
+  for (const [peer, l] of voz.pcs) {
+    if (!l.stream || !l.stream.getAudioTracks().length) continue;
+    vivos.add(peer);
+    let el = caixa.querySelector(`audio[data-chave="${peer}"]`);
+    if (!el) {
+      el = document.createElement('audio');
+      el.dataset.chave = peer;
+      el.autoplay = true;
+      caixa.append(el);
+    }
+    if (el.srcObject !== l.stream) el.srcObject = l.stream;
+    el.muted = surdo || voz.silenciados.has(peer);
+  }
+  caixa.querySelectorAll('audio').forEach(el => {
+    if (!vivos.has(el.dataset.chave)) { el.srcObject = null; el.remove(); }
+  });
+}
+
+/** Os botões que aparecem quando o rato passa por cima de um painel.
+ *
+ *  Só mostram o que faz sentido para aquela pessoa naquele momento: não há botão de
+ *  silenciar no próprio painel, nem de assistir a quem não está a transmitir.
+ */
+function accoesDoPainel(chave, { transmite, aVer, temVideo }) {
+  const barra = elemento('div', 'tile__acoes');
+  const botao = (rotulo, titulo, accao, ligado) => {
+    const b = elemento('button', ligado ? 'tile__bt is-on' : 'tile__bt', rotulo);
+    b.title = titulo;
+    b.onclick = ev => { ev.stopPropagation(); accao(); };
+    return b;
+  };
+
+  if (transmite && chave !== voz.eu) {
+    barra.append(aVer
+      ? botao('▣', 'Voltar à sala', pararDeAssistir)
+      : botao('▸', 'Assistir à transmissão', () => assistir(chave)));
+  }
+
+  if (aVer && temVideo) {
+    barra.append(botao('⛶', 'Ecrã inteiro', () => {
+      const v = document.querySelector(`.tile[data-chave="${chave}"] video`);
+      if (v) (document.fullscreenElement ? document.exitFullscreen() : v.requestFullscreen());
+    }));
+  }
+
+  if (chave !== voz.eu) {
+    const mudo = voz.silenciados.has(chave);
+    barra.append(botao(mudo ? '🔇' : '🔊', mudo ? 'Voltar a ouvir' : 'Silenciar esta pessoa', () => {
+      if (mudo) voz.silenciados.delete(chave); else voz.silenciados.add(chave);
+      sincronizarAudios();
+      desenharVoz();
+    }, mudo));
+  }
+
+  return barra;
 }
 
 function desenharVoz() {
@@ -811,6 +949,8 @@ function desenharVoz() {
   const canal = s && s.canais.find(c => c.id === canalAtual);
   const eDeVoz = canal && canal.tipo === 'voz';
   $('#vista-voz').hidden = !eDeVoz;
+  desenharNaChamada();
+  sincronizarAudios();
   if (!eDeVoz) return;
 
   const ligado = voz.canal === canal.id;
@@ -833,6 +973,7 @@ function desenharVoz() {
 
   const grelha = $('#voz-grelha');
   grelha.textContent = '';
+  grelha.classList.toggle('esta-a-ver', !!voz.aVer);
 
   if (!ligado) {
     const v = elemento('div', 'vazio');
@@ -846,10 +987,25 @@ function desenharVoz() {
     return;
   }
 
-  grelha.append(painelDeVoz(voz.eu, voz.ecra ? 'tu · a partilhar' : 'tu', voz.ecra || voz.camara || voz.micro));
+  // A ver a transmissão de alguém: o ecrã dessa pessoa ocupa tudo e as fotinhas saem.
+  if (voz.aVer) {
+    const l = voz.pcs.get(voz.aVer);
+    const barra = elemento('div', 'assistindo');
+    const voltar = elemento('button', 'btn', '← Voltar à sala');
+    voltar.onclick = pararDeAssistir;
+    barra.append(voltar);
+    barra.append(elemento('span', 'assistindo__quem', `a ver ${nomeDoPeer(voz.aVer)}`));
+    grelha.append(barra);
+    grelha.append(painelDeVoz(voz.aVer, l ? l.stream : null, { aVer: true }));
+    $('#voz-nota').textContent = '';
+    return;
+  }
+
+  ajustarGrelha(outros.length + 1);
+  grelha.append(painelDeVoz(voz.eu, voz.ecra || voz.camara || voz.micro));
   for (const p of outros) {
     const l = voz.pcs.get(p);
-    grelha.append(painelDeVoz(p, nomeDoPeer(p), l ? l.stream : null));
+    grelha.append(painelDeVoz(p, l ? l.stream : null));
   }
 
   const ice = servidoresDeGelo().length;
@@ -857,6 +1013,43 @@ function desenharVoz() {
     ? `${ice} servidor(es) de ligação configurado(s).`
     : 'Sem servidores de ligação, isto só liga entre máquinas na mesma rede local. ' +
       'Botão direito → Servidores de ligação para configurar um TURN.';
+}
+
+/** A lista lateral de quem está na chamada, com o anel verde de quem fala. */
+function desenharNaChamada() {
+  const alvo = $('#na-chamada');
+  if (!alvo) return;
+  if (!voz.canal) { alvo.hidden = true; alvo.textContent = ''; return; }
+
+  const s = vista.servidores.find(x => x.id === voz.servidor);
+  const canal = s && s.canais.find(c => c.id === voz.canal);
+  const gente = [voz.eu, ...[...voz.presentes.entries()]
+    .filter(([, c]) => c === voz.canal).map(([p]) => p)];
+
+  alvo.hidden = false;
+  alvo.textContent = '';
+  alvo.append(elemento('div', 'members__label',
+    `Na chamada · ${canal ? canal.nome : ''}`));
+
+  for (const p of gente) {
+    const linha = elemento('div', 'member member--chamada');
+    linha.dataset.chave = p;
+    if (voz.falando.has(p)) linha.classList.add('a-falar');
+    const av = elemento('span', 'ident');
+    pintar(av, p);
+    const bloco = elemento('span');
+    bloco.append(elemento('b', null, nomeDoPeer(p)));
+    const transmite = voz.aPartilhar.has(p) || (p === voz.eu && !!voz.ecra);
+    bloco.append(elemento('i', null, transmite ? 'a transmitir' : 'na chamada'));
+    linha.append(av, bloco);
+    if (transmite && p !== voz.eu) {
+      const b = elemento('button', 'chan__x chan__x--ver', '▸');
+      b.title = 'Assistir';
+      b.onclick = ev => { ev.stopPropagation(); assistir(p); };
+      linha.append(b);
+    }
+    alvo.append(linha);
+  }
 }
 
 $('#btn-micro').onclick = () => {
@@ -997,7 +1190,8 @@ $('#btn-surdo').onclick = () => {
   // Ficar surdo silencia tudo o que entra E o próprio microfone, como no Discord:
   // não faz sentido continuar a falar para quem não se consegue ouvir a responder.
   surdo = !surdo;
-  document.querySelectorAll('#voz-grelha audio, #voz-grelha video').forEach(el => {
+  document.querySelectorAll('#audios audio').forEach(el => { el.muted = surdo; });
+  document.querySelectorAll('#voz-grelha video').forEach(el => {
     if (!el.dataset.proprio) el.muted = surdo;
   });
   const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
@@ -1046,12 +1240,103 @@ $('#btn-camara').onclick = async () => {
       voz.camara.getTracks().forEach(t => l.pc.addTrack(t, voz.camara));
     }
   }
+  anunciarEstado();
   desenharVoz();
   desenharRodape();
 };
 
 // A ligação muda de qualidade sozinha; o rodapé acompanha.
 setInterval(() => { if (voz.canal) desenharRodape(); }, 3000);
+
+/* ==========================================================================
+   Vista de chamada: quem está, quem fala, e quem transmite.
+   ========================================================================== */
+
+/** Deteção de fala.
+ *
+ *  Não se pergunta ao WebRTC se alguém está a falar — ele não sabe. Mede-se a energia
+ *  do áudio com a Web Audio API, e usa-se histerese: entra em "a falar" acima de um
+ *  limiar e só sai abaixo de outro mais baixo. Sem isso o anel verde pisca em cada
+ *  pausa entre sílabas, que é pior do que não o ter.
+ */
+const LIMIAR_ENTRA = 0.045;
+const LIMIAR_SAI = 0.022;
+
+function vigiarAudio(chave, stream) {
+  pararDeVigiar(chave);
+  if (!stream || !stream.getAudioTracks().length) return;
+  try {
+    if (!voz.audioCtx) voz.audioCtx = new AudioContext();
+    if (voz.audioCtx.state === 'suspended') voz.audioCtx.resume();
+    const fonte = voz.audioCtx.createMediaStreamSource(stream);
+    const an = voz.audioCtx.createAnalyser();
+    an.fftSize = 512;
+    an.smoothingTimeConstant = 0.4;
+    fonte.connect(an);
+    voz.analisadores.set(chave, { an, fonte, dados: new Float32Array(an.fftSize) });
+  } catch (e) {
+    console.warn('não consegui vigiar o áudio de', chave, e);
+  }
+}
+
+function pararDeVigiar(chave) {
+  const a = voz.analisadores.get(chave);
+  if (!a) return;
+  try { a.fonte.disconnect(); } catch (e) { /* já desligado */ }
+  voz.analisadores.delete(chave);
+  voz.falando.delete(chave);
+}
+
+function medirFala() {
+  if (!voz.canal || !voz.analisadores.size) return;
+  for (const [chave, a] of voz.analisadores) {
+    a.an.getFloatTimeDomainData(a.dados);
+    let soma = 0;
+    for (let i = 0; i < a.dados.length; i++) soma += a.dados[i] * a.dados[i];
+    const rms = Math.sqrt(soma / a.dados.length);
+
+    // O microfone silenciado nunca "fala", por mais barulho que haja na sala.
+    const proprioSilenciado =
+      chave === voz.eu && (!voz.micro || !voz.micro.getAudioTracks()[0]?.enabled);
+
+    const estava = voz.falando.has(chave);
+    const agora = proprioSilenciado ? false : (estava ? rms > LIMIAR_SAI : rms > LIMIAR_ENTRA);
+    if (agora === estava) continue;
+
+    if (agora) voz.falando.add(chave); else voz.falando.delete(chave);
+    // Mexe-se nas classes diretamente: redesenhar tudo dez vezes por segundo daria
+    // um piscar constante e mataria a lista de mensagens.
+    document.querySelectorAll(`[data-chave="${chave}"]`).forEach(el => {
+      el.classList.toggle('a-falar', agora);
+    });
+  }
+}
+setInterval(medirFala, 120);
+
+// A janela muda de tamanho, os painéis acompanham.
+addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
+
+/* --- estado partilhado entre peers ----------------------------------------- */
+
+/** Diz a toda a gente na sala o que estou a enviar. O WebRTC não distingue um ecrã
+ *  de uma câmara do outro lado, portanto quem envia é que tem de contar. */
+function anunciarEstado() {
+  for (const peer of voz.pcs.keys()) {
+    sinalizar(peer, { tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara });
+  }
+}
+
+/* --- assistir a uma transmissão -------------------------------------------- */
+
+function assistir(peer) {
+  voz.aVer = peer;
+  desenharVoz();
+}
+
+function pararDeAssistir() {
+  voz.aVer = null;
+  desenharVoz();
+}
 
 /* ---------- arranque ---------- */
 

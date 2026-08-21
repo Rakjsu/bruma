@@ -682,10 +682,13 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .voz__acoes { display: flex; gap: 8px; }
 
 .voz__grelha {
-  flex: 1; min-height: 0; overflow-y: auto;
+  flex: 1; min-height: 0; overflow: hidden;
   display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  align-content: start;
+  /* As colunas e o lado vêm do JS: só ele sabe quantas pessoas há e quanto
+     espaço sobra. O CSS sozinho fazia um painel do tamanho do ecrã para uma
+     pessoa só. */
+  grid-template-columns: repeat(var(--colunas, 1), var(--lado, 320px));
+  align-content: center; justify-content: center;
 }
 .voz__nota { padding-top: 12px; font-size: 12px; color: var(--dim); }
 
@@ -695,8 +698,10 @@ body.ghost .app { transition: filter .8s var(--ease); }
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   overflow: hidden;
+  width: var(--lado, 320px);
   aspect-ratio: 16 / 10;
   display: grid; place-items: center;
+  transition: width .18s var(--ease);
 }
 .tile.is-speaking { border-color: var(--mint); box-shadow: 0 0 0 1px var(--mint); }
 .tile video { width: 100%; height: 100%; object-fit: contain; background: #05070a; }
@@ -770,3 +775,60 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .ico2.is-on { background: var(--mist-lo); color: var(--mist); }
 
 .ico.is-cortado { color: var(--rose); }
+
+/* --- chamada: quem fala, quem transmite ------------------------------------ */
+
+/* O anel verde vai no AVATAR, não na caixa toda: é a pessoa que está a falar,
+   não o painel. Vale para a grelha e para a lista lateral. */
+.tile.a-falar .ident,
+.member.a-falar .ident,
+.vm.a-falar .ident {
+  box-shadow: 0 0 0 2px var(--mint), 0 0 12px rgba(134, 214, 174, .45);
+}
+.tile.a-falar { border-color: rgba(134, 214, 174, .5); }
+
+.tile__transmite {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 18px; text-align: center;
+}
+.tile__transmite .ident { width: 52px; height: 52px; border-radius: 17px; }
+.tile__transmite b { font: 600 13.5px/1.4 var(--ui); color: var(--text); }
+.tile__dica { font-size: 12px; color: var(--dim); }
+
+.voz__grelha.esta-a-ver {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: stretch; justify-content: stretch;
+}
+.voz__grelha.esta-a-ver .tile { width: 100%; aspect-ratio: auto; height: 100%; }
+
+.assistindo { display: flex; align-items: center; gap: 12px; }
+.assistindo__quem { font-size: 13px; color: var(--dim); }
+
+.member--chamada { padding-right: 4px; }
+.chan__x--ver { opacity: 1; color: var(--mist); font-size: 13px; }
+.chan__x--ver:hover { color: var(--mint); }
+
+/* --- botões que aparecem ao passar o rato num painel ----------------------- */
+
+.tile__acoes {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: linear-gradient(to top, rgba(5, 7, 10, .55), rgba(5, 7, 10, .15));
+  opacity: 0; pointer-events: none;
+  transition: opacity .14s var(--ease);
+}
+.tile:hover .tile__acoes { opacity: 1; pointer-events: auto; }
+.tile__acoes:empty { display: none; }
+
+.tile__bt {
+  width: 38px; height: 38px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 50%;
+  background: rgba(12, 17, 22, .9);
+  color: var(--text);
+  font-size: 15px; line-height: 1; cursor: pointer;
+  display: grid; place-items: center;
+  transition: background .14s, color .14s, transform .14s var(--ease);
+}
+.tile__bt:hover { background: var(--mist-lo); color: var(--mist); transform: scale(1.06); }
+.tile__bt.is-on { background: rgba(217, 154, 154, .18); color: var(--rose); border-color: rgba(217, 154, 154, .35); }

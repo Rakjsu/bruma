@@ -168,6 +168,7 @@
   </main>
 
   <aside class="members">
+    <div id="na-chamada" hidden></div>
     <div class="members__label">Membros<button class="porque" data-explica="expulsar" aria-label="O que garante uma expulsão">?</button></div>
     <div id="lista-membros"></div>
   </aside>
@@ -180,6 +181,12 @@
   </div>
 
   <!-- menu de contexto proprio: o do browser nao pertence a uma app -->
+  <!-- O audio da chamada vive AQUI, fora da grelha.
+       Se vivesse dentro dos paineis, carregar em "Assistir" — que substitui a grelha
+       por um painel so — arrancava os <audio> dos outros e a pessoa deixava de ouvir
+       toda a gente no momento em que comecava a ver alguem. -->
+  <div id="audios" hidden></div>
+
   <div class="menu" id="menu" hidden></div>
 
   <div class="explica" id="explica" hidden>
