@@ -37,7 +37,7 @@ para que isso não obrigue a reescrever o núcleo.
 
 ## Arquitetura
 
-Monorepo pnpm + Turborepo em `C:\Users\rakjs\Music\Projetos\Discord`. **Não há `apps/server`.**
+Monorepo pnpm + Turborepo na raiz do repositorio. **Não há `apps/server`.**
 
 ```
 apps/

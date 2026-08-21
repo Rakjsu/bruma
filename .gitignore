@@ -34,6 +34,9 @@ recovery.txt
 Thumbs.db
 desktop.ini
 
+# Config local do Claude Code (nao pertence ao projeto)
+.claude/settings.local.json
+
 # Editores
 .idea/
 *.swp
