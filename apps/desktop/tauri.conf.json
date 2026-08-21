@@ -19,12 +19,29 @@
     ],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "icon": [
       "icons/icon.ico"
-    ]
+    ],
+    "targets": [
+      "nsis"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5MERDRjIzMzdBRDQxOTQKUldTVVFhMDNJODhONlRzU3pFY0RTQ3J3ZGhiVHJBa2RXaXppeUg0TmFEbTdqWnY2T0FsSFRPYVoK",
+      "endpoints": [
+        "https://github.com/Rakjsu/bruma/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

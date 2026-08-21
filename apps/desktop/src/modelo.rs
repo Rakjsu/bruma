@@ -9,7 +9,7 @@
 //! garante que dois membros com as mesmas entradas veem exatamente o mesmo servidor, sem
 //! precisarem de falar um com o outro para acertar.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,16 +28,6 @@ pub fn novo_id() -> Result<Id> {
 
 pub fn id_hex(id: &Id) -> String {
     data_encoding::HEXLOWER.encode(id)
-}
-
-pub fn id_de_hex(s: &str) -> Result<Id> {
-    let v = data_encoding::HEXLOWER.decode(s.as_bytes())?;
-    if v.len() != 16 {
-        bail!("id tem de ter 16 bytes");
-    }
-    let mut o = [0u8; 16];
-    o.copy_from_slice(&v);
-    Ok(o)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -30,6 +30,11 @@ recovery.txt
 .env.*
 !.env.example
 
+# Dados de execucao da app. O indice.json guarda a CHAVE SIMETRICA de cada servidor
+# em claro, e os logs guardam o historico. Nada disto pertence ao repositorio.
+apps/desktop/dados/
+dados/
+
 # Sistema
 .DS_Store
 Thumbs.db

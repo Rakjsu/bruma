@@ -1,0 +1,158 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Bruma</title>
+<link rel="stylesheet" href="app.css">
+
+<div class="app">
+  <div class="fog" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <nav class="rail">
+    <button class="rail__mark" data-explica="identidade" title="A tua identidade">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M3 9c3 0 3-2 6-2s3 2 6 2 3-2 6-2" />
+        <path d="M2 14c3 0 3-2 6-2s3 2 6 2 3-2 6-2" opacity=".65" />
+        <path d="M4 19c3 0 3-2 6-2s3 2 6 2 3-2 5-2" opacity=".4" />
+      </svg>
+    </button>
+    <div class="rail__sep"></div>
+    <div id="rail-servidores"></div>
+    <button class="rail__pill rail__pill--add" id="btn-novo" data-tip="Criar servidor ou entrar com um convite">+</button>
+  </nav>
+
+  <aside class="sidebar">
+    <header class="sidebar__head">
+      <span class="sidebar__name" id="nome-servidor">—</span>
+      <span class="sidebar__peers">
+        <i class="dot"></i><span id="contagem-membros">0 membros</span>
+        <button class="porque" data-explica="historico" aria-label="Porque é que isto importa">?</button>
+      </span>
+    </header>
+
+    <div class="sidebar__scroll" id="lista-canais"></div>
+
+    <div class="me">
+      <span class="ident ident--lg" id="meu-avatar"></span>
+      <div class="me__id">
+        <span class="me__name" id="meu-nome">—</span>
+        <span class="me__key" id="minha-chave" title="A tua chave pública é o teu ID"></span>
+      </div>
+      <div class="me__actions">
+        <button class="ico" id="btn-perfil" title="Mudar o meu nome">
+          <svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="2.4" fill="none"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" fill="none"/></svg>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="chat">
+    <header class="topbar">
+      <div class="topbar__title"><span class="chan__glyph" id="glifo-canal">#</span><span id="nome-canal">—</span></div>
+      <div class="topbar__spacer"></div>
+      <div class="transport">
+        <span class="chip chip--ok" data-explica="e2ee" role="button" tabindex="0">
+          <svg viewBox="0 0 16 16" width="12" height="12"><rect x="3.5" y="7" width="9" height="6.5" rx="1.6"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none"/></svg>
+          E2EE
+        </span>
+        <span class="chip" id="chip-peers" data-explica="caminho" role="button" tabindex="0">
+          <i class="dot"></i><span id="rotulo-peers">0 ligados</span>
+        </span>
+        <button class="chip chip--btn" id="btn-convite" title="Criar um convite para este servidor">Convidar</button>
+      </div>
+    </header>
+
+    <section class="stream" id="stream"></section>
+
+    <footer class="composer" id="composer" hidden>
+      <div class="composer__box">
+        <input id="entrada" placeholder="Mensagem" autocomplete="off">
+        <span class="composer__lock" title="Cifrado ponta a ponta">
+          <svg viewBox="0 0 16 16" width="13" height="13"><rect x="3.5" y="7" width="9" height="6.5" rx="1.6"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none"/></svg>
+        </span>
+      </div>
+      <div class="composer__note">as mensagens ficam no teu computador — não há servidor onde elas se acumulem</div>
+    </footer>
+  </main>
+
+  <aside class="members">
+    <div class="members__label">Membros<button class="porque" data-explica="expulsar" aria-label="O que garante uma expulsão">?</button></div>
+    <div id="lista-membros"></div>
+  </aside>
+
+  <div class="explica" id="explica" hidden>
+    <div class="explica__titulo" id="explica-titulo"></div>
+    <div class="explica__corpo" id="explica-corpo"></div>
+  </div>
+</div>
+
+<!-- primeira vez: escolher um nome. Não há registo, não há conta. -->
+<div class="veu" id="veu-bemvindo" hidden>
+  <div class="caixa">
+    <h2>Bem-vindo ao Bruma</h2>
+    <p>
+      Não há conta, não há e-mail, não há palavra-passe. A tua identidade já foi criada neste
+      computador e é uma chave — ninguém a registou em lado nenhum.
+    </p>
+    <label for="in-nome">Como queres aparecer para os outros</label>
+    <input id="in-nome" placeholder="o teu nome" maxlength="32" autocomplete="off">
+    <div class="caixa__erro" id="erro-nome"></div>
+    <div class="caixa__acoes">
+      <button class="btn btn--primary" id="ok-nome">Continuar</button>
+    </div>
+  </div>
+</div>
+
+<div class="veu" id="veu-novo" hidden>
+  <div class="caixa">
+    <h2>Novo servidor</h2>
+    <p>Cria um servidor teu, ou entra num com um convite que te tenham dado.</p>
+    <label for="in-servidor">Criar um servidor</label>
+    <input id="in-servidor" placeholder="nome do servidor" maxlength="40" autocomplete="off">
+    <div class="caixa__acoes" style="margin-bottom:20px">
+      <button class="btn btn--primary" id="ok-servidor">Criar</button>
+    </div>
+    <label for="in-convite">Ou entrar com um convite</label>
+    <textarea id="in-convite" placeholder="cola aqui o código que te enviaram"></textarea>
+    <div class="caixa__erro" id="erro-novo"></div>
+    <div class="caixa__acoes">
+      <button class="btn" id="fechar-novo">Cancelar</button>
+      <button class="btn btn--primary" id="ok-convite">Entrar</button>
+    </div>
+  </div>
+</div>
+
+<div class="veu" id="veu-canal" hidden>
+  <div class="caixa">
+    <h2>Novo canal</h2>
+    <label for="in-canal">Nome</label>
+    <input id="in-canal" placeholder="ex.: geral" maxlength="32" autocomplete="off">
+    <label for="in-tipo">Tipo</label>
+    <select id="in-tipo">
+      <option value="texto">Texto</option>
+      <option value="voz">Voz</option>
+    </select>
+    <div class="caixa__erro" id="erro-canal"></div>
+    <div class="caixa__acoes">
+      <button class="btn" id="fechar-canal">Cancelar</button>
+      <button class="btn btn--primary" id="ok-canal">Criar</button>
+    </div>
+  </div>
+</div>
+
+<div class="veu" id="veu-convite" hidden>
+  <div class="caixa">
+    <h2>Convite</h2>
+    <div class="aviso">
+      <b>Este código é um segredo.</b> Quem o tiver entra no servidor e consegue ler tudo o que lá
+      for escrito a partir daí. Manda-o por um canal privado, não o publiques.
+    </div>
+    <textarea id="out-convite" readonly></textarea>
+    <div class="caixa__acoes">
+      <span class="copiado" id="copiado"></span>
+      <button class="btn" id="fechar-convite">Fechar</button>
+      <button class="btn btn--primary" id="copiar-convite">Copiar</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
