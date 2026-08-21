@@ -1,5 +1,9 @@
 //! Log append-only, assinado e encadeado por hash — o desenho que substituiu o CRDT nas mensagens.
 //!
+//! A cadeia não é decorativa: cada entrada aponta para a cabeça que o autor via, esse ponteiro
+//! está coberto pela assinatura, e é dele que sai a ORDEM das mensagens (ver `instantes`) e a
+//! deteção de buracos no histórico (ver `orfas`).
+//!
 //! Guardado como JSON com campos em hex de propósito: dá para fazer `cat` ao ficheiro e VER
 //! que o conteúdo é opaco. Isso é metade da verificação do spike.
 
@@ -16,10 +20,10 @@ pub const ZERO_HASH: [u8; 32] = [0u8; 32];
 pub struct Entry {
     pub author: String, // hex, 32 bytes — é também o EndpointId do iroh
     pub ts_ms: u64,
-    pub prev: String,       // hex, 32 bytes — referência causal, não cadeia estrita
-    pub nonce: String,      // hex, 24 bytes
+    pub prev: String,  // hex, 32 bytes — a cabeça que o autor via; define a ordem
+    pub nonce: String, // hex, 24 bytes
     pub ciphertext: String, // hex
-    pub sig: String,        // hex, 64 bytes
+    pub sig: String,   // hex, 64 bytes
 }
 
 impl Entry {
@@ -83,15 +87,81 @@ impl Log {
         Ok(())
     }
 
-    /// Ordem determinística e igual em todos os peers: (timestamp, hash).
+    /// Instante efetivo de cada entrada, num relógio lógico híbrido.
+    ///
+    /// O relógio de parede sozinho não serve. Entre uma máquina nos EUA e outra no Brasil,
+    /// alguns segundos de desvio bastam para uma resposta aparecer ANTES da pergunta — e é o
+    /// tipo de bug que nunca se vê em testes locais, porque aí os relógios coincidem.
+    ///
+    /// A causalidade pura também não serve sozinha: agruparia mensagens concorrentes por uma
+    /// ordem que não corresponde a nada que o utilizador reconheça.
+    ///
+    /// A regra é `instante(e) = max(e.ts_ms, instante(pai) + 1)`. Com os relógios em sintonia
+    /// dá exatamente a ordem de parede; com um relógio atrasado, a entrada é empurrada para
+    /// depois do pai em vez de saltar para trás. Depende só do grafo e dos carimbos guardados,
+    /// portanto todos os peers convergem para a mesma ordem sem falarem uns com os outros.
+    fn instantes(&self) -> BTreeMap<String, u64> {
+        let mut cache: BTreeMap<String, u64> = BTreeMap::new();
+        for inicio in self.entries.keys() {
+            if cache.contains_key(inicio) {
+                continue;
+            }
+            // Iterativo e não recursivo de propósito: uma conversa longa é uma cadeia longa,
+            // e recursão aqui seria estouro de pilha à espera de acontecer.
+            let mut pilha: Vec<String> = Vec::new();
+            let mut atual = inicio.clone();
+            loop {
+                if cache.contains_key(&atual) {
+                    break;
+                }
+                let Some(e) = self.entries.get(&atual) else {
+                    break;
+                };
+                pilha.push(atual.clone());
+                // Um ciclo exigiria colisão de hash (o `prev` está dentro do hash), mas o
+                // limite custa nada e evita pendurar o processo se alguma vez existir.
+                if !self.entries.contains_key(&e.prev) || pilha.len() > self.entries.len() {
+                    break;
+                }
+                atual = e.prev.clone();
+            }
+            while let Some(h) = pilha.pop() {
+                let e = &self.entries[&h];
+                // Pai ausente (ainda não sincronizado): a entrada é uma raiz e vale o seu
+                // próprio relógio. Quando o pai chegar, isto recalcula-se sozinho.
+                let base = cache.get(&e.prev).copied().unwrap_or(0);
+                let v = e.ts_ms.max(base.saturating_add(1));
+                cache.insert(h, v);
+            }
+        }
+        cache
+    }
+
+    /// Ordem determinística e igual em todos os peers: (instante efetivo, hash).
     pub fn ordered(&self) -> Vec<Entry> {
-        let mut v: Vec<(u64, String, Entry)> = self
+        let inst = self.instantes();
+        let mut v: Vec<(u64, &String, &Entry)> = self
             .entries
             .iter()
-            .map(|(h, e)| (e.ts_ms, h.clone(), e.clone()))
+            .map(|(h, e)| (inst.get(h).copied().unwrap_or(e.ts_ms), h, e))
             .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        v.into_iter().map(|(_, _, e)| e).collect()
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+        v.into_iter().map(|(_, _, e)| e.clone()).collect()
+    }
+
+    /// Entradas cujo pai ainda não chegou.
+    ///
+    /// É isto que torna o campo `prev` verificável em vez de decorativo: enquanto isto não
+    /// for vazio, o histórico tem buracos e ainda não se pode chamar-lhe uma cadeia. Não é
+    /// motivo para rejeitar nada — na sincronização as entradas chegam por qualquer ordem —
+    /// mas é um sinal honesto de que falta material.
+    pub fn orfas(&self) -> Vec<String> {
+        let zero = HEXLOWER.encode(&ZERO_HASH);
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.prev != zero && !self.entries.contains_key(&e.prev))
+            .map(|(h, _)| h.clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -305,6 +375,115 @@ mod tests {
             2,
             "o historico tem de sobreviver ao reinicio"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn relogio_atrasado_nao_inverte_a_resposta() {
+        // O bug que isto fecha: a pergunta e escrita por quem tem o relogio certo, a resposta
+        // por quem o tem cinco segundos atrasado. Ordenando por relogio de parede, a resposta
+        // aparecia ANTES da pergunta -- e nunca se via em testes locais, porque ai as duas
+        // maquinas sao a mesma. Entre os EUA e o Brasil, ve-se.
+        let path = tmp("relogio");
+        let mut log = Log::load(&path).unwrap();
+        let pergunta = log
+            .append_local(&key(1), [0u8; 24], vec![1], 10_000)
+            .unwrap();
+        let resposta = log
+            .append_local(&key(2), [1u8; 24], vec![2], 5_000)
+            .unwrap();
+
+        assert_eq!(
+            resposta.prev,
+            pergunta.hash_hex().unwrap(),
+            "a resposta tem de apontar para a pergunta"
+        );
+        assert!(
+            resposta.ts_ms < pergunta.ts_ms,
+            "o cenario so tem valor com o relogio atrasado"
+        );
+
+        let ordem: Vec<String> = log
+            .ordered()
+            .iter()
+            .map(|e| e.hash_hex().unwrap())
+            .collect();
+        assert_eq!(
+            ordem[0],
+            pergunta.hash_hex().unwrap(),
+            "a pergunta tem de vir primeiro apesar do carimbo maior"
+        );
+        assert_eq!(ordem[1], resposta.hash_hex().unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn relogios_em_sintonia_dao_ordem_de_parede() {
+        // O outro lado da moeda: quando nao ha desvio, o resultado tem de ser exatamente a
+        // ordem cronologica. O relogio logico nao pode inventar uma ordem estranha no caso normal.
+        let path = tmp("sintonia");
+        let mut log = Log::load(&path).unwrap();
+        let a = log
+            .append_local(&key(1), [0u8; 24], vec![1], 1_000)
+            .unwrap();
+        let b = log
+            .append_local(&key(2), [1u8; 24], vec![2], 2_000)
+            .unwrap();
+        let c = log
+            .append_local(&key(3), [2u8; 24], vec![3], 3_000)
+            .unwrap();
+
+        let ordem: Vec<String> = log
+            .ordered()
+            .iter()
+            .map(|e| e.hash_hex().unwrap())
+            .collect();
+        let esperado: Vec<String> = [&a, &b, &c].iter().map(|e| e.hash_hex().unwrap()).collect();
+        assert_eq!(ordem, esperado);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn orfas_deteta_pai_em_falta() {
+        // E isto que torna o `prev` verificavel em vez de decorativo.
+        let pa = tmp("orfa-a");
+        let pb = tmp("orfa-b");
+        let mut origem = Log::load(&pa).unwrap();
+        let primeira = origem
+            .append_local(&key(1), [0u8; 24], vec![1], 1_000)
+            .unwrap();
+        let segunda = origem
+            .append_local(&key(1), [1u8; 24], vec![2], 2_000)
+            .unwrap();
+
+        // O destino recebe SO a segunda: o pai dela nunca chegou.
+        let mut destino = Log::load(&pb).unwrap();
+        destino.merge(vec![segunda.clone()]).unwrap();
+        assert_eq!(
+            destino.orfas(),
+            vec![segunda.hash_hex().unwrap()],
+            "com o pai em falta, a entrada e orfa"
+        );
+
+        // Quando o pai chega, o buraco fecha sozinho.
+        destino.merge(vec![primeira]).unwrap();
+        assert!(
+            destino.orfas().is_empty(),
+            "com o pai presente ja nao ha orfas"
+        );
+
+        for f in [pa, pb] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn primeira_entrada_nao_e_orfa() {
+        // Uma raiz aponta para o hash zero, e isso nao e um buraco.
+        let path = tmp("raiz");
+        let mut log = Log::load(&path).unwrap();
+        log.append_local(&key(1), [0u8; 24], vec![1], 1_000)
+            .unwrap();
+        assert!(log.orfas().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

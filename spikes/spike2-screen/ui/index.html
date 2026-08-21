@@ -28,7 +28,7 @@
   <aside class="sidebar">
     <header class="sidebar__head">
       <span class="sidebar__name">Bruma · dev</span>
-      <span class="sidebar__peers"><i class="dot"></i>3 online</span>
+      <span class="sidebar__peers"><i class="dot"></i>3 online<button class="porque" data-explica="historico" aria-label="Porque é que isto importa">?</button></span>
     </header>
 
     <div class="sidebar__scroll">
@@ -85,11 +85,11 @@
 
       <!-- estado de transporte: a identidade funcional do Bruma -->
       <div class="transport" id="transport">
-        <span class="chip chip--ok" title="Cifrado ponta a ponta; o conteúdo nunca sai em claro">
+        <span class="chip chip--ok" data-explica="e2ee" role="button" tabindex="0">
           <svg viewBox="0 0 16 16" width="12" height="12"><rect x="3.5" y="7" width="9" height="6.5" rx="1.6"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none"/></svg>
           E2EE
         </span>
-        <span class="chip" id="chip-path" title="Como o teu tráfego está a viajar">
+        <span class="chip" id="chip-path" data-explica="caminho" role="button" tabindex="0">
           <i class="dot dot--ok"></i><span id="path-label">direto</span>
         </span>
         <button class="chip chip--btn" id="ghost-toggle" title="Modo Fantasma: chat por Tor, sem ninguém saber o teu IP">
@@ -227,9 +227,15 @@
     </footer>
   </main>
 
+  <!-- painel de explicação: o raciocínio vive aqui, não só nos READMEs -->
+  <div class="explica" id="explica" hidden>
+    <div class="explica__titulo" id="explica-titulo"></div>
+    <div class="explica__corpo" id="explica-corpo"></div>
+  </div>
+
   <!-- membros -->
   <aside class="members">
-    <div class="members__label">Ligados · 3</div>
+    <div class="members__label">Ligados · 3<button class="porque" data-explica="expulsar" aria-label="O que garante uma expulsão">?</button></div>
     <div class="member"><span class="ident" data-key="9cd269eb77"></span><span><b>ana</b><i>direto</i></span></div>
     <div class="member"><span class="ident" data-key="819625cc95"></span><span><b>rui</b><i>por relay</i></span></div>
     <div class="member"><span class="ident" data-key="27a76005040e"></span><span><b>tu</b><i>direto</i></span></div>

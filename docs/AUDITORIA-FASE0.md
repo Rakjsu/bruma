@@ -13,13 +13,19 @@ não sobreviveram à verificação estão listados no fim para não voltarem a a
 | 1.4 | Falta o ficheiro LICENSE | **corrigido** — texto canónico da AGPL-3.0 |
 | 1.5 | 16 MiB alocados antes do handshake | **corrigido** — limite de 64 KiB até a identidade estar provada, nos dois spikes |
 | 2.4 | Animações sem `prefers-reduced-motion` | **corrigido** — media query + névoa pausa em segundo plano |
-| 2.1 | Cadeia de hash decorativa | em aberto — precisa de decisão (ver 2.1) |
-| 2.2 | Ordem por relógio de parede | em aberto — resolve-se com 2.1 |
+| 2.1 | Cadeia de hash decorativa | **corrigido** — o `prev` passou a definir a ordem e a expor buracos (`orfas()`) |
+| 2.2 | Ordem por relógio de parede | **corrigido** — relógio lógico híbrido, com teste de regressão |
 | 2.3 | Log reescrito por inteiro | em aberto — morre na Fase 1 com SQLite |
-| 2.5 | Raciocínio só nos READMEs | em aberto |
+| 2.5 | Raciocínio só nos READMEs | **corrigido** — quatro explicadores na própria interface |
 
 A correção do XSS foi verificada por teste no browser: a técnica antiga injeta a tag (`antigo_injectou: true`),
 a nova não (`novo_injectou: false`) e mantém as cores do painel.
+
+A ordenação tem agora teste de regressão: uma resposta escrita com o relógio cinco segundos atrasado
+continua a aparecer **depois** da pergunta. Com a ordenação antiga por `ts_ms`, o carimbo 5000
+ordenava-se antes do 10000 — a inversão era aritmética, não hipótese.
+
+Fica em aberto apenas o 2.3 (log reescrito por inteiro), que morre na Fase 1 com SQLite.
 
 ---
 

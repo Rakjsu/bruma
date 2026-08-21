@@ -80,6 +80,101 @@ $$('.chan[data-view]').forEach(btn => {
 });
 
 /* --------------------------------------------------------------------------
+   Explicações — o porquê vive na app, não só nos READMEs.
+
+   Cada uma destas foi, em algum momento, uma decisão explicada num documento que
+   o utilizador nunca vai ler. Se ele precisa de entender para confiar na app,
+   tem de estar ao alcance de um clique no sítio onde a dúvida aparece.
+   -------------------------------------------------------------------------- */
+
+const EXPLICACOES = {
+  e2ee: {
+    titulo: 'Cifrado ponta a ponta',
+    corpo: [
+      'O conteúdo das mensagens e dos ficheiros é cifrado <b>antes</b> de sair deste computador. Ninguém no caminho o consegue ler — nem o relay, nem quem reencaminha.',
+      'O que <b>não</b> esconde: quem fala com quem, quando, e o tamanho do que é enviado. Isso chama-se metadados, e um relay vê-os.',
+    ],
+  },
+  caminho: {
+    titulo: 'Como o teu tráfego viaja',
+    corpo: [
+      '<b>Direto</b> significa que a ligação passou por cima do router das duas casas e vai de máquina a máquina. É o mais rápido.',
+      '<b>Por relay</b> significa que isso não foi possível — normalmente porque um dos lados está atrás de CGNAT — e o tráfego passa por um servidor que reencaminha bytes cifrados que não consegue ler.',
+      'Atenção, isto vale para o chat. <b>Numa chamada de voz ou de ecrã, os participantes veem o teu IP</b>: o WebRTC faz o seu próprio caminho e este indicador não o cobre.',
+    ],
+  },
+  historico: {
+    titulo: 'Porque é que quem está online importa',
+    corpo: [
+      'Não há servidor. O histórico deste canal existe nos computadores de quem é membro, e mais em lado nenhum.',
+      'Na prática: só sincronizas com quem estiver ligado ao mesmo tempo que tu. <b>Se ninguém do canal estiver online, não há nada de onde puxar.</b>',
+      'É o preço direto de não haver uma máquina no meio a guardar as conversas de toda a gente.',
+    ],
+  },
+  expulsar: {
+    titulo: 'O que uma expulsão garante',
+    corpo: [
+      'Expulsar alguém roda a chave do canal. A partir desse momento ele <b>deixa de conseguir decifrar</b> o que for escrito — isso é garantido por matemática, não por regra.',
+      'O que <b>não</b> garante: ele continua a ter tudo o que já tinha recebido. Sem servidor não há ninguém que lhe possa apagar o histórico à distância.',
+    ],
+  },
+};
+
+const painelExplica = $('#explica');
+
+function mostrarExplicacao(chave, ancora) {
+  const e = EXPLICACOES[chave];
+  if (!e) return;
+  $('#explica-titulo').textContent = e.titulo;
+  // O conteudo e nosso e estatico, mas manter innerHTML fora do caminho por habito:
+  // constroi-se paragrafo a paragrafo e so o <b> e permitido, ja escrito por nos.
+  const corpo = $('#explica-corpo');
+  corpo.textContent = '';
+  for (const p of e.corpo) {
+    const el = document.createElement('p');
+    el.innerHTML = p;   // literais desta constante, nunca dados de fora
+    corpo.append(el);
+  }
+  painelExplica.hidden = false;
+
+  const r = ancora.getBoundingClientRect();
+  const largura = painelExplica.offsetWidth;
+  let x = r.left + r.width / 2 - largura / 2;
+  x = Math.max(12, Math.min(x, innerWidth - largura - 12));
+  let y = r.bottom + 8;
+  if (y + painelExplica.offsetHeight > innerHeight - 12) {
+    y = Math.max(12, r.top - painelExplica.offsetHeight - 8);
+  }
+  painelExplica.style.left = `${Math.round(x)}px`;
+  painelExplica.style.top = `${Math.round(y)}px`;
+}
+
+function esconderExplicacao() { painelExplica.hidden = true; }
+
+document.addEventListener('click', ev => {
+  const gatilho = ev.target.closest('[data-explica]');
+  if (gatilho) {
+    ev.stopPropagation();
+    const jaAberta = !painelExplica.hidden && painelExplica.dataset.chave === gatilho.dataset.explica;
+    if (jaAberta) return esconderExplicacao();
+    painelExplica.dataset.chave = gatilho.dataset.explica;
+    return mostrarExplicacao(gatilho.dataset.explica, gatilho);
+  }
+  if (!ev.target.closest('#explica')) esconderExplicacao();
+});
+
+// Teclado: as afordancias tem role=button, portanto tem de responder a Enter e Espaco.
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') return esconderExplicacao();
+  const gatilho = ev.target.closest && ev.target.closest('[data-explica]');
+  if (gatilho && (ev.key === 'Enter' || ev.key === ' ')) {
+    ev.preventDefault();
+    painelExplica.dataset.chave = gatilho.dataset.explica;
+    mostrarExplicacao(gatilho.dataset.explica, gatilho);
+  }
+});
+
+/* --------------------------------------------------------------------------
    Modo Fantasma
    O botão tem de dizer o que faz E o que deixa de funcionar. Prometer
    "anónimo" sem mencionar que a voz morre seria mentir por omissão.

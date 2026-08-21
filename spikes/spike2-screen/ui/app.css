@@ -499,6 +499,38 @@ body.ghost .fog {
 }
 body.ghost .app { transition: filter .8s var(--ease); }
 
+/* --- explicações: o porquê fica na app, não só no README ------------------ */
+
+.porque {
+  width: 15px; height: 15px; margin-left: 6px;
+  border: 0; border-radius: 50%;
+  background: rgba(255, 255, 255, .07); color: var(--dim);
+  font: 600 9.5px/1 var(--ui); cursor: pointer;
+  display: inline-grid; place-items: center; vertical-align: middle;
+  transition: background .15s, color .15s;
+}
+.porque:hover { background: var(--mist-lo); color: var(--mist); }
+
+[data-explica] { cursor: help; }
+
+.explica {
+  position: fixed; z-index: 60;
+  width: 320px; max-width: calc(100vw - 24px);
+  background: #0c1116;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--mist);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  animation: surge .18s var(--ease);
+}
+@keyframes surge { from { opacity: 0; transform: translateY(-4px); } }
+.explica__titulo { font: 600 12px/1.3 var(--ui); letter-spacing: .05em; text-transform: uppercase; color: var(--mist); margin-bottom: 6px; }
+.explica__corpo { font-size: 13px; color: var(--muted); }
+.explica__corpo b { color: var(--text); font-weight: 600; }
+.explica__corpo p { margin: 0 0 7px; }
+.explica__corpo p:last-child { margin-bottom: 0; }
+
 /* --- movimento reduzido --------------------------------------------------- */
 /* Tres animacoes correm em ciclo infinito: a nevoa, o anel de quem fala e os
    pontos de "esta a escrever". Para quem tem sensibilidade a movimento isso e

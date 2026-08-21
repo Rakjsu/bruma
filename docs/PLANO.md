@@ -26,7 +26,7 @@ para que isso não obrigue a reescrever o núcleo.
 |---|---|---|
 | Rede | **`iroh` 1.0.3 (QUIC P2P)**, sem servidor | Liga-se **por chave pública, não por IP** — é literalmente a identidade Ed25519 que já usamos. ~90% de hole-punch direto, relay como fallback, wire protocol estável, bindings oficiais Node/Swift/Kotlin (cobre web e mobile depois). |
 | Relay | **Relay público do n0** | Zero infraestrutura própria. Escotilha de fuga: `iroh-relay` é o mesmo crate, self-hostável depois sem mexer no cliente. |
-| Mensagens | **Log assinado encadeado por hash**, não CRDT | Um log append-only ordenado por (timestamp, hash) chega e é trivial de sincronizar. Poupa uma dependência pesada e muita superfície de bugs. |
+| Mensagens | **Log assinado encadeado por hash**, não CRDT | Um log append-only chega e é trivial de sincronizar. Poupa uma dependência pesada e muita superfície de bugs. A ordem sai de um **relógio lógico híbrido** derivado da cadeia (ver abaixo), não do relógio de parede. |
 | Estado mutável | **CRDT (`loro` 1.13)** só para canais, cargos, membros, reações e edições | É aqui que há fusão a sério. O log de mensagens não precisa disto. |
 | Identidade | Ed25519 no dispositivo + mnemónica BIP39 de 12 palavras | Zero PII. A mesma chave é o `NodeId` do iroh. |
 | Cripto de grupo | **Sender keys** por época (Fase 1) → **MLS/OpenMLS 0.8.1** (Fase 3) | Chat E2EE de pé em dias; troca isolada atrás de um trait `GroupKeyAgreement`. |
@@ -64,7 +64,11 @@ bootstrap, o id do canal e uma chave de convite assinada. Quem não tem o link n
 **Dois planos de estado, e a razão é criptográfica.** Um CRDT não consegue fundir aquilo que não
 consegue ler — isto tem de ficar decidido antes de escrever código, ou reescreve-se a camada de sync:
 - **Log de mensagens**: append-only, payload **opaco de ponta a ponta**. Cada entrada é assinada e
-  encadeada por hash à anterior; ordena por (timestamp, hash). Não precisa de fusão semântica.
+  encadeada por hash à anterior. **A ordem é `instante(e) = max(carimbo do autor, instante(pai) + 1)`,
+  com desempate por hash** — um relógio lógico híbrido. Com os relógios em sintonia dá a ordem
+  cronológica; com um relógio atrasado, a entrada é empurrada para depois do pai em vez de saltar
+  para trás. Isto importa: entre uma máquina nos EUA e outra no Brasil, alguns segundos de desvio
+  bastariam para uma resposta aparecer antes da pergunta. Não precisa de fusão semântica.
 - **Documento de configuração da guild** (canais, cargos, membros, reações, edições): **desencriptado
   localmente, fundido em claro em memória pelo Loro, e re-encriptado para transporte.** Nunca sai em claro.
 
