@@ -6,8 +6,19 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e 12 palavras recuperam-na noutro lado. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: Fase 0 — spikes de risco.** Não há produto ainda. Os spikes existem para
-> descobrir cedo se as premissas se aguentam, enquanto mudar de ideias ainda é barato.
+> **Estado: v0.1.x — utilizável para texto.** Já dá para entrar, criar um servidor, criar
+> canais, convidar amigos e conversar. **Voz e partilha de ecrã ainda não passam entre peers**:
+> a captura está validada, falta o transporte.
+
+## Instalar
+
+Descarrega o instalador da [última versão](https://github.com/Rakjsu/bruma/releases/latest).
+
+O Windows vai avisar que o editor é desconhecido — o instalador não tem assinatura de código
+comercial. *Mais informações* → *Executar mesmo assim*. A assinatura que existe garante que uma
+**atualização** veio mesmo daqui, e é verificada pela app antes de instalar seja o que for.
+
+A partir da v0.1.1 a app avisa sozinha quando há versão nova, e nunca instala sem perguntar.
 
 ## Porquê
 

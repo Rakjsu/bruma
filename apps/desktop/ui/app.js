@@ -455,6 +455,39 @@ document.addEventListener('visibilitychange', () => {
   if (fog) fog.style.animationPlayState = document.hidden ? 'paused' : 'running';
 });
 
+/* --------------------------------------------------------------------------
+   Atualizações.
+
+   O plugin sozinho não faz nada — é preciso alguém perguntar. E a atualização
+   nunca se instala em silêncio: quem está a usar a app decide quando reinicia,
+   porque reiniciar a meio de uma conversa é uma coisa que se faz a alguém.
+   -------------------------------------------------------------------------- */
+
+async function procurarAtualizacao() {
+  try {
+    const { check } = window.__TAURI__.updater;
+    const nova = await check();
+    if (!nova) return;
+    $('#texto-update').textContent = `Há uma versão nova do Bruma (${nova.version}).`;
+    $('#faixa-update').hidden = false;
+    $('#adiar-update').onclick = () => { $('#faixa-update').hidden = true; };
+    $('#btn-update').onclick = async () => {
+      $('#btn-update').disabled = true;
+      $('#texto-update').textContent = 'A descarregar…';
+      try {
+        await nova.downloadAndInstall();
+        await window.__TAURI__.process.relaunch();
+      } catch (e) {
+        $('#texto-update').textContent = `Não consegui atualizar: ${e}`;
+        $('#btn-update').disabled = false;
+      }
+    };
+  } catch (e) {
+    // Sem rede, ou o endpoint em baixo. Não vale a pena incomodar ninguém com isso.
+    console.warn('verificação de atualização falhou:', e);
+  }
+}
+
 /* ---------- arranque ---------- */
 
 (async () => {
@@ -463,4 +496,5 @@ document.addEventListener('visibilitychange', () => {
     abrir('veu-bemvindo');
     $('#in-nome').focus();
   }
+  procurarAtualizacao();
 })();

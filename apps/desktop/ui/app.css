@@ -627,3 +627,19 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .chan__x:hover { color: var(--rose); }
 
 .copiado { color: var(--mint); font-size: 12.5px; }
+
+/* --- faixa de atualização ------------------------------------------------- */
+
+.faixa {
+  position: fixed; z-index: 90;
+  left: 50%; bottom: 20px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px;
+  background: #0c1116;
+  border: 1px solid var(--mist-mid);
+  border-radius: var(--r-lg);
+  padding: 10px 12px 10px 16px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, .65);
+  font-size: 13.5px;
+  animation: surge .25s var(--ease);
+}
+.faixa[hidden] { display: none; }

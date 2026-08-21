@@ -40,5 +40,9 @@ jobs:
             > A assinatura que existe e a do auto-update, que garante que uma atualizacao
             > veio mesmo daqui e nao de outro sitio.
           releaseDraft: false
-          prerelease: true
+          # NAO pode ser prerelease. O endpoint do updater aponta para
+          # /releases/latest/download/latest.json, e o "latest" do GitHub IGNORA
+          # pre-releases -- o updater receberia 404 para sempre, em silencio.
+          # A natureza inicial da versao diz-se no numero (0.x) e nas notas, nao aqui.
+          prerelease: false
           includeUpdaterJson: true
