@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows e primeiro alvo; Linux entra para apanhar codigo dependente de plataforma cedo.
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatacao
+        run: cargo fmt --all -- --check
+      - name: Clippy (avisos sao erros)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Testes
+        run: cargo test --workspace
+      - name: Nenhum segredo commitado
+        shell: bash
+        run: |
+          if git ls-files | grep -E '\.(key|pem|onion)$|^.*identity\.json$|recovery\.txt$'; then
+            echo "::error::Ficheiro de segredo commitado -- ver .gitignore"
+            exit 1
+          fi
