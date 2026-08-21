@@ -1,0 +1,28 @@
+[package]
+name = "spike3-ghost"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+spike-common = { path = "../spike-common" }
+arti-client = { version = "0.45", default-features = false, features = [
+  "tokio", "rustls", "onion-service-client", "onion-service-service",
+  # O arti guarda a cache do diretorio Tor em SQLite. Sem isto o linker do
+  # Windows procura um sqlite3.lib do sistema que nao existe (LNK1181).
+  "static-sqlite",
+] }
+tor-hsservice = "0.45"
+tor-rtcompat = { version = "0.45", features = ["tokio", "rustls"] }
+tor-cell = "0.45"
+# O arti redacta enderecos .onion nos logs por omissao; isto da acesso a versao completa.
+safelog = "0.9"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"
+anyhow = "1"
+data-encoding = "2"

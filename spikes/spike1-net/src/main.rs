@@ -16,8 +16,7 @@
 //!   spike1-net --name ana                       # imprime o ID e fica a espera
 //!   spike1-net --name rui --connect <ENDPOINT_ID>
 
-mod crypto;
-mod log;
+use spike_common::{crypto, log};
 
 use anyhow::{anyhow, bail, Context, Result};
 use data_encoding::HEXLOWER;

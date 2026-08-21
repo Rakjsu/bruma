@@ -98,6 +98,10 @@ impl Log {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn head(&self) -> String {
         self.ordered()
             .last()
