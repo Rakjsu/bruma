@@ -94,6 +94,11 @@ html, body {
   z-index: 2;
   display: grid;
   grid-template-columns: 68px 236px minmax(0, 1fr) 224px;
+  /* A linha TEM de ser minmax(0, 1fr) e nao implicita. Sem isto a linha ganha a altura do
+     conteudo em vez da altura da janela: a coluna do chat cresce para la do ecra, o
+     overflow:hidden do body corta-a, e as seccoes de baixo ficam inalcancaveis porque nao
+     ha nada para rolar. O sintoma engana -- parece que o scroll nao funciona. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
 }
 
@@ -172,6 +177,7 @@ html, body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
   box-shadow: 1px 0 0 rgba(0, 0, 0, .35);
 }
 
@@ -262,7 +268,7 @@ html, body {
 
 /* --- barra de topo e estado de transporte -------------------------------- */
 
-.chat { display: flex; flex-direction: column; min-width: 0; background: var(--chat); }
+.chat { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--chat); }
 
 .topbar {
   display: flex; align-items: center; gap: 10px;

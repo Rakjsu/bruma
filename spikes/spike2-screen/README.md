@@ -10,6 +10,64 @@ Responde a duas perguntas que o plano deixou em aberto e que ninguém documenta 
 A segunda pergunta mede-se sem rede nenhuma: duas `RTCPeerConnection` na mesma máquina, ligadas uma
 à outra. O encoder é o mesmo que seria usado numa chamada real, portanto os números são reais.
 
+## Resultado — 21/08/2026 (RTX 5080, WebView2 151, Windows 11)
+
+**O gate passa.** A partilha de ecrã funciona dentro do Tauri. Mas duas das ressalvas que o plano
+listava como hipóteses confirmaram-se, e mudam a estratégia de upload.
+
+### O que funciona, e melhor do que se esperava
+
+| | Resultado |
+|---|---|
+| `getDisplayMedia()` na webview | **funciona** |
+| Picker de fontes | **aparece** — separadores *Janela* e *Tela Inteira*, com miniaturas |
+| Resolução capturada | **3840×2160** |
+| Framerate pedido | 60 |
+| `displaySurface` | `monitor` |
+| `cursor` | `always` — o cursor vem incluído |
+| Codecs disponíveis | VP8, H264, **AV1**, VP9 |
+
+O picker é o do Chromium, com o título `Escolha o que compartilhar com http://tauri.localhost`. Ou
+seja, o utilizador escolhe mesmo o que partilha — não há concessão silenciosa.
+
+### O que não confirma o plano
+
+**1. O AV1 vai por software.** O `encoderImplementation` diz `libaom` — não toca no NVENC da RTX
+5080. Nesta máquina (32 núcleos) aguenta-se, mas **um amigo com CPU modesta não vai conseguir
+partilhar 1080p60**, e é para os amigos que isto existe.
+
+**2. O `contentHint` não fez diferença mensurável.**
+
+| codec | `contentHint` | kbps | fps | encoder |
+|---|---|---|---|---|
+| AV1 | `text` | **2504** | 32,1 | libaom |
+| AV1 | *(nenhum)* | **2489** | 32 | libaom |
+
+Isso é 0,6% de diferença — ruído. O plano contava com 25%+ de poupança vinda das ferramentas de
+*screen content coding* do AV1 (palette mode, intra block copy), e **essa poupança não apareceu**.
+
+**3. O encoder já estava a lutar.** Pediu-se 60 fps e entregou ~32, com a resolução reduzida para
+1440p de altura, sem que o `qualityLimitationReason` acusasse nada.
+
+### Ressalva honesta sobre esta medição
+
+O ecrã partilhado continha a própria janela da app, **incluindo a pré-visualização da captura** —
+o que cria um efeito de espelho com movimento constante numa região. Não é um cenário *parado*
+puro, e o `contentHint` atua melhor precisamente em conteúdo estático.
+
+**Antes de dar o ponto 2 por fechado, vale a pena repetir com um ecrã genuinamente imóvel** —
+outro monitor, com um editor de código aberto e sem a app à vista.
+
+### O que isto muda
+
+A camada 1 do orçamento de upload do plano — a que dependia do AV1 com `contentHint` — perde o seu
+principal argumento até prova em contrário. Em compensação, **o caminho nativo em Rust ganhou muito
+peso**: `scap` com os *dirty rects* do DXGI e o NVENC por hardware atacam exatamente os dois
+problemas que a webview não resolve.
+
+Em termos absolutos o número não é mau: **2,5 Mbps para um ecrã 4K** é comportável, e para três
+espectadores em mesh dá ~7,5 Mbps, que cabe num upload de cabo residencial.
+
 ## Correr
 
 ```bash

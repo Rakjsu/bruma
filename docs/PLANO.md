@@ -181,6 +181,11 @@ Cada um destes nove pontos é um projeto pequeno.
 O problema não é o ecrã ser pesado — é enviarmos a mesma coisa N vezes e enviarmos pixels que não
 mudaram. Cinco camadas, por ordem de retorno sobre esforço:
 
+> ⚠️ **Medido a 21/08/2026 e não confirmado.** Na webview do Tauri, o `contentHint = 'text'` deu
+> 2504 kbps contra 2489 kbps sem hint — 0,6%, ruído. O AV1 foi por `libaom` (software), não pelo
+> NVENC. A medição tinha um espelho em movimento no ecrã, portanto não é definitiva, mas **a camada
+> 1 não pode ser dada como adquirida no caminho da webview**. Ver `spikes/spike2-screen/README.md`.
+
 **1. Não codificar o que não mudou (grátis, maior ganho).** Um ecrã de código está ~95% estático.
 - `contentHint = 'text'` / `'detail'` na track liga as ferramentas de *screen content coding* do AV1
   (palette mode + intra block copy) no Chromium — logo, funciona dentro da WebView2. IntraBC sozinho
