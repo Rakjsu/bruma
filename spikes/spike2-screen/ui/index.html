@@ -1,0 +1,327 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Bruma · spike 2 · partilha de ecrã</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 20px 24px; background: #14161a; color: #e6e8ec;
+         font: 14px/1.55 system-ui, "Segoe UI", sans-serif; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 22px 0 8px; color: #9aa4b2; text-transform: uppercase;
+       letter-spacing: .06em; font-weight: 600; }
+  p.sub { margin: 0 0 16px; color: #8b95a3; }
+  button { background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
+           padding: 9px 15px; font-size: 14px; cursor: pointer; margin: 0 8px 8px 0; }
+  button:hover:not(:disabled) { background: #3182ce; }
+  button:disabled { background: #333940; color: #6b7480; cursor: not-allowed; }
+  button.ghost { background: #262b33; }
+  button.ghost:hover:not(:disabled) { background: #323945; }
+  pre { background: #0e1013; border: 1px solid #262b33; border-radius: 6px;
+        padding: 12px; overflow: auto; font-size: 12.5px; margin: 0; max-height: 340px;
+        white-space: pre-wrap; word-break: break-word; }
+  video { width: 380px; background: #000; border-radius: 6px; border: 1px solid #262b33; }
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th, td { border: 1px solid #262b33; padding: 6px 9px; text-align: left; }
+  th { background: #1b1f25; color: #9aa4b2; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok   { color: #68d391; }
+  .bad  { color: #fc8181; }
+  .warn { color: #f6c177; }
+  .row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 380px; }
+  label { color: #9aa4b2; margin-right: 10px; }
+  select { background: #1b1f25; color: #e6e8ec; border: 1px solid #333940;
+           border-radius: 5px; padding: 6px 8px; font-size: 13px; }
+</style>
+
+<h1>Bruma · spike 2 — partilha de ecrã dentro do Tauri</h1>
+<p class="sub">
+  Responde a duas perguntas: <b>o <code>getDisplayMedia()</code> funciona nesta webview</b>
+  (com picker de fontes, áudio do sistema e cursor), e <b>quanto custa mesmo em upload</b>
+  por codec e por <code>contentHint</code>.
+</p>
+
+<h2>1 · Captura</h2>
+<button id="btn-cap">Testar partilha de ecrã</button>
+<button id="btn-cap-audio" class="ghost">Testar com áudio do sistema</button>
+<button id="btn-stop" class="ghost" disabled>Parar</button>
+<div class="row" style="margin-top:10px">
+  <video id="preview" autoplay muted playsinline></video>
+  <div class="grow"><pre id="cap-out">(por testar)</pre></div>
+</div>
+
+<h2>2 · Codecs que este encoder oferece</h2>
+<button id="btn-codecs" class="ghost">Listar codecs</button>
+<pre id="codec-out">(por listar)</pre>
+
+<h2>3 · Bitrate real (loopback local, sem rede)</h2>
+<p class="sub">
+  Mede o que o encoder produz mesmo, com duas ligações WebRTC nesta máquina.
+  O campo <code>encoderImplementation</code> diz se o AV1 vai por <b>hardware</b> ou por software.
+  <b>Precisa da captura ligada.</b>
+</p>
+<label>Cenário no ecrã:</label>
+<select id="scenario">
+  <option value="parado">parado (código/texto, sem mexer)</option>
+  <option value="movimento">com movimento (vídeo ou jogo)</option>
+</select>
+<div style="margin-top:10px">
+  <button id="btn-bitrate" disabled>Medir todas as combinações (~2 min)</button>
+  <button id="btn-bitrate-quick" class="ghost" disabled>Só AV1: com e sem contentHint (~30 s)</button>
+</div>
+<div id="progress" class="sub" style="margin-top:8px"></div>
+<div id="table-wrap" style="margin-top:10px"></div>
+
+<h2>4 · Relatório</h2>
+<button id="btn-copy" class="ghost">Copiar relatório</button>
+<pre id="report">(ainda sem dados)</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const relatorio = { ambiente: {}, captura: null, codecs: null, medicoes: [] };
+let stream = null;
+
+function render() {
+  $('report').textContent = JSON.stringify(relatorio, null, 2);
+}
+
+relatorio.ambiente = {
+  userAgent: navigator.userAgent,
+  plataforma: navigator.platform,
+  nucleos: navigator.hardwareConcurrency,
+};
+render();
+
+// ---------- 1. captura ----------
+
+async function capturar(comAudio) {
+  const pedido = {
+    video: { frameRate: { ideal: 60 } },
+    audio: comAudio ? { echoCancellation: false, noiseSuppression: false } : false,
+  };
+  // Só o Chromium aceita estes; se forem ignorados, aparece na leitura das settings.
+  if (comAudio) pedido.systemAudio = 'include';
+  pedido.surfaceSwitching = 'include';
+  pedido.selfBrowserSurface = 'exclude';
+
+  const t0 = performance.now();
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia(pedido);
+  } catch (e) {
+    const r = { ok: false, pedidoComAudio: comAudio, erro: `${e.name}: ${e.message}`,
+                msAteFalhar: Math.round(performance.now() - t0) };
+    relatorio.captura = r;
+    $('cap-out').innerHTML = `<span class="bad">FALHOU</span>\n` + JSON.stringify(r, null, 2);
+    render();
+    return;
+  }
+  const msAteResolver = Math.round(performance.now() - t0);
+
+  const v = stream.getVideoTracks()[0];
+  const a = stream.getAudioTracks()[0];
+  const s = v ? v.getSettings() : {};
+
+  const r = {
+    ok: true,
+    pedidoComAudio: comAudio,
+    // Se demorou >1s, houve interacao humana => apareceu um picker.
+    msAteResolver,
+    houvePickerProvavelmente: msAteResolver > 1000,
+    video: {
+      label: v ? v.label : null,
+      resolucao: s.width && s.height ? `${s.width}x${s.height}` : null,
+      frameRate: s.frameRate ?? null,
+      displaySurface: s.displaySurface ?? '(nao reportado)',
+      cursor: s.cursor ?? '(nao reportado)',
+      logicalSurface: s.logicalSurface ?? null,
+    },
+    audio: a ? { label: a.label, settings: a.getSettings() } : null,
+    audioObtido: !!a,
+  };
+  relatorio.captura = r;
+
+  const linhas = [
+    `<span class="ok">CAPTURA OK</span>`,
+    r.houvePickerProvavelmente
+      ? `<span class="ok">Picker de fontes: apareceu</span> (${msAteResolver} ms ate resolver)`
+      : `<span class="warn">Picker de fontes: NAO parece ter aparecido</span> (resolveu em ${msAteResolver} ms)`,
+    comAudio
+      ? (r.audioObtido
+          ? `<span class="ok">Audio do sistema: obtido</span>`
+          : `<span class="bad">Audio do sistema: NAO veio nenhuma track</span>`)
+      : `Audio: nao pedido`,
+    '',
+    JSON.stringify(r, null, 2),
+  ];
+  $('cap-out').innerHTML = linhas.join('\n');
+  $('preview').srcObject = stream;
+  $('btn-stop').disabled = false;
+  $('btn-bitrate').disabled = false;
+  $('btn-bitrate-quick').disabled = false;
+
+  v.addEventListener('ended', () => {
+    $('cap-out').innerHTML += `\n\n<span class="warn">A partilha foi terminada pelo utilizador ou pelo SO.</span>`;
+    pararCaptura();
+  });
+  render();
+}
+
+function pararCaptura() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  $('preview').srcObject = null;
+  $('btn-stop').disabled = true;
+  $('btn-bitrate').disabled = true;
+  $('btn-bitrate-quick').disabled = true;
+}
+
+$('btn-cap').onclick = () => capturar(false);
+$('btn-cap-audio').onclick = () => capturar(true);
+$('btn-stop').onclick = pararCaptura;
+
+// ---------- 2. codecs ----------
+
+$('btn-codecs').onclick = () => {
+  const caps = RTCRtpSender.getCapabilities('video');
+  const lista = caps.codecs.map(c => ({
+    mime: c.mimeType,
+    clock: c.clockRate,
+    params: c.sdpFmtpLine || null,
+  }));
+  relatorio.codecs = lista;
+  const familias = [...new Set(lista.map(c => c.mime.split('/')[1]))];
+  $('codec-out').textContent =
+    `Familias: ${familias.join(', ')}\n\n` + JSON.stringify(lista, null, 2);
+  render();
+};
+
+// ---------- 3. bitrate por loopback ----------
+
+async function amostra(pc) {
+  const stats = await pc.getStats();
+  let out = null, codecId = null;
+  stats.forEach(r => {
+    if (r.type === 'outbound-rtp' && r.kind === 'video') {
+      out = {
+        ts: r.timestamp, bytes: r.bytesSent, frames: r.framesEncoded,
+        encoder: r.encoderImplementation ?? '(nao reportado)',
+        limite: r.qualityLimitationReason ?? null,
+        w: r.frameWidth, h: r.frameHeight,
+      };
+      codecId = r.codecId;
+    }
+  });
+  if (out && codecId) stats.forEach(r => { if (r.id === codecId) out.codec = r.mimeType; });
+  return out;
+}
+
+async function medir(mime, hint, segundos) {
+  const track = stream.getVideoTracks()[0];
+  track.contentHint = hint;
+
+  const pc1 = new RTCPeerConnection();
+  const pc2 = new RTCPeerConnection();
+  pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+  pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+  pc2.ontrack = () => {};
+
+  const tx = pc1.addTransceiver(track, { direction: 'sendonly' });
+  let codecPedidoDisponivel = true;
+  if (mime) {
+    const todos = RTCRtpSender.getCapabilities('video').codecs;
+    const alvo = todos.filter(c => c.mimeType.toLowerCase() === mime.toLowerCase());
+    codecPedidoDisponivel = alvo.length > 0;
+    if (alvo.length) {
+      tx.setCodecPreferences([...alvo, ...todos.filter(c => !alvo.includes(c))]);
+    }
+  }
+
+  await pc1.setLocalDescription(await pc1.createOffer());
+  await pc2.setRemoteDescription(pc1.localDescription);
+  await pc2.setLocalDescription(await pc2.createAnswer());
+  await pc1.setRemoteDescription(pc2.localDescription);
+
+  await sleep(3500);                 // deixar o encoder estabilizar
+  const a1 = await amostra(pc1);
+  await sleep(segundos * 1000);
+  const a2 = await amostra(pc1);
+  pc1.close(); pc2.close();
+
+  if (!a1 || !a2) {
+    return { mime: mime || '(automatico)', hint: hint || '(nenhum)', erro: 'sem estatisticas' };
+  }
+  const dt = (a2.ts - a1.ts) / 1000;
+  return {
+    mime: mime || '(automatico)',
+    hint: hint || '(nenhum)',
+    codecUsado: a2.codec ?? '?',
+    codecPedidoDisponivel,
+    kbps: Math.round((a2.bytes - a1.bytes) * 8 / dt / 1000),
+    fps: +(((a2.frames - a1.frames) / dt).toFixed(1)),
+    resolucao: a2.w && a2.h ? `${a2.w}x${a2.h}` : '?',
+    encoder: a2.encoder,
+    limitadoPor: a2.limite,
+  };
+}
+
+function desenharTabela(linhas) {
+  const cabecalhos = ['codec pedido', 'contentHint', 'codec usado', 'kbps', 'fps',
+                      'resolucao', 'encoder', 'limitado por'];
+  const th = cabecalhos.map(h => `<th>${h}</th>`).join('');
+  const tr = linhas.map(r => {
+    if (r.erro) return `<tr><td>${r.mime}</td><td>${r.hint}</td><td colspan="6" class="bad">${r.erro}</td></tr>`;
+    const hw = r.encoder && !/libaom|libvpx|openh264|software|ffmpeg/i.test(r.encoder);
+    return `<tr>
+      <td>${r.mime}</td><td>${r.hint}</td><td>${r.codecUsado}</td>
+      <td class="num">${r.kbps}</td><td class="num">${r.fps}</td><td>${r.resolucao}</td>
+      <td class="${hw ? 'ok' : 'warn'}">${r.encoder}</td>
+      <td>${r.limitadoPor ?? '-'}</td></tr>`;
+  }).join('');
+  $('table-wrap').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+}
+
+async function correrMedicoes(combinacoes, segundos) {
+  $('btn-bitrate').disabled = true;
+  $('btn-bitrate-quick').disabled = true;
+  const cenario = $('scenario').value;
+  const linhas = [];
+  for (let i = 0; i < combinacoes.length; i++) {
+    const [mime, hint] = combinacoes[i];
+    $('progress').textContent =
+      `A medir ${i + 1}/${combinacoes.length}: ${mime || 'automatico'} · hint "${hint || 'nenhum'}" ...`;
+    const r = await medir(mime, hint, segundos);
+    r.cenario = cenario;
+    linhas.push(r);
+    desenharTabela(linhas);
+    relatorio.medicoes = relatorio.medicoes.filter(m => m.cenario !== cenario).concat(linhas);
+    render();
+  }
+  $('progress').textContent = `Terminado (${combinacoes.length} medicoes, cenario "${cenario}").`;
+  $('btn-bitrate').disabled = false;
+  $('btn-bitrate-quick').disabled = false;
+}
+
+$('btn-bitrate').onclick = () => correrMedicoes([
+  ['video/AV1',  'text'],
+  ['video/AV1',  'detail'],
+  ['video/AV1',  'motion'],
+  ['video/AV1',  ''],
+  ['video/VP9',  'text'],
+  ['video/VP9',  ''],
+  ['video/VP8',  'text'],
+  ['video/H264', 'text'],
+], 8);
+
+$('btn-bitrate-quick').onclick = () => correrMedicoes([
+  ['video/AV1', 'text'],
+  ['video/AV1', ''],
+], 8);
+
+// ---------- 4. relatorio ----------
+
+$('btn-copy').onclick = async () => {
+  await navigator.clipboard.writeText(JSON.stringify(relatorio, null, 2));
+  $('btn-copy').textContent = 'Copiado';
+  setTimeout(() => ($('btn-copy').textContent = 'Copiar relatório'), 1500);
+};
+</script>
