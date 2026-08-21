@@ -499,6 +499,21 @@ body.ghost .fog {
 }
 body.ghost .app { transition: filter .8s var(--ease); }
 
+/* --- movimento reduzido --------------------------------------------------- */
+/* Tres animacoes correm em ciclo infinito: a nevoa, o anel de quem fala e os
+   pontos de "esta a escrever". Para quem tem sensibilidade a movimento isso e
+   desconfortavel. A nevoa tem ainda um custo proprio: e um blur(34px) sobre uma
+   camada fixa de ecra inteiro, a animar sem parar numa app que fica aberta o dia
+   todo -- ou seja, GPU e bateria a arder por decoracao. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+  .fog { animation: none; }
+}
+
 /* --- scrollbars ---------------------------------------------------------- */
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }

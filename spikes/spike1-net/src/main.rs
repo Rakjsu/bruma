@@ -31,6 +31,10 @@ use x25519_dalek::PublicKey as XPublic;
 
 const ALPN: &[u8] = b"bruma/spike1/0";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Antes do handshake o outro lado e so "alguem que sabe o nosso endereco". Aceitar
+/// um prefixo de 16 MiB dele significa alocar 16 MiB a pedido de um desconhecido,
+/// repetidamente. Depois de a identidade estar provada, o limite normal aplica-se.
+const MAX_FRAME_PRE_HANDSHAKE: usize = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -177,7 +181,7 @@ async fn session(
     )
     .await?;
 
-    let (x_pub, prekey_sig) = match read_msg(&mut recv).await? {
+    let (x_pub, prekey_sig) = match read_msg(&mut recv, MAX_FRAME_PRE_HANDSHAKE).await? {
         Msg::Hello { x_pub, prekey_sig } => (x_pub, prekey_sig),
         _ => bail!("esperava Hello como primeira mensagem"),
     };
@@ -200,7 +204,7 @@ async fn session(
     let enviei = mine.len();
     write_msg(&mut send, &Msg::Sync { entries: mine }).await?;
 
-    let entries = match read_msg(&mut recv).await? {
+    let entries = match read_msg(&mut recv, MAX_FRAME).await? {
         Msg::Sync { entries } => entries,
         _ => bail!("esperava Sync"),
     };
@@ -217,7 +221,7 @@ async fn session(
     let rx_shared = shared.clone();
     let mut reader = tokio::spawn(async move {
         loop {
-            match read_msg(&mut recv).await {
+            match read_msg(&mut recv, MAX_FRAME).await {
                 Ok(Msg::New { entry }) => {
                     let mut g = rx_shared.store.lock().await;
                     if g.merge(vec![entry.clone()]).unwrap_or(0) > 0 {
@@ -392,14 +396,14 @@ async fn write_msg(send: &mut SendStream, m: &Msg) -> Result<()> {
     Ok(())
 }
 
-async fn read_msg(recv: &mut RecvStream) -> Result<Msg> {
+async fn read_msg(recv: &mut RecvStream, limite: usize) -> Result<Msg> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len)
         .await
         .map_err(|e| anyhow!("read: {e}"))?;
     let n = u32::from_be_bytes(len) as usize;
-    if n > MAX_FRAME {
-        bail!("frame de {n} bytes excede o limite");
+    if n > limite {
+        bail!("frame de {n} bytes excede o limite de {limite}");
     }
     let mut body = vec![0u8; n];
     recv.read_exact(&mut body)

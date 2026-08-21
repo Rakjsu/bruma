@@ -48,6 +48,13 @@ $$('.ident').forEach(el => {
   el.style.backgroundSize = 'cover';
 });
 
+/* A névoa é um blur de ecrã inteiro a animar em ciclo. Não há razão para gastar
+   GPU enquanto a janela nem sequer está a ser vista. */
+document.addEventListener('visibilitychange', () => {
+  const fog = $('.fog');
+  if (fog) fog.style.animationPlayState = document.hidden ? 'paused' : 'running';
+});
+
 /* --------------------------------------------------------------------------
    Navegação entre vistas
    -------------------------------------------------------------------------- */
@@ -138,6 +145,36 @@ let stream = null;
 const desenharRelatorio = () => { $('#report').textContent = JSON.stringify(relatorio, null, 2); };
 desenharRelatorio();
 
+/* --- escrita segura no DOM ---
+   Isto nao e zelo excessivo. O v.label e o TITULO da janela que se esta a partilhar, e
+   qualquer pagina web o controla via document.title. Com innerHTML, bastava um amigo mandar
+   um link, abrires a pagina e partilhares essa janela para correr script dentro da app -- e
+   numa app Tauri isso alcanca a ponte IPC. O JSON.stringify nao salva: escapa aspas, mas
+   deixa passar < e >. */
+
+function escaparHtml(v) {
+  return String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/** Escreve o painel de captura sem passar por innerHTML. */
+function mostrarCaptura(linhas, dados) {
+  const out = $('#cap-out');
+  out.textContent = '';
+  for (const l of linhas) {
+    if (l.classe) {
+      const span = document.createElement('span');
+      span.className = l.classe;
+      span.textContent = l.texto;
+      out.append(span);
+    } else {
+      out.append(l.texto);
+    }
+    if (l.extra) out.append(l.extra);
+    out.append('\n');
+  }
+  out.append('\n' + JSON.stringify(dados, null, 2));
+}
+
 /* --- 1. captura --- */
 
 async function capturar(comAudio) {
@@ -159,7 +196,7 @@ async function capturar(comAudio) {
       msAteFalhar: Math.round(performance.now() - t0),
     };
     relatorio.captura = r;
-    $('#cap-out').innerHTML = `<span class="bad">FALHOU</span>\n\n` + JSON.stringify(r, null, 2);
+    mostrarCaptura([{ classe: 'bad', texto: 'FALHOU' }], r);
     desenharRelatorio();
     return;
   }
@@ -187,18 +224,19 @@ async function capturar(comAudio) {
   };
   relatorio.captura = r;
 
-  $('#cap-out').innerHTML = [
-    `<span class="ok">CAPTURA OK</span>`,
+  mostrarCaptura([
+    { classe: 'ok', texto: 'CAPTURA OK' },
     r.houvePickerProvavelmente
-      ? `<span class="ok">picker de fontes: apareceu</span>  (${msAteResolver} ms ate resolver)`
-      : `<span class="warn">picker de fontes: NAO parece ter aparecido</span>  (resolveu em ${msAteResolver} ms)`,
+      ? { classe: 'ok', texto: 'picker de fontes: apareceu',
+          extra: `  (${msAteResolver} ms ate resolver)` }
+      : { classe: 'warn', texto: 'picker de fontes: NAO parece ter aparecido',
+          extra: `  (resolveu em ${msAteResolver} ms)` },
     comAudio
-      ? (r.audioObtido ? `<span class="ok">audio do sistema: obtido</span>`
-                       : `<span class="bad">audio do sistema: nenhuma track veio</span>`)
-      : `audio: nao pedido`,
-    '',
-    JSON.stringify(r, null, 2),
-  ].join('\n');
+      ? (r.audioObtido
+          ? { classe: 'ok', texto: 'audio do sistema: obtido' }
+          : { classe: 'bad', texto: 'audio do sistema: nenhuma track veio' })
+      : { texto: 'audio: nao pedido' },
+  ], r);
 
   $('#preview').srcObject = stream;
   $('#btn-stop').disabled = false;
@@ -258,6 +296,7 @@ async function medir(mime, hint, segundos) {
 
   const pc1 = new RTCPeerConnection();
   const pc2 = new RTCPeerConnection();
+  try {
   pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
   pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
   pc2.ontrack = () => {};
@@ -276,7 +315,6 @@ async function medir(mime, hint, segundos) {
   const a1 = await amostra(pc1);
   await sleep(segundos * 1000);
   const a2 = await amostra(pc1);
-  pc1.close(); pc2.close();
 
   if (!a1 || !a2) return { mime, hint: hint || '(nenhum)', erro: 'sem estatisticas' };
   const dt = (a2.ts - a1.ts) / 1000;
@@ -291,18 +329,25 @@ async function medir(mime, hint, segundos) {
     encoder: a2.encoder,
     limitadoPor: a2.limite,
   };
+  } finally {
+    // Fechar aqui e nao no fim do caminho feliz: se a negociacao SDP falhar a meio, as duas
+    // ligacoes ficavam abertas e a track de ecra presa. Ao fim das oito medicoes do teste
+    // completo seriam ate dezasseis ligacoes penduradas.
+    pc1.close();
+    pc2.close();
+  }
 }
 
 function desenharTabela(linhas) {
   const cols = ['pedido', 'hint', 'usado', 'kbps', 'fps', 'resolucao', 'encoder', 'limitado'];
   const th = cols.map(c => `<th>${c}</th>`).join('');
   const tr = linhas.map(r => {
-    if (r.erro) return `<tr><td>${r.mime}</td><td>${r.hint}</td><td colspan="6" class="bad">${r.erro}</td></tr>`;
+    if (r.erro) return `<tr><td>${escaparHtml(r.mime)}</td><td>${escaparHtml(r.hint)}</td><td colspan="6" class="bad">${escaparHtml(r.erro)}</td></tr>`;
     const hw = r.encoder && !/libaom|libvpx|openh264|software|ffmpeg/i.test(r.encoder);
     return `<tr>
-      <td>${r.mime.replace('video/', '')}</td><td>${r.hint}</td><td>${(r.codecUsado || '').replace('video/', '')}</td>
-      <td class="num">${r.kbps}</td><td class="num">${r.fps}</td><td>${r.resolucao}</td>
-      <td class="${hw ? 'ok' : 'warn'}">${r.encoder}</td><td>${r.limitadoPor ?? '-'}</td></tr>`;
+      <td>${escaparHtml(r.mime.replace('video/', ''))}</td><td>${escaparHtml(r.hint)}</td><td>${escaparHtml((r.codecUsado || '').replace('video/', ''))}</td>
+      <td class="num">${escaparHtml(r.kbps)}</td><td class="num">${escaparHtml(r.fps)}</td><td>${escaparHtml(r.resolucao)}</td>
+      <td class="${hw ? 'ok' : 'warn'}">${escaparHtml(r.encoder)}</td><td>${escaparHtml(r.limitadoPor ?? '-')}</td></tr>`;
   }).join('');
   $('#table-wrap').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
 }
@@ -312,6 +357,7 @@ async function correrMedicoes(combos, segundos) {
   $('#btn-bitrate-quick').disabled = true;
   const cenario = $('#scenario').value;
   const linhas = [];
+  try {
   for (let i = 0; i < combos.length; i++) {
     const [mime, hint] = combos[i];
     $('#progress').textContent = `a medir ${i + 1}/${combos.length} · ${mime.replace('video/', '')} · hint "${hint || 'nenhum'}"`;
@@ -323,8 +369,15 @@ async function correrMedicoes(combos, segundos) {
     desenharRelatorio();
   }
   $('#progress').textContent = `terminado · ${combos.length} medicoes no cenario "${cenario}"`;
-  $('#btn-bitrate').disabled = false;
-  $('#btn-bitrate-quick').disabled = false;
+  } catch (e) {
+    $('#progress').textContent = `interrompido por erro: ${e.message}`;
+    console.error(e);
+  } finally {
+    // Sem isto, uma excecao a meio deixava os dois botoes desativados para sempre: a unica
+    // saida seria recarregar, e o relatorio ja recolhido perdia-se.
+    $('#btn-bitrate').disabled = false;
+    $('#btn-bitrate-quick').disabled = false;
+  }
 }
 
 $('#btn-bitrate-quick').onclick = () => correrMedicoes([['video/AV1', 'text'], ['video/AV1', '']], 8);

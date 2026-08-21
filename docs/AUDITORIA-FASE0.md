@@ -3,6 +3,24 @@
 Revisão do que foi construído nos três spikes. Cada achado foi verificado contra o código, e os que
 não sobreviveram à verificação estão listados no fim para não voltarem a aparecer.
 
+## Estado das correções
+
+| # | Achado | Estado |
+|---|---|---|
+| 1.1 | XSS pelo título da janela partilhada | **corrigido** — `mostrarCaptura()` sem `innerHTML`, escape na tabela |
+| 1.2 | CI vermelho em Linux | **corrigido** — escopo por plataforma, exclui o Tauri em Linux |
+| 1.3 | Fuga de `RTCPeerConnection` e botões presos | **corrigido** — `try/finally` em `medir()` e `correrMedicoes()` |
+| 1.4 | Falta o ficheiro LICENSE | **corrigido** — texto canónico da AGPL-3.0 |
+| 1.5 | 16 MiB alocados antes do handshake | **corrigido** — limite de 64 KiB até a identidade estar provada, nos dois spikes |
+| 2.4 | Animações sem `prefers-reduced-motion` | **corrigido** — media query + névoa pausa em segundo plano |
+| 2.1 | Cadeia de hash decorativa | em aberto — precisa de decisão (ver 2.1) |
+| 2.2 | Ordem por relógio de parede | em aberto — resolve-se com 2.1 |
+| 2.3 | Log reescrito por inteiro | em aberto — morre na Fase 1 com SQLite |
+| 2.5 | Raciocínio só nos READMEs | em aberto |
+
+A correção do XSS foi verificada por teste no browser: a técnica antiga injeta a tag (`antigo_injectou: true`),
+a nova não (`novo_injectou: false`) e mantém as cores do painel.
+
 ---
 
 ## O que muda decisões
