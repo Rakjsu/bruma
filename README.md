@@ -6,9 +6,12 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e 12 palavras recuperam-na noutro lado. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.1.x — utilizável para texto.** Já dá para entrar, criar um servidor, criar
-> canais, convidar amigos e conversar. **Voz e partilha de ecrã ainda não passam entre peers**:
-> a captura está validada, falta o transporte.
+> **Estado: v0.2.0 — texto, voz e partilha de ecrã.** Entrar, criar servidor, criar canais,
+> convidar amigos, conversar, e entrar em salas de voz com partilha de ecrã.
+>
+> ⚠️ **A voz e o ecrã só ligam na mesma rede local sem configuração extra.** Para funcionar
+> entre casas é preciso um servidor TURN — configura-o em *botão direito → Servidores de
+> ligação*. O chat funciona em qualquer caso, porque usa o iroh e não o WebRTC.
 
 ## Instalar
 
