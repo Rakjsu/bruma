@@ -10,7 +10,8 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 
-# Tauri
+# Tauri: gen/ e gerado pelo tauri-build a cada compilacao.
+**/gen/schemas/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
 
