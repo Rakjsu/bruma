@@ -31,8 +31,8 @@ O plano completo, com as decisões e — mais importante — as limitações que
 
 | Spike | Pergunta que responde | Estado |
 |---|---|---|
-| [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | a testar |
-| 2 · ecrã | Dá para partilhar ecrã com áudio dentro do Tauri? | por fazer |
+| [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | código pronto, [à espera do teste real](docs/TESTE-COM-AMIGO.md) |
+| [2 · ecrã](spikes/spike2-screen/) | Dá para partilhar ecrã com áudio dentro do Tauri, e a que custo? | pronto a correr |
 | 3 · fantasma | Dá para sincronizar chat por `.onion` sem tor externo? | por fazer |
 
 O Spike 1 vem primeiro de propósito: se a resposta for não, a arquitetura inteira muda e
@@ -47,6 +47,18 @@ cargo run -p spike1-net -- --name ana
 ```
 
 Instruções completas e como ler o resultado: [`spikes/spike1-net/README.md`](spikes/spike1-net/README.md).
+Para o teste que interessa mesmo — duas casas, duas redes — segue
+[`docs/TESTE-COM-AMIGO.md`](docs/TESTE-COM-AMIGO.md); do outro lado basta um executável, sem
+instalar nada.
+
+## Correr o Spike 2
+
+```bash
+cargo run -p spike2-screen
+```
+
+Abre uma janela que testa a partilha de ecrã e mede o bitrate real do encoder por codec e por
+`contentHint`. Detalhes em [`spikes/spike2-screen/README.md`](spikes/spike2-screen/README.md).
 
 ## O que o Bruma não faz
 
