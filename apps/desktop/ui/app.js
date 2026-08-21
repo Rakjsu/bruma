@@ -267,6 +267,7 @@ async function desenharTudo() {
   desenharMembros();
   desenharTopo();
   await desenharMensagens();
+  desenharRodape();
 }
 
 function escolherServidor(id) {
@@ -584,6 +585,7 @@ const voz = {
   canal: null,
   micro: null,
   ecra: null,
+  camara: null,
   pcs: new Map(),        // peer -> ligação
   presentes: new Map(),  // peer -> canal em que está
 };
@@ -661,9 +663,11 @@ async function sairDeVoz(anunciar = true) {
   voz.pcs.clear();
   if (voz.micro) voz.micro.getTracks().forEach(t => t.stop());
   if (voz.ecra) voz.ecra.getTracks().forEach(t => t.stop());
-  voz.micro = null; voz.ecra = null;
+  if (voz.camara) voz.camara.getTracks().forEach(t => t.stop());
+  voz.micro = null; voz.ecra = null; voz.camara = null;
   voz.canal = null;
   desenharVoz();
+  desenharRodape();
 }
 
 function garantirLigacao(peer) {
@@ -676,6 +680,7 @@ function garantirLigacao(peer) {
 
   if (voz.micro) voz.micro.getTracks().forEach(t => pc.addTrack(t, voz.micro));
   if (voz.ecra) voz.ecra.getTracks().forEach(t => pc.addTrack(t, voz.ecra));
+  if (voz.camara) voz.camara.getTracks().forEach(t => pc.addTrack(t, voz.camara));
 
   pc.onicecandidate = e => {
     if (e.candidate) sinalizar(peer, { tipo: 'ice', candidato: e.candidate });
@@ -778,6 +783,8 @@ function painelDeVoz(chave, rotulo, stream) {
     el.autoplay = true;
     el.playsInline = true;
     el.muted = chave === voz.eu;      // nunca ouvir o próprio microfone
+    if (chave === voz.eu) el.dataset.proprio = '1';
+    else el.muted = surdo;
     el.srcObject = stream;
     t.append(el);
   } else {
@@ -790,7 +797,8 @@ function painelDeVoz(chave, rotulo, stream) {
       const a = document.createElement('audio');
       a.autoplay = true;
       a.srcObject = stream;
-      a.muted = chave === voz.eu;
+      a.muted = chave === voz.eu || surdo;
+      if (chave === voz.eu) a.dataset.proprio = '1';
       t.append(a);
     }
   }
@@ -838,7 +846,7 @@ function desenharVoz() {
     return;
   }
 
-  grelha.append(painelDeVoz(voz.eu, voz.ecra ? 'tu · a partilhar' : 'tu', voz.ecra || voz.micro));
+  grelha.append(painelDeVoz(voz.eu, voz.ecra ? 'tu · a partilhar' : 'tu', voz.ecra || voz.camara || voz.micro));
   for (const p of outros) {
     const l = voz.pcs.get(p);
     grelha.append(painelDeVoz(p, nomeDoPeer(p), l ? l.stream : null));
@@ -868,6 +876,7 @@ listen('presenca', ev => {
   }
   desenharVoz();
   desenharCanais();
+  desenharRodape();
 });
 
 listen('sinal', ev => {
@@ -875,6 +884,174 @@ listen('sinal', ev => {
   if (canal !== voz.canal) return;
   try { receberSinal(de, JSON.parse(dados)); } catch (e) { console.error(e); }
 });
+
+/* ==========================================================================
+   Rodapé: o que tens aberto, a ligação de voz, e os botões ao lado do nome.
+   ========================================================================== */
+
+let jogoAberto = null;
+
+/* --- o que tens aberto ----------------------------------------------------- */
+
+async function verJogo() {
+  try {
+    const j = await invoke('jogo_em_execucao');
+    jogoAberto = j;
+    const linha = $('#jogo');
+    if (!j) { linha.hidden = true; return; }
+    linha.hidden = false;
+    $('#jogo-nome').textContent = j.titulo;
+    pintar($('#jogo-marca'), j.processo);
+    const aTransmitir = !!voz.ecra;
+    $('#jogo-estado').textContent = aTransmitir ? 'A transmitir' : 'Não estás a transmitir';
+    $('#btn-jogo').classList.toggle('is-on', aTransmitir);
+    $('#btn-jogo').title = aTransmitir
+      ? 'Parar de transmitir'
+      : `Transmitir — escolhe "${j.titulo}" na janela que aparece`;
+  } catch (e) {
+    $('#jogo').hidden = true;
+  }
+}
+
+$('#btn-jogo').onclick = async () => {
+  // Não dá para começar a partilhar sem estar numa sala: não haveria a quem enviar.
+  if (!voz.canal) {
+    const s = servidor();
+    const sala = s && s.canais.find(c => c.tipo === 'voz');
+    if (!sala) return;
+    canalAtual = sala.id;
+    desenharCanais();
+    desenharTopo();
+    await desenharMensagens();
+    await entrarEmVoz(s.id, sala.id);
+  }
+  alternarEcra();
+};
+
+setInterval(verJogo, 5000);
+
+/* --- ligação de voz --------------------------------------------------------- */
+
+/** Lê a qualidade da ligação das estatísticas do WebRTC, em vez de a inventar. */
+async function qualidadeDaLigacao() {
+  const ligacoes = [...voz.pcs.values()];
+  if (!ligacoes.length) return { ok: true, texto: 'Voz conectada' };
+  let pior = 0;
+  let algumaLigada = false;
+  for (const l of ligacoes) {
+    if (l.pc.connectionState === 'connected') algumaLigada = true;
+    try {
+      const stats = await l.pc.getStats();
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime) {
+          pior = Math.max(pior, r.currentRoundTripTime * 1000);
+        }
+      });
+    } catch (e) { /* sem estatísticas ainda */ }
+  }
+  if (!algumaLigada) return { ok: false, texto: 'A ligar…' };
+  if (!pior) return { ok: true, texto: 'Voz conectada' };
+  return { ok: pior < 250, texto: `Voz conectada · ${Math.round(pior)} ms` };
+}
+
+async function desenharRodape() {
+  const ligado = !!voz.canal;
+  $('#ligacao').hidden = !ligado;
+
+  if (ligado) {
+    const s = vista.servidores.find(x => x.id === voz.servidor);
+    const canal = s && s.canais.find(c => c.id === voz.canal);
+    $('#ligacao-onde').textContent = canal && s ? `${canal.nome} / ${s.nome}` : '—';
+
+    const q = await qualidadeDaLigacao();
+    $('#ligacao-estado').textContent = q.texto;
+    $('#ligacao-estado').classList.toggle('is-fraco', !q.ok);
+    $('#ligacao-sinal').classList.toggle('is-fraco', !q.ok);
+
+    $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
+    $('#btn-camara').classList.toggle('is-on', !!voz.camara);
+    $('#btn-ruido').classList.toggle('is-cortado', !ruidoSuprimido);
+    $('#btn-ruido').title = ruidoSuprimido
+      ? 'Supressão de ruído ligada'
+      : 'Supressão de ruído desligada';
+  }
+
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  $('#btn-mic').classList.toggle('is-cortado', !!t && !t.enabled);
+  $('#btn-mic').title = !t ? 'Sem microfone' : (t.enabled ? 'Silenciar microfone' : 'Ligar microfone');
+  $('#btn-surdo').classList.toggle('is-cortado', surdo);
+  $('#btn-surdo').title = surdo ? 'Voltar a ouvir' : 'Silenciar tudo';
+}
+
+/* --- botões ---------------------------------------------------------------- */
+
+let surdo = false;
+let ruidoSuprimido = true;
+
+$('#btn-mic').onclick = () => {
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  if (t) { t.enabled = !t.enabled; desenharVoz(); desenharRodape(); }
+};
+
+$('#btn-surdo').onclick = () => {
+  // Ficar surdo silencia tudo o que entra E o próprio microfone, como no Discord:
+  // não faz sentido continuar a falar para quem não se consegue ouvir a responder.
+  surdo = !surdo;
+  document.querySelectorAll('#voz-grelha audio, #voz-grelha video').forEach(el => {
+    if (!el.dataset.proprio) el.muted = surdo;
+  });
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  if (t && surdo) t.enabled = false;
+  desenharVoz();
+  desenharRodape();
+};
+
+$('#btn-ruido').onclick = async () => {
+  ruidoSuprimido = !ruidoSuprimido;
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  if (t) {
+    try {
+      await t.applyConstraints({
+        noiseSuppression: ruidoSuprimido,
+        echoCancellation: ruidoSuprimido,
+        autoGainControl: ruidoSuprimido,
+      });
+    } catch (e) {
+      console.warn('o microfone não aceitou a mudança:', e);
+    }
+  }
+  desenharRodape();
+};
+
+$('#btn-desligar').onclick = () => sairDeVoz();
+$('#btn-partilhar').onclick = () => alternarEcra();
+
+$('#btn-camara').onclick = async () => {
+  if (voz.camara) {
+    voz.camara.getTracks().forEach(t => t.stop());
+    voz.camara = null;
+    for (const [, l] of voz.pcs) {
+      l.pc.getSenders()
+        .filter(s => s.track && s.track.kind === 'video' && s.track.label.indexOf('screen') < 0)
+        .forEach(s => l.pc.removeTrack(s));
+    }
+  } else {
+    try {
+      voz.camara = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    } catch (e) {
+      console.warn('sem câmara:', e);
+      return;
+    }
+    for (const [, l] of voz.pcs) {
+      voz.camara.getTracks().forEach(t => l.pc.addTrack(t, voz.camara));
+    }
+  }
+  desenharVoz();
+  desenharRodape();
+};
+
+// A ligação muda de qualidade sozinha; o rodapé acompanha.
+setInterval(() => { if (voz.canal) desenharRodape(); }, 3000);
 
 /* ---------- arranque ---------- */
 
@@ -887,4 +1064,6 @@ listen('sinal', ev => {
     $('#in-nome').focus();
   }
   procurarAtualizacao();
+  verJogo();
+  desenharRodape();
 })();

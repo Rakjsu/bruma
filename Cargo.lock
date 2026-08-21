@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bruma"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -581,6 +581,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tokio",
+ "windows 0.62.2",
  "x25519-dalek",
 ]
 

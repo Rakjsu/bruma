@@ -7,6 +7,7 @@
 
 mod comandos;
 mod estado;
+mod jogo;
 mod modelo;
 mod rede;
 
@@ -49,6 +50,7 @@ fn main() {
             comandos::enviar_sinal,
             comandos::meu_endereco,
             comandos::saude,
+            jogo::jogo_em_execucao,
         ])
         .run(tauri::generate_context!())
         .expect("falha a arrancar o Bruma");

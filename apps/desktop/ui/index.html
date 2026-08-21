@@ -31,18 +31,97 @@
 
     <div class="sidebar__scroll" id="lista-canais"></div>
 
-    <div class="me">
-      <span class="ident ident--lg" id="meu-avatar"></span>
-      <div class="me__id">
-        <span class="me__name" id="meu-nome">—</span>
-        <span class="me__key" id="minha-chave" title="A tua chave pública é o teu ID"></span>
-      </div>
-      <div class="me__actions">
-        <button class="ico" id="btn-perfil" title="Mudar o meu nome">
-          <svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="2.4" fill="none"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" fill="none"/></svg>
+    <div class="rodape">
+      <!-- 1 · o que tens aberto -->
+      <div class="jogo" id="jogo" hidden>
+        <span class="jogo__marca" id="jogo-marca"></span>
+        <div class="jogo__txt">
+          <b id="jogo-nome">—</b>
+          <i id="jogo-estado">Não estás a transmitir</i>
+        </div>
+        <button class="ico ico--jogo" id="btn-jogo" title="Transmitir esta janela">
+          <svg viewBox="0 0 18 18" width="17" height="17">
+            <rect x="1.5" y="3" width="15" height="10" rx="1.6" fill="none"/>
+            <path d="M6.5 16h5" fill="none"/>
+            <path d="M6.2 8.6h4.4M8.9 6.6l2.2 2-2.2 2" fill="none"/>
+          </svg>
         </button>
       </div>
+
+      <!-- 2 · voz ligada -->
+      <div class="ligacao" id="ligacao" hidden>
+        <div class="ligacao__cima">
+          <span class="ligacao__sinal" id="ligacao-sinal">
+            <svg viewBox="0 0 18 18" width="16" height="16">
+              <path d="M2.6 11.2a9 9 0 0 1 12.8 0" fill="none"/>
+              <path d="M5.2 13.4a5.4 5.4 0 0 1 7.6 0" fill="none"/>
+              <circle cx="9" cy="15.4" r="1.2"/>
+            </svg>
+          </span>
+          <div class="ligacao__txt">
+            <b id="ligacao-estado">Voz conectada</b>
+            <i id="ligacao-onde">—</i>
+          </div>
+          <button class="ico" id="btn-ruido" title="Supressão de ruído">
+            <svg viewBox="0 0 18 18" width="16" height="16">
+              <path d="M3 7v4M6 4.5v9M9 6v6M12 3.5v11M15 7v4" fill="none" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <button class="ico ico--sair" id="btn-desligar" title="Sair do canal de voz">
+            <svg viewBox="0 0 18 18" width="16" height="16">
+              <path d="M2.4 8.2c4-3 9.2-3 13.2 0l-1.4 2.4-3-.8-.5-2.1a8.6 8.6 0 0 0-3.4 0l-.5 2.1-3 .8z" fill="none"/>
+              <path d="M3 15L15 3" fill="none" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="ligacao__botoes">
+          <button class="ico2" id="btn-camara" title="Câmara">
+            <svg viewBox="0 0 20 20" width="18" height="18">
+              <rect x="2" y="5.5" width="11" height="9" rx="2" fill="none"/>
+              <path d="M13 9l4.5-2.6v7.2L13 11z" fill="none"/>
+            </svg>
+          </button>
+          <button class="ico2" id="btn-partilhar" title="Partilhar ecrã">
+            <svg viewBox="0 0 20 20" width="18" height="18">
+              <rect x="2" y="3.5" width="16" height="11" rx="1.8" fill="none"/>
+              <path d="M7 17.5h6" fill="none" stroke-linecap="round"/>
+              <path d="M7 9h5M10 6.8 12.2 9 10 11.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 3 · eu -->
+      <div class="me">
+        <span class="ident ident--lg" id="meu-avatar"></span>
+        <div class="me__id">
+          <span class="me__name" id="meu-nome">—</span>
+          <span class="me__key" id="minha-chave" title="A tua chave pública é o teu ID"></span>
+        </div>
+        <div class="me__actions">
+          <button class="ico" id="btn-mic" title="Microfone">
+            <svg viewBox="0 0 16 16" width="15" height="15">
+              <rect x="6" y="2" width="4" height="7" rx="2"/>
+              <path d="M4 8a4 4 0 0 0 8 0M8 12v2" fill="none"/>
+            </svg>
+          </button>
+          <button class="ico" id="btn-surdo" title="Silenciar tudo">
+            <svg viewBox="0 0 16 16" width="15" height="15">
+              <path d="M3 10V8a5 5 0 0 1 10 0v2" fill="none"/>
+              <rect x="2" y="9" width="3" height="5" rx="1.4"/>
+              <rect x="11" y="9" width="3" height="5" rx="1.4"/>
+            </svg>
+          </button>
+          <button class="ico" id="btn-perfil" title="Definições">
+            <svg viewBox="0 0 16 16" width="15" height="15">
+              <circle cx="8" cy="8" r="2.4" fill="none"/>
+              <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" fill="none"/>
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
+
   </aside>
 
   <main class="chat">
