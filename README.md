@@ -33,7 +33,7 @@ O plano completo, com as decisões e — mais importante — as limitações que
 |---|---|---|
 | [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | código pronto, [à espera do teste real](docs/TESTE-COM-AMIGO.md) |
 | [2 · ecrã](spikes/spike2-screen/) | Dá para partilhar ecrã com áudio dentro do Tauri, e a que custo? | pronto a correr |
-| [3 · fantasma](spikes/spike3-ghost/) | Dá para sincronizar chat por `.onion` sem tor externo? | pronto a correr |
+| [3 · fantasma](spikes/spike3-ghost/) | Dá para sincronizar chat por `.onion` sem tor externo? | **bloqueado** — o arranque do Tor não conclui |
 
 O Spike 1 vem primeiro de propósito: se a resposta for não, a arquitetura inteira muda e
 tudo o resto seria trabalho deitado fora.

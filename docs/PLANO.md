@@ -123,8 +123,13 @@ Partilhar ecrã com áudio do sistema entre dois clientes.
 - Caminho B: captura nativa em Rust (`scap` 0.0.8) publicada pelo crate `livekit` 0.8.3.
 - **Gate**: se nenhum der ecrã+áudio fiável no Windows, parar e reavaliar (Electron ou janela dedicada).
 
-**Spike 3 — Modo Fantasma.**
+**Spike 3 — Modo Fantasma.** — **EXECUTADO, BLOQUEADO (21/08/2026)**
 Dois peers a sincronizar chat por `.onion` com arti embutido, sem tor externo e sem portas abertas.
+O arti embebe-se, liga-se a relays reais e recebe o consenso, mas o `create_bootstrapped()` nunca
+retorna e nada é gravado em cache. Cinco causas eliminadas com medições (operador, lentidão,
+relógio, permissões, runtime) — ver `spikes/spike3-ghost/README.md`. Suspeita-se de um problema do
+arti no Windows. **Consequência para o plano:** o Modo Fantasma deixa de ser dado como adquirido na
+Fase 2. Nada da Fase 1 depende dele.
 
 ## Fase 1 — MVP usável
 

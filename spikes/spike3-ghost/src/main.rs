@@ -116,7 +116,14 @@ async fn main() -> Result<()> {
 
     println!("tor        : a arrancar e a construir circuitos (pode levar 30-60 s)...");
     let t0 = std::time::Instant::now();
-    let client = TorClient::builder()
+    // TEM de ser o runtime ATUAL, nao um que o arti crie sozinho. Estamos dentro de um
+    // #[tokio::main], e o arti grava o consenso em SQLite por spawn_blocking; se esse
+    // trabalho for para um runtime que ninguem conduz, as chamadas nunca voltam. O sintoma
+    // e cruel porque nao ha erro nenhum: a rede funciona, o consenso chega, e o arranque
+    // simplesmente nunca termina.
+    let runtime = tor_rtcompat::PreferredRuntime::current()
+        .map_err(|e| anyhow!("nao consegui usar o runtime atual: {e}"))?;
+    let client = TorClient::with_runtime(runtime)
         .config(config)
         .create_bootstrapped()
         .await
