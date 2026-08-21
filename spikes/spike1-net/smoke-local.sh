@@ -44,8 +44,10 @@ echo "        EndpointId da ana: $ID"
 
 # --- fase 1: rui liga-se, trocam mensagens ---
 echo "[fase 1] rui liga-se e trocam mensagens (~16s)"
-( sleep 6; echo "rui fala com a ana"; sleep 10 ) \
-  | "$BIN" --name rui --connect "$ID" > "$OUT/rui1.log" 2>&1
+# timeout porque o processo NAO termina quando o stdin fecha: a sessao fica a
+# ouvir o peer, que e o comportamento certo num cliente e errado num teste.
+( sleep 6; echo "rui fala com a ana"; sleep 25 ) | timeout -s KILL 18 "$BIN" --name rui --connect "$ID" > "$OUT/rui1.log" 2>&1
+true
 echo "        rui saiu."
 
 # --- fase 2: ana escreve sozinha (rui offline) ---
@@ -54,7 +56,8 @@ sleep 14
 
 # --- fase 3: rui volta e tem de apanhar o que perdeu ---
 echo "[fase 3] rui volta e sincroniza (~15s)"
-( sleep 15 ) | "$BIN" --name rui --connect "$ID" > "$OUT/rui2.log" 2>&1
+( sleep 20 ) | timeout -s KILL 15 "$BIN" --name rui --connect "$ID" > "$OUT/rui2.log" 2>&1
+true
 kill $ANA_PID 2>/dev/null
 wait $ANA_PID 2>/dev/null
 

@@ -1,0 +1,17 @@
+# LF em todo o lado, tambem na copia de trabalho.
+# Sem isto o Git converte para CRLF no Windows e os scripts .sh partem-se no
+# Linux com "bad interpreter" -- e o CI corre em ubuntu-latest.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+
+# Nunca tratar como texto.
+*.key  binary
+*.pem  binary
+*.png  binary
+*.ico  binary
