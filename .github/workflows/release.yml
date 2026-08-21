@@ -1,0 +1,44 @@
+name: Release
+
+# Uma release nasce de uma etiqueta. Nada de builds automaticos a cada push:
+# uma release e uma decisao, nao um efeito secundario.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compilar, assinar e publicar
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A chave privada vive so aqui e em ~/.tauri na maquina do dono.
+          # Sem ela o instalador sai sem assinatura e o auto-update recusa-o.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "Bruma ${{ github.ref_name }}"
+          releaseBody: |
+            Instalador para Windows.
+
+            > O Windows vai avisar que o editor e desconhecido — o instalador nao tem
+            > assinatura de codigo comercial. *Mais informacoes* → *Executar mesmo assim*.
+            > A assinatura que existe e a do auto-update, que garante que uma atualizacao
+            > veio mesmo daqui e nao de outro sitio.
+          releaseDraft: false
+          prerelease: true
+          includeUpdaterJson: true
