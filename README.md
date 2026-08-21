@@ -33,7 +33,7 @@ O plano completo, com as decisões e — mais importante — as limitações que
 |---|---|---|
 | [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | código pronto, [à espera do teste real](docs/TESTE-COM-AMIGO.md) |
 | [2 · ecrã](spikes/spike2-screen/) | Dá para partilhar ecrã com áudio dentro do Tauri, e a que custo? | pronto a correr |
-| 3 · fantasma | Dá para sincronizar chat por `.onion` sem tor externo? | por fazer |
+| [3 · fantasma](spikes/spike3-ghost/) | Dá para sincronizar chat por `.onion` sem tor externo? | pronto a correr |
 
 O Spike 1 vem primeiro de propósito: se a resposta for não, a arquitetura inteira muda e
 tudo o resto seria trabalho deitado fora.
@@ -57,8 +57,18 @@ instalar nada.
 cargo run -p spike2-screen
 ```
 
-Abre uma janela que testa a partilha de ecrã e mede o bitrate real do encoder por codec e por
-`contentHint`. Detalhes em [`spikes/spike2-screen/README.md`](spikes/spike2-screen/README.md).
+Abre a aplicação. O diagnóstico da partilha de ecrã vive no canal `#diagnóstico`, e mede o bitrate
+real do encoder por codec e por `contentHint`.
+Detalhes em [`spikes/spike2-screen/README.md`](spikes/spike2-screen/README.md).
+
+## Correr o Spike 3
+
+```bash
+cargo run -p spike3-ghost -- --name ana
+```
+
+Arranca um cliente Tor embutido e publica um onion service — sem daemon externo e sem abrir portas
+no router. Detalhes em [`spikes/spike3-ghost/README.md`](spikes/spike3-ghost/README.md).
 
 ## O que o Bruma não faz
 

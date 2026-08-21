@@ -59,7 +59,25 @@ struct Shared {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (name, connect_to) = parse_args()?;
+    // O rustls 0.23 recusa-se a escolher sozinho um provedor de cripto quando ha mais do
+    // que um na arvore de dependencias, e entra em panico a meio do arranque do Tor. Tem
+    // de ser escolhido aqui, antes de tudo. Ignora-se o erro porque so falha se ja estiver
+    // instalado, o que nao e problema.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (name, connect_to, verbose) = parse_args()?;
+
+    // O bootstrap do Tor pode demorar minutos e falhar em silencio. Com --verbose
+    // ve-se exatamente onde e que fica preso.
+    if verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "info,arti=debug,tor_dirmgr=debug,tor_guardmgr=debug".into()
+                }),
+            )
+            .init();
+    }
 
     std::fs::create_dir_all("data")?;
     let seed = load_or_create_seed(&format!("data/{name}.key"))?;
@@ -363,10 +381,11 @@ async fn ler<R: futures::AsyncRead + Unpin>(r: &mut R) -> Result<Msg> {
 
 // Auxiliares.
 
-fn parse_args() -> Result<(String, Option<String>)> {
+fn parse_args() -> Result<(String, Option<String>, bool)> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut name = "peer".to_string();
     let mut connect_to = None;
+    let mut verbose = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -385,14 +404,18 @@ fn parse_args() -> Result<(String, Option<String>)> {
                 );
                 i += 2;
             }
+            "--verbose" | "-v" => {
+                verbose = true;
+                i += 1;
+            }
             "--help" | "-h" => {
-                println!("spike3-ghost --name <perfil> [--connect <ENDERECO>.onion]");
+                println!("spike3-ghost --name <perfil> [--connect <ENDERECO>.onion] [--verbose]");
                 std::process::exit(0);
             }
             outro => bail!("argumento desconhecido: {outro}"),
         }
     }
-    Ok((name, connect_to))
+    Ok((name, connect_to, verbose))
 }
 
 fn load_or_create_seed(path: &str) -> Result<[u8; 32]> {
