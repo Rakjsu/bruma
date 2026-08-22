@@ -75,6 +75,15 @@ pub enum Saida {
     },
 }
 
+/// O que passou por uma ligação, para o painel de diagnóstico.
+#[derive(Default, Clone, Copy)]
+pub struct Contagem {
+    pub voz_env: u64,
+    pub voz_rec: u64,
+    pub ecra_env: u64,
+    pub ecra_rec: u64,
+}
+
 pub struct Rede {
     pub endpoint: Endpoint,
     /// Entradas criadas localmente, para as sessões abertas difundirem.
@@ -91,7 +100,7 @@ pub struct Rede {
     /// Existe para o dia em que alguém disser "não se ouve nada". Com isto, a resposta
     /// deixa de ser um palpite: ou não estamos a enviar, ou não estamos a receber, ou o
     /// problema está no som e não na rede — e são três sítios diferentes para procurar.
-    pub contagem: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    pub contagem: std::sync::Mutex<std::collections::HashMap<String, Contagem>>,
     /// As ligações abertas, por peer.
     ///
     /// O resto do módulo trabalha por difusão: escreve-se num canal e cada sessão decide
@@ -202,7 +211,7 @@ impl Rede {
             if let Some(c) = ligacoes.get(p) {
                 if c.send_datagram(bytes.clone()).is_ok() {
                     if let Ok(mut n) = self.contagem.lock() {
-                        n.entry(p.clone()).or_default().0 += 1;
+                        n.entry(p.clone()).or_default().voz_env += 1;
                     }
                 }
             }
@@ -300,7 +309,7 @@ async fn sessao(
                 }
             };
             if let Ok(mut n) = contagem.contagem.lock() {
-                n.entry(voz_peer.clone()).or_default().1 += 1;
+                n.entry(voz_peer.clone()).or_default().voz_rec += 1;
             }
             crate::comandos::voz_recebida(&voz_peer, &d);
         }
@@ -330,6 +339,7 @@ async fn sessao(
         }
     }
 
+    let rede_leitura = rede.clone();
     let leitura_app = app.clone();
     let leitura_janela = janela.clone();
     let peer_leitura = peer.clone();
@@ -344,6 +354,9 @@ async fn sessao(
                     canal,
                     dados,
                 }) => {
+                    if let Ok(mut n) = rede_leitura.contagem.lock() {
+                        n.entry(peer_leitura.clone()).or_default().ecra_rec += 1;
+                    }
                     crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
                 }
                 Ok(Quadro::Controlo(Msg::Ola { nome })) => {
@@ -410,6 +423,9 @@ async fn sessao(
                         }
                         Saida::Sinal { .. } => None,
                         Saida::Video { para, servidor, canal, dados } if para == peer => {
+                            if let Ok(mut n) = rede.contagem.lock() {
+                                n.entry(peer.clone()).or_default().ecra_env += 1;
+                            }
                             Some(Quadro::Video { servidor, canal, dados: dados.as_ref().clone() })
                         }
                         Saida::Video { .. } => None,

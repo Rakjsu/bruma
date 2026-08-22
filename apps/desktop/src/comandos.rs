@@ -397,6 +397,13 @@ pub struct Ecra {
     pub propria: SyncMutex<Option<Channel<InvokeResponseBody>>>,
     /// A que servidor e canal pertence a partilha a decorrer.
     pub onde: SyncMutex<Option<(String, String)>>,
+    /// O princípio da transmissão: o nome do codec e o segmento de inicialização.
+    ///
+    /// Saem uma única vez, quando a partilha começa. Quem carregar em "Assistir" a seguir
+    /// — que é o caso normal — só apanharia fragmentos soltos, e um fragmento sem o
+    /// cabeçalho não é vídeo nenhum: chegam bytes e não aparece imagem. Guardam-se para
+    /// se mandarem a cada espectador novo antes de tudo o resto.
+    pub cabecalho: SyncMutex<Vec<Vec<u8>>>,
 }
 
 /// Guarda-se o canal por onde o ecrã dos outros vai entrar. Um só, porque só se assiste a
@@ -419,8 +426,16 @@ pub fn comecar_a_partilhar(
     *ecra.propria.lock().unwrap() = Some(saida);
     *ecra.onde.lock().unwrap() = Some((servidor.clone(), canal_voz.clone()));
 
+    ecra.cabecalho.lock().unwrap().clear();
     let eco = ecra.clone();
     let entrega: crate::ecra::Entrega = Arc::new(move |pedaco: &[u8]| {
+        // Os dois primeiros pedaços são o codec e o segmento de inicialização.
+        {
+            let mut c = eco.cabecalho.lock().unwrap();
+            if c.len() < 2 {
+                c.push(pedaco.to_vec());
+            }
+        }
         // A pré-visualização local: os bytes vão como estão, sem cabeçalho, porque só há
         // uma origem possível.
         if let Some(c) = eco.propria.lock().unwrap().as_ref() {
@@ -462,9 +477,28 @@ pub fn parar_de_partilhar(ecra: State<Arc<Ecra>>) {
 /// codifica-se e deita-se fora, que é mais barato do que parar e recomeçar o codificador
 /// a cada espectador que chega ou sai.
 #[tauri::command]
-pub fn definir_espectadores(chaves: Vec<String>, ecra: State<Arc<Ecra>>) {
-    if let Ok(e) = ecra.estado.lock() {
-        *e.espectadores.lock().unwrap() = chaves;
+pub fn definir_espectadores(chaves: Vec<String>, ecra: State<Arc<Ecra>>, rede: State<Arc<Rede>>) {
+    let Ok(e) = ecra.estado.lock() else { return };
+    let mut lista = e.espectadores.lock().unwrap();
+
+    // Quem é novo leva primeiro o princípio da transmissão. Sem isto vê os fragmentos
+    // chegarem e um ecrã preto — que foi exatamente o que aconteceu no teste de par.
+    let novos: Vec<String> = chaves
+        .iter()
+        .filter(|c| !lista.contains(c))
+        .cloned()
+        .collect();
+    *lista = chaves;
+    drop(lista);
+
+    if novos.is_empty() {
+        return;
+    }
+    let Some((servidor, canal)) = ecra.onde.lock().unwrap().clone() else {
+        return;
+    };
+    for pedaco in ecra.cabecalho.lock().unwrap().iter() {
+        rede.enviar_video(&novos, &servidor, &canal, Arc::new(pedaco.clone()));
     }
 }
 
@@ -593,15 +627,16 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 ),
                 None => (false, 0.0),
             };
-            let (enviados, recebidos) = rede
+            let n = rede
                 .contagem
                 .lock()
                 .ok()
                 .and_then(|c| c.get(p).copied())
-                .unwrap_or((0, 0));
+                .unwrap_or_default();
             Some(serde_json::json!({
                 "peer": p, "relay": relay, "ms": ms,
-                "enviados": enviados, "recebidos": recebidos,
+                "enviados": n.voz_env, "recebidos": n.voz_rec,
+                "ecraEnviado": n.ecra_env, "ecraRecebido": n.ecra_rec,
             }))
         })
         .collect()

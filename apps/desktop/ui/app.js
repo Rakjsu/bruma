@@ -1944,17 +1944,42 @@ function pararDeAssistir() {
     await entrarEmVoz(servidorId, canal.id);
     diz(`par entrou na sala (microfone=${voz.micro ? 'sim' : 'não'})`);
 
+    // O anfitrião parte o ecrã; o convidado vai assistir. É o caminho que dá sentido ao
+    // projeto e o único que nunca tinha sido visto entre dois pares.
+    if (modo === '') {
+      await esperar(3000);
+      await alternarEcra();
+      diz(`par ANFITRIAO a partilhar=${!!voz.ecra}`);
+    }
+
     // Deixar correr, e depois contar. O que interessa é `recebidos`: prova que o datagrama
     // saiu de uma instância e chegou ao descodificador da outra.
-    for (let volta = 1; volta <= 4; volta++) {
+    for (let volta = 1; volta <= 6; volta++) {
       await esperar(5000);
       const gente = [...voz.presentes.keys()];
       const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
       const resumo = estado.map(e =>
         `${e.peer.slice(0, 6)} ${e.relay ? 'relay' : 'direta'} ↑${e.enviados} ↓${e.recebidos}`
       ).join(' | ');
-      diz(`par ${volta}/4: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
-        + ` | a ouvir ${voz.audio.size} pessoa(s)`);
+      const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
+      diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
+        + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`);
+
+      // Assim que alguém aparecer a transmitir, o convidado carrega em Assistir e conta o
+      // que o <video> conseguiu mesmo descodificar — que é o que separa "chegaram bytes"
+      // de "vê-se imagem".
+      if (modo !== '' && !voz.aVer) {
+        const quem = [...voz.aPartilhar][0];
+        if (quem) { assistir(quem); diz(`par CONVIDADO a assistir a ${quem.slice(0, 6)}`); }
+      }
+      if (voz.aVer) {
+        const el = ecraDe(voz.aVer);
+        const q = el && el.getVideoPlaybackQuality ? el.getVideoPlaybackQuality() : null;
+        diz(`par imagem: ${el ? `${el.videoWidth}x${el.videoHeight}` : 'sem <video>'}`
+          + ` readyState=${el ? el.readyState : '-'}`
+          + ` frames=${q ? q.totalVideoFrames : '?'}`
+          + ` erro=${el && el.error ? el.error.code : 'nenhum'}`);
+      }
     }
   } catch (e) {
     diz(`par FALHOU: ${e}`);
