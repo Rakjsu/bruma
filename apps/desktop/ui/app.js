@@ -800,9 +800,51 @@ const voz = {
   audioCtx: null,
 };
 
-/** Já não há definições de rede — este painel passou a explicar porque é que não há. */
+/** Já não há definições de rede — este painel passou a explicar porque é que não há, e a
+ *  mostrar o que está mesmo a acontecer.
+ *
+ *  O que está aqui é o que transforma um "não se ouve nada" numa resposta: se saíram
+ *  pacotes e não entrou nenhum, o problema é do outro lado; se não saiu nenhum, é deste;
+ *  se entraram e saíram e mesmo assim não se ouve, o problema não é a rede. São três
+ *  sítios diferentes, e sem isto escolhe-se um à sorte.
+ */
 function abrirDefinicoesDeRede() {
   abrir('veu-rede');
+  desenharDiagnostico();
+}
+
+let relogioDiag = null;
+async function desenharDiagnostico() {
+  const alvo = $('#diag-rede');
+  if (!alvo) return;
+  if ($('#veu-rede').hidden) {
+    if (relogioDiag) { clearInterval(relogioDiag); relogioDiag = null; }
+    return;
+  }
+  if (!relogioDiag) relogioDiag = setInterval(desenharDiagnostico, 1500);
+
+  const gente = [...voz.presentes.keys()];
+  if (!gente.length) {
+    alvo.textContent = 'Ninguém ligado neste momento.';
+    return;
+  }
+  const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
+  alvo.textContent = '';
+  if (!estado.length) {
+    alvo.textContent = `${gente.length} presente(s), nenhuma ligação aberta ainda.`;
+    return;
+  }
+  for (const e of estado) {
+    const linha = elemento('div', 'diag__linha');
+    linha.append(elemento('span', 'diag__quem', nomeDoPeer(e.peer)));
+    const caminho = e.relay ? 'por relay' : 'direta';
+    const ms = e.ms ? ` · ${Math.round(e.ms)} ms` : '';
+    const voz_ = `voz ↑${e.enviados} ↓${e.recebidos}`;
+    const d = elemento('span', e.recebidos === 0 && e.enviados > 0 ? 'diag__mudo' : null,
+      `${caminho}${ms} · ${voz_}`);
+    linha.append(d);
+    alvo.append(linha);
+  }
 }
 $('#fechar-rede').onclick = () => fechar('veu-rede');
 
@@ -1855,4 +1897,66 @@ function pararDeAssistir() {
     + (simples.error && simples.error.message ? ` "${simples.error.message}"` : ''));
   simples.remove();
   v.remove();
+})();
+
+/* ---------- autoteste de par: duas instâncias a falar ---------------------- */
+
+/* A voz tem duas metades que se provam sozinhas — o codec e o transporte — e uma que não:
+   a do meio. Quem está na sala, o datagrama a sair para a pessoa certa, e o pedaço a
+   chegar ao descodificador do outro lado. Isso só se vê com duas instâncias.
+
+     bruma --par              cria o servidor e escreve o convite
+     bruma --par=<convite>    entra, junta-se à sala e conta o que ouviu
+
+   Cada uma com o seu BRUMA_DADOS, senão partilham a identidade e não são duas pessoas. */
+(async () => {
+  if (!window.__TAURI__) return;
+  const modo = await invoke('autoteste_par').catch(() => null);
+  if (modo === null || modo === undefined) return;
+
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  const esperar = ms => new Promise(r => setTimeout(r, ms));
+
+  try {
+    let servidorId;
+    if (modo === '') {
+      servidorId = await invoke('criar_servidor', { nome: 'par' });
+      await invoke('criar_canal', { servidor: servidorId, nome: 'sala', tipo: 'voz' });
+      const convite = await invoke('criar_convite', { servidor: servidorId });
+      diz(`par ANFITRIAO convite=${convite}`);
+    } else {
+      servidorId = await invoke('entrar_com_convite', { codigo: modo });
+      diz('par CONVIDADO entrou');
+    }
+
+    // Esperar que o canal de voz apareça: o convidado só o conhece depois de sincronizar.
+    let canal = null;
+    for (let i = 0; i < 40 && !canal; i++) {
+      await desenharTudo();
+      const srv = vista.servidores.find(x => x.id === servidorId);
+      canal = srv && srv.canais.find(c => c.tipo === 'voz');
+      if (!canal) await esperar(500);
+    }
+    if (!canal) return diz('par FALHOU: o canal de voz nunca apareceu');
+
+    servidorAtual = servidorId;
+    canalAtual = canal.id;
+    await entrarEmVoz(servidorId, canal.id);
+    diz(`par entrou na sala (microfone=${voz.micro ? 'sim' : 'não'})`);
+
+    // Deixar correr, e depois contar. O que interessa é `recebidos`: prova que o datagrama
+    // saiu de uma instância e chegou ao descodificador da outra.
+    for (let volta = 1; volta <= 4; volta++) {
+      await esperar(5000);
+      const gente = [...voz.presentes.keys()];
+      const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
+      const resumo = estado.map(e =>
+        `${e.peer.slice(0, 6)} ${e.relay ? 'relay' : 'direta'} ↑${e.enviados} ↓${e.recebidos}`
+      ).join(' | ');
+      diz(`par ${volta}/4: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
+        + ` | a ouvir ${voz.audio.size} pessoa(s)`);
+    }
+  } catch (e) {
+    diz(`par FALHOU: ${e}`);
+  }
 })();

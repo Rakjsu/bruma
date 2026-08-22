@@ -593,7 +593,36 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 ),
                 None => (false, 0.0),
             };
-            Some(serde_json::json!({ "peer": p, "relay": relay, "ms": ms }))
+            let (enviados, recebidos) = rede
+                .contagem
+                .lock()
+                .ok()
+                .and_then(|c| c.get(p).copied())
+                .unwrap_or((0, 0));
+            Some(serde_json::json!({
+                "peer": p, "relay": relay, "ms": ms,
+                "enviados": enviados, "recebidos": recebidos,
+            }))
         })
         .collect()
+}
+
+/// O autoteste de par: `""` significa "sou o anfitrião", um convite significa "sou o
+/// convidado", e `None` significa que não foi pedido.
+///
+/// Existe porque a única parte da voz que nenhum teste de uma máquina só alcança é a do
+/// meio: a lista de quem está na sala, o datagrama a atravessar, e o pedaço a chegar ao
+/// descodificador do outro lado. Com duas instâncias emparelhadas isso passa a ser
+/// verificável sem ninguém a clicar em nada.
+#[tauri::command]
+pub fn autoteste_par() -> Option<String> {
+    for a in std::env::args() {
+        if a == "--par" {
+            return Some(String::new());
+        }
+        if let Some(c) = a.strip_prefix("--par=") {
+            return Some(c.to_string());
+        }
+    }
+    None
 }

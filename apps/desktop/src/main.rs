@@ -84,6 +84,7 @@ fn main() {
             comandos::receber_voz,
             comandos::enviar_voz,
             comandos::qualidade,
+            comandos::autoteste_par,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
             comandos::definir_espectadores,

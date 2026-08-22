@@ -79,6 +79,19 @@ pub struct Rede {
     pub endpoint: Endpoint,
     /// Entradas criadas localmente, para as sessões abertas difundirem.
     pub tx: broadcast::Sender<Saida>,
+    /// Em que sala de voz estamos, se estivermos em alguma.
+    ///
+    /// A presença era só anunciada quando MUDAVA. Quem se ligasse a seguir nunca ficava a
+    /// saber quem já lá estava — e, como só se envia voz a quem se sabe estar na sala, o
+    /// som ia num sentido e não no outro. Guardar o estado atual é o que permite contá-lo
+    /// a quem chega.
+    pub presenca: std::sync::Mutex<Option<(String, Option<String>)>>,
+    /// Quantos pedaços de voz saíram e entraram, por peer.
+    ///
+    /// Existe para o dia em que alguém disser "não se ouve nada". Com isto, a resposta
+    /// deixa de ser um palpite: ou não estamos a enviar, ou não estamos a receber, ou o
+    /// problema está no som e não na rede — e são três sítios diferentes para procurar.
+    pub contagem: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
     /// As ligações abertas, por peer.
     ///
     /// O resto do módulo trabalha por difusão: escreve-se num canal e cada sessão decide
@@ -101,6 +114,8 @@ impl Rede {
             endpoint: endpoint.clone(),
             tx,
             ligacoes: Default::default(),
+            contagem: Default::default(),
+            presenca: Default::default(),
         });
 
         // Aceitar ligações de quem nos conhece.
@@ -114,7 +129,7 @@ impl Rede {
                     tokio::spawn(async move {
                         match incoming.await {
                             Ok(conn) => {
-                                if let Err(e) = sessao(conn, rede, app, janela).await {
+                                if let Err(e) = sessao(conn, false, rede, app, janela).await {
                                     eprintln!("[rede] sessão terminou: {e}");
                                 }
                             }
@@ -159,6 +174,9 @@ impl Rede {
     }
 
     pub fn anunciar_presenca(&self, servidor: &str, canal: Option<String>) {
+        if let Ok(mut p) = self.presenca.lock() {
+            *p = Some((servidor.to_string(), canal.clone()));
+        }
         let _ = self.tx.send(Saida::Presenca(servidor.to_string(), canal));
     }
 
@@ -182,7 +200,11 @@ impl Rede {
         let bytes = bytes::Bytes::copy_from_slice(dados);
         for p in para {
             if let Some(c) = ligacoes.get(p) {
-                let _ = c.send_datagram(bytes.clone());
+                if c.send_datagram(bytes.clone()).is_ok() {
+                    if let Ok(mut n) = self.contagem.lock() {
+                        n.entry(p.clone()).or_default().0 += 1;
+                    }
+                }
             }
         }
     }
@@ -223,21 +245,38 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
         .map_err(|e| anyhow!("não consegui ligar: {e}"))?;
     let (rede, app, janela) = (rede.clone(), app.clone(), janela.clone());
     tokio::spawn(async move {
-        if let Err(e) = sessao(conn, rede, app, janela).await {
+        if let Err(e) = sessao(conn, true, rede, app, janela).await {
             eprintln!("[rede] sessão terminou: {e}");
         }
     });
     Ok(())
 }
 
-async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) -> Result<()> {
-    // Quem abre a ligação abre também o stream; quem aceita espera por ele.
-    let (mut envia, mut recebe) = match conn.open_bi().await {
-        Ok(par) => par,
-        Err(_) => conn
-            .accept_bi()
+/// `iniciei` diz se fomos nós a ligar-nos ou se foi o outro lado.
+///
+/// Não é um detalhe: abrir um stream QUIC é uma ação **local**, que quase sempre funciona.
+/// A versão anterior tentava `open_bi()` e só caía no `accept_bi()` se falhasse — e como
+/// nunca falha, os dois lados abriam o seu próprio stream, escreviam nele, e ficavam à
+/// espera no seu, que ninguém do outro lado alimentava. Dois pares ligavam-se e não
+/// trocavam uma única palavra, sem erro nenhum.
+///
+/// Não apareceu antes porque nunca tinham estado duas instâncias ligadas de verdade.
+async fn sessao(
+    conn: Connection,
+    iniciei: bool,
+    rede: Arc<Rede>,
+    app: Arc<App>,
+    janela: AppHandle,
+) -> Result<()> {
+    // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
+    let (mut envia, mut recebe) = if iniciei {
+        conn.open_bi()
             .await
-            .map_err(|e| anyhow!("sem stream: {e}"))?,
+            .map_err(|e| anyhow!("não consegui abrir o stream: {e}"))?
+    } else {
+        conn.accept_bi()
+            .await
+            .map_err(|e| anyhow!("sem stream: {e}"))?
     };
 
     let peer = conn.remote_id().to_string();
@@ -250,8 +289,19 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
     // A voz chega por aqui, fora do stream de controlo: um datagrama por pedaço de som.
     let voz_conn = conn.clone();
     let voz_peer = peer.clone();
-    let mut ouvinte = tokio::spawn(async move {
-        while let Ok(d) = voz_conn.read_datagram().await {
+    let contagem = rede.clone();
+    let ouvinte = tokio::spawn(async move {
+        loop {
+            let d = match voz_conn.read_datagram().await {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[rede] fim dos datagramas de {voz_peer}: {e}");
+                    break;
+                }
+            };
+            if let Ok(mut n) = contagem.contagem.lock() {
+                n.entry(voz_peer.clone()).or_default().1 += 1;
+            }
             crate::comandos::voz_recebida(&voz_peer, &d);
         }
     });
@@ -269,6 +319,15 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
     };
     for (servidor, entradas) in pacotes {
         escrever(&mut envia, &Msg::Sync { servidor, entradas }).await?;
+    }
+
+    // E dizer onde estamos agora. Sem isto, quem chega depois de nós entrarmos numa sala
+    // não sabe que lá estamos, e não nos manda voz nenhuma.
+    let onde = rede.presenca.lock().ok().and_then(|p| p.clone());
+    if let Some((servidor, canal)) = onde {
+        if canal.is_some() {
+            escrever(&mut envia, &Msg::Presenca { servidor, canal }).await?;
+        }
     }
 
     let leitura_app = app.clone();
@@ -332,8 +391,10 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
     let mut sub = rede.tx.subscribe();
     loop {
         tokio::select! {
+            // Só o leitor de controlo decide o fim. O de datagramas acabar não é motivo
+            // para fechar nada: se ele parar, perde-se a voz — não o servidor inteiro. Ter
+            // os dois aqui fazia com que qualquer soluço na voz levasse o chat com ele.
             _ = &mut leitor => break,
-            _ = &mut ouvinte => break,
             got = sub.recv() => match got {
                 Ok(saida) => {
                     let quadro = match saida {
