@@ -693,3 +693,13 @@ pub fn autoteste_par() -> Option<String> {
     }
     None
 }
+
+/// `bruma --medir-ui` faz a interface medir-se a si própria e escrever os números.
+///
+/// Existe porque fotografar a janela não serve para isto: o `PrintWindow` devolve a
+/// WebView2 incompleta, e trazê-la à frente a partir de outro processo é bloqueado pelo
+/// Windows. Perguntar ao DOM onde estão os elementos é exato e não depende de pixels.
+#[tauri::command]
+pub fn medir_ui_pedido() -> bool {
+    std::env::args().any(|a| a == "--medir-ui")
+}

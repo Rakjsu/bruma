@@ -97,6 +97,7 @@ fn main() {
             comandos::enviar_voz,
             comandos::qualidade,
             comandos::autoteste_par,
+            comandos::medir_ui_pedido,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
             fontes::fontes_de_partilha,

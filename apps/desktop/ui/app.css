@@ -381,7 +381,9 @@ html, body {
 /* --- membros ------------------------------------------------------------- */
 
 .members {
-  background: var(--sidebar); padding: 14px 10px; box-shadow: -1px 0 0 rgba(0, 0, 0, .3);
+  /* 50px em cima: a mesma altura da topbar, para o conteúdo não passar por baixo dos
+     botões da janela. */
+  background: var(--sidebar); padding: 50px 10px 14px; box-shadow: -1px 0 0 rgba(0, 0, 0, .3);
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 /* A lista rola dentro de si. Sem o min-height: 0 o flex deixava-a crescer para lá
@@ -402,6 +404,39 @@ html, body {
 .member b { font: 500 13.5px/1.3 var(--ui); color: var(--text); }
 .member i { font: 400 10.5px/1.3 var(--body); font-style: normal; color: var(--dim); }
 .member.is-off { opacity: .42; }
+
+/* --- barra de janela própria ---------------------------------------------- */
+
+/* A moldura do Windows saiu (decorations: false) e esta toma o lugar dela, na paleta da
+   app. Não é uma barra por cima do cabeçalho: os botões vivem DENTRO da barra que já lá
+   estava, à direita dos chips, e o resto dela arrasta a janela. Uma linha em vez de duas.
+
+   O -webkit-app-region não funciona na WebView2; o arrasto é feito pelo Tauri, com o
+   startDragging no mousedown — ver o app.js. */
+/* Os botões pertencem à JANELA, não à coluna do chat — por isso ficam fixos no canto,
+   por cima da faixa que a coluna dos membros deixa livre no topo. Dentro do fluxo da
+   topbar acabavam a meio da largura, cortados pelo painel da direita. */
+.janela__botoes {
+  position: fixed; top: 0; right: 0; z-index: 100;
+  height: 50px; padding-right: 6px;
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px;
+}
+.janela__bt {
+  width: 34px; height: 30px; display: grid; place-items: center;
+  border: 0; background: transparent; border-radius: 6px;
+  color: var(--dim); cursor: pointer;
+}
+.janela__bt svg { stroke: currentColor; stroke-width: 1.3; fill: none; stroke-linecap: round; }
+.janela__bt:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
+/* O vermelho só no fechar, e só ao passar o rato: um botão de fechar sempre aceso é um
+   aviso constante de uma coisa que ninguém está a fazer. */
+.janela__bt--fechar:hover { background: #b4404a; color: #fff; }
+
+/* Sem moldura, a janela precisa de um contorno próprio ou funde-se com o que está atrás. */
+.moldura {
+  position: fixed; inset: 0; pointer-events: none; z-index: 99;
+  border: 1px solid var(--line); border-radius: 0;
+}
 
 /* --- seletor de fontes de partilha ---------------------------------------- */
 

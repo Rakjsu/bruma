@@ -37,7 +37,8 @@ Descarregar o instalador mais recente:
 
 **https://github.com/Rakjsu/bruma/releases/latest**
 
-O ficheiro é `Bruma_x.y.z_x64-setup.exe`.
+O ficheiro é o **`Instalar-Bruma.exe`** — o instalador do Bruma, com a cara do Bruma.
+(O `Bruma_x.y.z_x64-setup.exe` que está ao lado é o veículo do auto-update; ignora-o.)
 
 > **O Windows vai avisar duas vezes, e as duas são esperadas.** Primeiro o SmartScreen —
 > *"O Windows protegeu o seu PC"* — porque calar esse aviso exige um certificado comercial

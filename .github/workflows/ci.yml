@@ -23,7 +23,7 @@ jobs:
           # Windows, portanto excluem-se em vez de instalar meia distribuicao. O Linux
           # continua a correr para apanhar cedo codigo que so compile em Windows.
           - os: ubuntu-latest
-            escopo: "--workspace --exclude spike2-screen --exclude bruma"
+            escopo: "--workspace --exclude spike2-screen --exclude bruma --exclude instalador"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

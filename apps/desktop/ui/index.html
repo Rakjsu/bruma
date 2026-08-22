@@ -3,6 +3,25 @@
 <title>Bruma</title>
 <link rel="stylesheet" href="app.css">
 
+<div class="moldura" aria-hidden="true"></div>
+
+<!-- Os botões da janela vivem FORA do .app de propósito: a .topbar tem
+     backdrop-filter, e um backdrop-filter cria um bloco de contenção novo —
+     lá dentro, o `position: fixed` passava a ser relativo à barra do canal e os
+     botões iam parar ao meio da janela, por cima do "Convidar". -->
+  <div class="janela__botoes">
+    <button class="janela__bt" data-janela="minimizar" title="Minimizar" aria-label="Minimizar">
+      <svg viewBox="0 0 12 12" width="11" height="11"><path d="M2.5 6h7"/></svg>
+    </button>
+    <button class="janela__bt" data-janela="maximizar" title="Maximizar" aria-label="Maximizar">
+      <svg viewBox="0 0 12 12" width="11" height="11"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/></svg>
+    </button>
+    <button class="janela__bt janela__bt--fechar" data-janela="fechar" title="Fechar" aria-label="Fechar">
+      <svg viewBox="0 0 12 12" width="11" height="11"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+    </button>
+  </div>
+
+
 <div class="app">
   <div class="fog" aria-hidden="true"></div>
   <div class="grain" aria-hidden="true"></div>

@@ -2092,3 +2092,67 @@ function pararDeAssistir() {
     diz(`par FALHOU: ${e}`);
   }
 })();
+
+/* ---------- a barra da janela é nossa -------------------------------------- */
+
+/* A moldura do Windows saiu; estes botões e o arrasto tomam-lhe o lugar. O
+   `-webkit-app-region: drag` do Chromium não funciona na WebView2 — o arrasto tem de ser
+   pedido ao Tauri no mousedown, e é por isso que isto é JavaScript e não três linhas de
+   CSS. */
+(function barraDaJanela() {
+  if (!window.__TAURI__) return;
+  const janela = window.__TAURI__.window.getCurrentWindow();
+
+  document.addEventListener('mousedown', ev => {
+    if (ev.button !== 0) return;
+    const barra = ev.target.closest('.topbar, .barra-instalador, .janela__botoes');
+    if (!barra) return;
+    // Um clique num botão, campo ou chip é para esse elemento, não para arrastar.
+    if (ev.target.closest('button, input, textarea, select, a, .chip, [role="button"]')) return;
+    janela.startDragging();
+  });
+
+  document.addEventListener('dblclick', ev => {
+    const barra = ev.target.closest('.topbar, .barra-instalador');
+    if (!barra || ev.target.closest('button, input, .chip, [role="button"]')) return;
+    janela.toggleMaximize();
+  });
+
+  document.addEventListener('click', ev => {
+    const bt = ev.target.closest('[data-janela]');
+    if (!bt) return;
+    ev.stopPropagation();
+    const accao = bt.dataset.janela;
+    if (accao === 'minimizar') janela.minimize();
+    else if (accao === 'maximizar') janela.toggleMaximize();
+    else if (accao === 'fechar') janela.close();
+  });
+})();
+
+/* ---------- medir a interface, para se poder verificar sem olhos ----------- */
+
+(async () => {
+  if (!window.__TAURI__) return;
+  if (!(await invoke('medir_ui_pedido').catch(() => false))) return;
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  await new Promise(r => setTimeout(r, 1200));
+
+  const medir = sel => {
+    const el = document.querySelector(sel);
+    if (!el) return `${sel}: NAO EXISTE`;
+    const r = el.getBoundingClientRect();
+    const est = getComputedStyle(el);
+    return `${sel}: ${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
+      + ` vis=${est.visibility} disp=${est.display} op=${est.opacity} z=${est.zIndex}`;
+  };
+  diz(`ui janela=${innerWidth}x${innerHeight}`);
+  for (const s of ['.janela__botoes', '.janela__bt', '.janela__bt--fechar', '.topbar', '.transport', '.members']) {
+    diz('ui ' + medir(s));
+  }
+  const bt = document.querySelector('.janela__bt--fechar');
+  if (bt) {
+    const r = bt.getBoundingClientRect();
+    const emCima = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    diz(`ui quem esta no ponto do fechar: ${emCima ? emCima.className || emCima.tagName : 'nada'}`);
+  }
+})();

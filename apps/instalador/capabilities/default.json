@@ -1,14 +1,11 @@
 {
-  "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissoes da janela principal do Bruma.",
+  "description": "Permissoes da janela do instalador.",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:default",
-    "updater:default",
-    "process:allow-restart",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
