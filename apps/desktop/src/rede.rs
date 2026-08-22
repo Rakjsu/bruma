@@ -64,6 +64,15 @@ pub enum Saida {
         canal: String,
         dados: String,
     },
+    /// Um pedaco de ecra, para UM espectador. O `Arc` e de proposito: numa sala com
+    /// varios a ver, isto passa por todas as sessoes e so uma o quer -- copiar cem
+    /// kilobytes em cada uma delas seria pagar a difusao que estamos a evitar.
+    Video {
+        para: String,
+        servidor: String,
+        canal: String,
+        dados: Arc<Vec<u8>>,
+    },
 }
 
 pub struct Rede {
@@ -146,6 +155,20 @@ impl Rede {
         let _ = self.tx.send(Saida::Presenca(servidor.to_string(), canal));
     }
 
+    /// Um pedaco de ecra para cada espectador. Quem nao carregou em "Assistir" nao
+    /// aparece nesta lista e nao recebe nada -- e a diferenca entre gastar uma copia de
+    /// upload e gastar seis.
+    pub fn enviar_video(&self, para: &[String], servidor: &str, canal: &str, dados: Arc<Vec<u8>>) {
+        for p in para {
+            let _ = self.tx.send(Saida::Video {
+                para: p.clone(),
+                servidor: servidor.to_string(),
+                canal: canal.to_string(),
+                dados: dados.clone(),
+            });
+        }
+    }
+
     pub fn enviar_sinal(&self, para: &str, servidor: &str, canal: &str, dados: String) {
         let _ = self.tx.send(Saida::Sinal {
             para: para.to_string(),
@@ -212,10 +235,20 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
     let mut leitor = tokio::spawn(async move {
         loop {
             match ler(&mut recebe).await {
-                Ok(Msg::Ola { nome }) => {
+                // O video nao passa pelo emit normal do Tauri: um Vec<u8> vira um array
+                // JSON de numeros, que para cem kilobytes de ecra e absurdo. Vai por um
+                // canal proprio, em bruto.
+                Ok(Quadro::Video {
+                    servidor,
+                    canal,
+                    dados,
+                }) => {
+                    crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
+                }
+                Ok(Quadro::Controlo(Msg::Ola { nome })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
                 }
-                Ok(Msg::Sync { servidor, entradas }) => {
+                Ok(Quadro::Controlo(Msg::Sync { servidor, entradas })) => {
                     aplicar(
                         &leitura_app,
                         &leitura_janela,
@@ -224,7 +257,7 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
                         &peer_leitura,
                     );
                 }
-                Ok(Msg::Nova { servidor, entrada }) => {
+                Ok(Quadro::Controlo(Msg::Nova { servidor, entrada })) => {
                     aplicar(
                         &leitura_app,
                         &leitura_janela,
@@ -233,17 +266,17 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
                         &peer_leitura,
                     );
                 }
-                Ok(Msg::Presenca { servidor, canal }) => {
+                Ok(Quadro::Controlo(Msg::Presenca { servidor, canal })) => {
                     let _ = leitura_janela.emit(
                         "presenca",
                         serde_json::json!({ "peer": &peer_leitura, "servidor": servidor, "canal": canal }),
                     );
                 }
-                Ok(Msg::Sinal {
+                Ok(Quadro::Controlo(Msg::Sinal {
                     servidor,
                     canal,
                     dados,
-                }) => {
+                })) => {
                     let _ = leitura_janela.emit(
                         "sinal",
                         serde_json::json!({ "de": &peer_leitura, "servidor": servidor, "canal": canal, "dados": dados }),
@@ -260,17 +293,25 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
             _ = &mut leitor => break,
             got = sub.recv() => match got {
                 Ok(saida) => {
-                    let msg = match saida {
-                        Saida::Entrada(servidor, entrada) => Some(Msg::Nova { servidor, entrada }),
-                        Saida::Presenca(servidor, canal) => Some(Msg::Presenca { servidor, canal }),
-                        // Sinalizacao e dirigida: as outras sessoes deixam passar.
+                    let quadro = match saida {
+                        Saida::Entrada(servidor, entrada) => {
+                            Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
+                        }
+                        Saida::Presenca(servidor, canal) => {
+                            Some(Quadro::Controlo(Msg::Presenca { servidor, canal }))
+                        }
+                        // Sinalizacao e video sao dirigidos: as outras sessoes deixam passar.
                         Saida::Sinal { para, servidor, canal, dados } if para == peer => {
-                            Some(Msg::Sinal { servidor, canal, dados })
+                            Some(Quadro::Controlo(Msg::Sinal { servidor, canal, dados }))
                         }
                         Saida::Sinal { .. } => None,
+                        Saida::Video { para, servidor, canal, dados } if para == peer => {
+                            Some(Quadro::Video { servidor, canal, dados: dados.as_ref().clone() })
+                        }
+                        Saida::Video { .. } => None,
                     };
-                    if let Some(m) = msg {
-                        if escrever(&mut envia, &m).await.is_err() {
+                    if let Some(q) = quadro {
+                        if escrever_quadro(&mut envia, &q).await.is_err() {
                             break;
                         }
                     }
@@ -311,8 +352,66 @@ fn aplicar(
     }
 }
 
+/// O que atravessa o fio.
+///
+/// Ate agora era so JSON, e para controlo continua a ser: e legivel, evolui sem partir
+/// nada, e o volume e ridiculo. Video em JSON e que nao -- um array de numeros por cada
+/// byte custaria varias vezes o proprio video. Por isso o quadro passa a dizer o que traz:
+///
+/// ```text
+/// u32 tamanho | u8 tipo | corpo
+///   tipo 0 -> Msg em JSON
+///   tipo 1 -> video: u16 tamanho do cabecalho | cabecalho JSON | bytes crus
+/// ```
+///
+/// O cabecalho do video vai em JSON na mesma, porque e pequeno e diz a que servidor e
+/// canal pertence; o que fica cru sao os bytes que pesam.
+pub enum Quadro {
+    Controlo(Msg),
+    Video {
+        servidor: String,
+        canal: String,
+        dados: Vec<u8>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct CabecalhoVideo {
+    servidor: String,
+    canal: String,
+}
+
+const TIPO_CONTROLO: u8 = 0;
+const TIPO_VIDEO: u8 = 1;
+
 async fn escrever(envia: &mut SendStream, m: &Msg) -> Result<()> {
-    let corpo = serde_json::to_vec(m)?;
+    escrever_quadro(envia, &Quadro::Controlo(m.clone())).await
+}
+
+async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
+    let corpo: Vec<u8> = match q {
+        Quadro::Controlo(m) => {
+            let mut v = vec![TIPO_CONTROLO];
+            v.extend_from_slice(&serde_json::to_vec(m)?);
+            v
+        }
+        Quadro::Video {
+            servidor,
+            canal,
+            dados,
+        } => {
+            let cab = serde_json::to_vec(&CabecalhoVideo {
+                servidor: servidor.clone(),
+                canal: canal.clone(),
+            })?;
+            let mut v = Vec::with_capacity(3 + cab.len() + dados.len());
+            v.push(TIPO_VIDEO);
+            v.extend_from_slice(&(cab.len() as u16).to_be_bytes());
+            v.extend_from_slice(&cab);
+            v.extend_from_slice(dados);
+            v
+        }
+    };
     envia
         .write_all(&(corpo.len() as u32).to_be_bytes())
         .await
@@ -324,7 +423,7 @@ async fn escrever(envia: &mut SendStream, m: &Msg) -> Result<()> {
     Ok(())
 }
 
-async fn ler(recebe: &mut RecvStream) -> Result<Msg> {
+async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
     let mut tam = [0u8; 4];
     recebe
         .read_exact(&mut tam)
@@ -332,12 +431,35 @@ async fn ler(recebe: &mut RecvStream) -> Result<Msg> {
         .map_err(|e| anyhow!("read: {e}"))?;
     let n = u32::from_be_bytes(tam) as usize;
     if n > MAX_FRAME {
-        bail!("frame de {n} bytes excede o limite");
+        bail!("quadro de {n} bytes excede o limite");
+    }
+    if n == 0 {
+        bail!("quadro vazio");
     }
     let mut corpo = vec![0u8; n];
     recebe
         .read_exact(&mut corpo)
         .await
         .map_err(|e| anyhow!("read: {e}"))?;
-    Ok(serde_json::from_slice(&corpo)?)
+
+    match corpo[0] {
+        TIPO_CONTROLO => Ok(Quadro::Controlo(serde_json::from_slice(&corpo[1..])?)),
+        TIPO_VIDEO => {
+            if corpo.len() < 3 {
+                bail!("quadro de video truncado");
+            }
+            let tam_cab = u16::from_be_bytes([corpo[1], corpo[2]]) as usize;
+            let fim = 3 + tam_cab;
+            if corpo.len() < fim {
+                bail!("cabecalho de video truncado");
+            }
+            let cab: CabecalhoVideo = serde_json::from_slice(&corpo[3..fim])?;
+            Ok(Quadro::Video {
+                servidor: cab.servidor,
+                canal: cab.canal,
+                dados: corpo[fim..].to_vec(),
+            })
+        }
+        outro => bail!("tipo de quadro desconhecido: {outro}"),
+    }
 }

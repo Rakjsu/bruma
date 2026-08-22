@@ -6,9 +6,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod comandos;
+mod ecra;
 mod estado;
+mod fmp4;
 mod jogo;
 mod modelo;
+mod mse;
 mod rede;
 
 use std::sync::Arc;
@@ -29,11 +32,18 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|a| a == "--autoteste") {
+        mse::VER_CAIXAS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let nucleo = Arc::new(estado::App::arrancar()?);
+            let ecra = Arc::new(comandos::Ecra::default());
+            let _ = comandos::ECRA.set(ecra.clone());
+            app.manage(ecra);
             let janela = app.handle().clone();
 
             // A rede precisa de um runtime async; o Tauri já traz um.
@@ -65,6 +75,11 @@ fn main() {
             comandos::meu_endereco,
             comandos::saude,
             comandos::capacidades,
+            comandos::autoteste_pedido,
+            comandos::receber_ecra,
+            comandos::comecar_a_partilhar,
+            comandos::parar_de_partilhar,
+            comandos::definir_espectadores,
             jogo::jogo_em_execucao,
         ])
         .run(tauri::generate_context!())

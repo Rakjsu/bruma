@@ -1,6 +1,6 @@
 [package]
 name = "bruma"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 publish = false
 
@@ -24,9 +24,14 @@ tauri-plugin-process = "2"
 
 # Deteção do que está aberto, para a barra de "estás a jogar X".
 [target.'cfg(windows)'.dependencies]
+windows-capture = "2"
+# O macro #[implement] gera codigo que procura `windows_core` na raiz do crate.
+windows-core = "0.62"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
 ] }

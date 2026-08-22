@@ -372,3 +372,133 @@ pub fn saude(servidor: String, app: State<Arc<App>>) -> R<serde_json::Value> {
 pub fn capacidades(linha: String) {
     println!("  capacidades: {linha}");
 }
+
+/* ==========================================================================
+Partilha de ecrã nativa.
+
+O ecrã é captado e codificado em Rust (ver `ecra.rs`) e sai em pedaços de MP4
+fragmentado. Os mesmos pedaços vão a dois sítios: para a webview de quem partilha, que
+os mostra como pré-visualização, e para a rede, um a um, só para quem carregou em
+"Assistir".
+
+Dois canais, e são mesmo diferentes: quem partilha só precisa de ver o seu, e quem
+assiste precisa de saber de QUEM é o pedaço que chegou — daí o cabeçalho com a chave.
+========================================================================== */
+
+use std::sync::Mutex as SyncMutex;
+use tauri::ipc::{Channel, InvokeResponseBody};
+
+#[derive(Default)]
+pub struct Ecra {
+    pub estado: SyncMutex<crate::ecra::Estado>,
+    /// Onde a webview quer receber o ecrã dos outros.
+    pub entrada: SyncMutex<Option<Channel<InvokeResponseBody>>>,
+    /// Onde ela quer ver o seu próprio.
+    pub propria: SyncMutex<Option<Channel<InvokeResponseBody>>>,
+    /// A que servidor e canal pertence a partilha a decorrer.
+    pub onde: SyncMutex<Option<(String, String)>>,
+}
+
+/// Guarda-se o canal por onde o ecrã dos outros vai entrar. Um só, porque só se assiste a
+/// uma pessoa de cada vez — e é o cabeçalho de cada pedaço que diz de quem é.
+#[tauri::command]
+pub fn receber_ecra(canal: Channel<InvokeResponseBody>, ecra: State<Arc<Ecra>>) {
+    *ecra.entrada.lock().unwrap() = Some(canal);
+}
+
+#[tauri::command]
+pub fn comecar_a_partilhar(
+    servidor: String,
+    canal_voz: String,
+    saida: Channel<InvokeResponseBody>,
+    ecra: State<Arc<Ecra>>,
+    rede: State<Arc<Rede>>,
+) -> R<serde_json::Value> {
+    let ecra = ecra.inner().clone();
+    let rede = rede.inner().clone();
+    *ecra.propria.lock().unwrap() = Some(saida);
+    *ecra.onde.lock().unwrap() = Some((servidor.clone(), canal_voz.clone()));
+
+    let eco = ecra.clone();
+    let entrega: crate::ecra::Entrega = Arc::new(move |pedaco: &[u8]| {
+        // A pré-visualização local: os bytes vão como estão, sem cabeçalho, porque só há
+        // uma origem possível.
+        if let Some(c) = eco.propria.lock().unwrap().as_ref() {
+            let _ = c.send(InvokeResponseBody::Raw(pedaco.to_vec()));
+        }
+        // E para a rede, um Arc partilhado por todos os espectadores.
+        let espectadores = {
+            let e = eco.estado.lock().unwrap();
+            let v = e.espectadores.lock().unwrap();
+            v.clone()
+        };
+        if !espectadores.is_empty() {
+            rede.enviar_video(
+                &espectadores,
+                &servidor,
+                &canal_voz,
+                Arc::new(pedaco.to_vec()),
+            );
+        }
+    });
+
+    let (largura, altura) = {
+        let mut e = ecra.estado.lock().map_err(erro)?;
+        crate::ecra::comecar(&mut e, entrega).map_err(erro)?
+    };
+    Ok(serde_json::json!({ "largura": largura, "altura": altura }))
+}
+
+#[tauri::command]
+pub fn parar_de_partilhar(ecra: State<Arc<Ecra>>) {
+    if let Ok(mut e) = ecra.estado.lock() {
+        crate::ecra::parar(&mut e);
+    }
+    *ecra.propria.lock().unwrap() = None;
+    *ecra.onde.lock().unwrap() = None;
+}
+
+/// Quem está mesmo a ver. Enquanto esta lista estiver vazia, nada sai desta máquina —
+/// codifica-se e deita-se fora, que é mais barato do que parar e recomeçar o codificador
+/// a cada espectador que chega ou sai.
+#[tauri::command]
+pub fn definir_espectadores(chaves: Vec<String>, ecra: State<Arc<Ecra>>) {
+    if let Ok(e) = ecra.estado.lock() {
+        *e.espectadores.lock().unwrap() = chaves;
+    }
+}
+
+/// Chamado pela camada de rede quando chega um pedaço do ecrã de alguém.
+///
+/// O pedaço segue para a webview com a chave de quem o mandou à frente, para o JavaScript
+/// saber a que transmissão pertence sem ter de adivinhar pela ordem de chegada.
+pub fn ecra_recebido(peer: &str, _servidor: &str, _canal: &str, dados: Vec<u8>) {
+    let Some(ecra) = ECRA.get() else { return };
+    let Some(canal) = ecra.entrada.lock().unwrap().clone() else {
+        return;
+    };
+    let chave = peer.as_bytes();
+    let mut corpo = Vec::with_capacity(1 + chave.len() + dados.len());
+    corpo.push(chave.len().min(255) as u8);
+    corpo.extend_from_slice(&chave[..chave.len().min(255)]);
+    corpo.extend_from_slice(&dados);
+    let _ = canal.send(InvokeResponseBody::Raw(corpo));
+}
+
+/// A camada de rede não tem um `State` do Tauri à mão, e passar o `Ecra` por toda a
+/// cadeia de chamadas só para isto tornava tudo pior. Fica aqui, escrito uma vez no
+/// arranque e só lido depois.
+pub static ECRA: std::sync::OnceLock<Arc<Ecra>> = std::sync::OnceLock::new();
+
+/// `bruma --autoteste` põe a interface a partilhar o ecrã sozinha, a receber os pedaços e
+/// a dizer o que viu.
+///
+/// Existe porque o caminho novo não se consegue verificar de outra maneira sem alguém à
+/// frente do ecrã: os pedaços nascem em Rust, atravessam o IPC, entram num MediaSource e
+/// só existem mesmo se um `<video>` os aceitar. Um teste em Rust prova metade; este prova
+/// a cadeia toda, e a captura nativa — ao contrário do `getDisplayMedia` — não precisa de
+/// um clique para arrancar.
+#[tauri::command]
+pub fn autoteste_pedido() -> bool {
+    std::env::args().any(|a| a == "--autoteste")
+}

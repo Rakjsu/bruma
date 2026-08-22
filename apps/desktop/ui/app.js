@@ -605,6 +605,7 @@ const voz = {
   silenciados: new Set(),// pessoas silenciadas uma a uma
   aPartilhar: new Set(), // quem está a transmitir o ecrã
   aVer: null,            // de quem estou a ver a transmissão
+  aSerVistoPor: new Set(), // quem pediu para ver o MEU ecrã — só a esses se envia
   analisadores: new Map(),
   audioCtx: null,
 };
@@ -757,8 +758,18 @@ async function receberSinal(de, dados) {
         await pc.setLocalDescription();
         sinalizar(de, { tipo: 'sdp', sdp: pc.localDescription });
       }
+    } else if (dados.tipo === 'assistir') {
+      if (dados.ligado) voz.aSerVistoPor.add(de); else voz.aSerVistoPor.delete(de);
+      actualizarEspectadores();
+      return;
     } else if (dados.tipo === 'estado') {
-      if (dados.ecra) voz.aPartilhar.add(de); else voz.aPartilhar.delete(de);
+      if (dados.ecra) {
+        voz.aPartilhar.add(de);
+      } else {
+        voz.aPartilhar.delete(de);
+        // Parou de transmitir: o <video> dele fica sem fonte e a memoria com ele.
+        fecharFluxoRecebido(de);
+      }
       if (voz.aVer === de && !dados.ecra) voz.aVer = null;
       desenharVoz();
       return;
@@ -774,37 +785,179 @@ async function receberSinal(de, dados) {
   }
 }
 
+/* ==========================================================================
+   Partilha de ecrã: captada e codificada em Rust, não pela webview.
+
+   O `getDisplayMedia` funcionava, mas trazia duas coisas que não se resolvem por
+   configuração: o WebView2 desenhava por cima da app a barra "está a partilhar uma
+   janela" — não há API nem flag para a tirar, porque é o indicador de segurança dele — e
+   o codificador acabava por ser software, com a placa parada ao lado.
+
+   Agora o Rust capta, codifica com o codificador da placa, e manda pedaços de MP4
+   fragmentado. Aqui só se juntam os pedaços e se entregam a um `<video>` pelo
+   MediaSource, que é o que o navegador sabe fazer sem ajuda.
+   ========================================================================== */
+
+/* As etiquetas com que o Rust marca cada pedaço: bytes de vídeo, ou o nome do codec. */
+const ETIQUETA_BYTES = 0;
+const ETIQUETA_CODEC = 1;
+
+/** Um `<video>` alimentado aos pedaços.
+ *
+ *  O MediaSource não aceita bytes enquanto está ocupado a digerir os anteriores, e o
+ *  `appendBuffer` atira exceção se lho fizerem. Por isso há fila: os pedaços chegam ao
+ *  ritmo do codificador, não ao ritmo a que o navegador os quer.
+ */
+function fluxoDePedacos() {
+  const media = new MediaSource();
+  const el = document.createElement('video');
+  el.autoplay = true;
+  el.playsInline = true;
+  el.muted = true;
+  el.src = URL.createObjectURL(media);
+
+  const fila = [];
+  let buffer = null;
+  let codec = null;
+  let aberto = false;
+
+  /* O codec não se assume, vem escrito no fluxo.
+     O `addSourceBuffer` obriga a declará-lo, e o navegador VALIDA o que se lhe declara
+     contra o cabeçalho: se não bater certo, recusa tudo com um "stream parsing failed"
+     que não explica nada. Nesta máquina a NVIDIA produz Baseline 4.2; noutra placa será
+     outro. Por isso espera-se por ele antes de abrir o buffer. */
+  const abrir = () => {
+    if (buffer || !aberto || !codec) return;
+    const tipo = `video/mp4; codecs="${codec}"`;
+    if (!window.MediaSource || !MediaSource.isTypeSupported(tipo)) {
+      console.warn('esta webview não sabe descodificar', tipo);
+      return;
+    }
+    try {
+      buffer = media.addSourceBuffer(tipo);
+      buffer.mode = 'sequence';
+      buffer.addEventListener('updateend', escoar);
+      escoar();
+    } catch (e) {
+      console.warn('não consegui abrir o buffer de vídeo:', e);
+    }
+  };
+
+  const escoar = () => {
+    if (!buffer || buffer.updating || !fila.length) return;
+    try {
+      buffer.appendBuffer(fila.shift());
+    } catch (e) {
+      // QuotaExceeded: o buffer encheu. Deita-se fora o que já passou — numa transmissão
+      // ao vivo ninguém quer rebobinar, e guardar tudo acabaria por rebentar a memória.
+      if (e.name === 'QuotaExceededError' && el.buffered.length) {
+        try { buffer.remove(0, Math.max(0, el.currentTime - 2)); } catch (_) { /* logo se vê */ }
+      } else {
+        console.warn('o vídeo recusou o pedaço:', e);
+      }
+    }
+  };
+
+  media.addEventListener('sourceopen', () => {
+    aberto = true;
+    abrir();
+  }, { once: true });
+
+  return {
+    el,
+    empurrar(marcado) {
+      if (!marcado.length) return;
+      const etiqueta = marcado[0];
+      const bytes = marcado.subarray(1);
+      if (etiqueta === ETIQUETA_CODEC) {
+        codec = new TextDecoder().decode(bytes);
+        abrir();
+        return;
+      }
+      if (etiqueta !== ETIQUETA_BYTES) return;
+      fila.push(bytes);
+      // Se a fila crescer é porque o navegador não acompanha; nesse caso o que interessa
+      // é o presente, não o passado.
+      if (fila.length > 60) fila.splice(0, fila.length - 30);
+      escoar();
+    },
+    fechar() {
+      try { el.pause(); } catch (e) { /* já parado */ }
+      try { URL.revokeObjectURL(el.src); } catch (e) { /* já libertado */ }
+      el.removeAttribute('src');
+      fila.length = 0;
+    },
+  };
+}
+
 async function alternarEcra() {
   if (voz.ecra) {
-    voz.ecra.getTracks().forEach(t => t.stop());
+    await invoke('parar_de_partilhar').catch(() => {});
+    if (voz.ecra.fechar) voz.ecra.fechar();
     voz.ecra = null;
-    for (const [, l] of voz.pcs) {
-      l.pc.getSenders()
-        .filter(s => s.track && s.track.kind === 'video')
-        .forEach(s => l.pc.removeTrack(s));
-    }
     anunciarEstado();
     desenharVoz();
+    desenharRodape();
     return;
   }
+  if (!voz.canal || !voz.servidor) return;
+
+  const fluxo = fluxoDePedacos();
+  const canal = new window.__TAURI__.core.Channel();
+  canal.onmessage = pedaco => fluxo.empurrar(pedaco);
+
   try {
-    voz.ecra = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30 } }, audio: true,
+    await invoke('comecar_a_partilhar', {
+      servidor: voz.servidor,
+      canalVoz: voz.canal,
+      saida: canal,
     });
   } catch (e) {
-    return;   // cancelou o picker
+    fluxo.fechar();
+    console.warn('não consegui começar a partilhar:', e);
+    return;
   }
-  // O hint diz ao encoder que isto é conteúdo de ecrã, não uma câmara.
-  voz.ecra.getVideoTracks().forEach(t => { t.contentHint = 'text'; });
-  voz.ecra.getVideoTracks()[0].addEventListener('ended', () => {
-    voz.ecra = null;
-    desenharVoz();
-  });
-  for (const [, l] of voz.pcs) {
-    voz.ecra.getTracks().forEach(t => l.pc.addTrack(t, voz.ecra));
-  }
+  voz.ecra = fluxo;
   anunciarEstado();
   desenharVoz();
+  desenharRodape();
+}
+
+/* --- receber o ecrã dos outros -------------------------------------------- */
+
+/* Um canal só, e é o cabeçalho de cada pedaço que diz de quem ele é. O Rust põe à frente
+   o tamanho da chave e a chave; o resto são os bytes do vídeo. */
+const fluxosRecebidos = new Map();
+
+(function ligarEntradaDeEcra() {
+  if (!window.__TAURI__) return;
+  const canal = new window.__TAURI__.core.Channel();
+  canal.onmessage = pedaco => {
+    const bytes = pedaco instanceof ArrayBuffer ? new Uint8Array(pedaco) : new Uint8Array(pedaco);
+    if (!bytes.length) return;
+    const n = bytes[0];
+    if (bytes.length < 1 + n) return;
+    const chave = new TextDecoder().decode(bytes.subarray(1, 1 + n));
+    const corpo = bytes.subarray(1 + n);
+    let fluxo = fluxosRecebidos.get(chave);
+    if (!fluxo) {
+      fluxo = fluxoDePedacos();
+      fluxosRecebidos.set(chave, fluxo);
+      // O painel só sabe que há imagem depois do primeiro pedaço.
+      desenharVoz();
+    }
+    fluxo.empurrar(corpo);
+  };
+  invoke('receber_ecra', { canal }).catch(() => {});
+})();
+
+/** Diz ao Rust quem está mesmo a ver. Enquanto isto estiver vazio, nada sai da máquina. */
+function actualizarEspectadores() {
+  if (!voz.ecra) return;
+  // Neste momento quem assiste é quem tem a transmissão aberta; a interface ainda não
+  // distingue "aberto mas minimizado", e é aí que vive a próxima poupança de upload.
+  const lista = [...voz.pcs.keys()].filter(p => voz.aSerVistoPor.has(p));
+  invoke('definir_espectadores', { chaves: lista }).catch(() => {});
 }
 
 function nomeDoPeer(peer) {
@@ -821,10 +974,30 @@ function nomeDoPeer(peer) {
  *   - com vídeo a ser visto: o vídeo ocupa tudo;
  *   - sem vídeo: a foto, com anel verde quando a pessoa fala.
  */
+/** O `<video>` da transmissão de ecrã, se houver.
+ *
+ *  O ecrã já não é um MediaStream: vem em pedaços de MP4 e vive num `<video>` próprio,
+ *  criado uma vez e reaproveitado. Redesenhar o painel não pode criar um novo, senão
+ *  perdia-se tudo o que já foi recebido a cada mudança de ecrã.
+ */
+function ecraDe(chave) {
+  if (chave === voz.eu) return voz.ecra ? voz.ecra.el : null;
+  const f = fluxosRecebidos.get(chave);
+  return f ? f.el : null;
+}
+
+/** A câmara e o microfone continuam a vir do WebRTC. */
 function fluxoDe(chave) {
-  if (chave === voz.eu) return voz.ecra || voz.camara || voz.micro;
+  if (chave === voz.eu) return voz.camara || voz.micro;
   const l = voz.pcs.get(chave);
   return l ? l.stream : null;
+}
+
+function fecharFluxoRecebido(chave) {
+  const f = fluxosRecebidos.get(chave);
+  if (!f) return;
+  f.fechar();
+  fluxosRecebidos.delete(chave);
 }
 
 function painelDeVoz(chave, stream, opcoes = {}) {
@@ -852,6 +1025,12 @@ function painelDeVoz(chave, stream, opcoes = {}) {
       bloco.append(elemento('span', 'tile__dica', 'é o teu ecrã, tal como sai daqui'));
     }
     t.append(bloco);
+  } else if (transmite && aVer) {
+    // O <video> do ecrã é reaproveitado, nunca recriado: ele já tem dentro tudo o que
+    // chegou até agora, e criar outro aqui deitava isso fora a cada redesenho.
+    const el = ecraDe(chave);
+    if (el) t.append(el);
+    else t.append(elemento('div', 'tile__sem-video', 'à espera da imagem…'));
   } else if (temVideo) {
     const el = document.createElement('video');
     el.autoplay = true;
@@ -1120,6 +1299,10 @@ listen('presenca', ev => {
   const { peer, canal } = ev.payload;
   if (canal) voz.presentes.set(peer, canal); else voz.presentes.delete(peer);
   if (voz.canal && canal === voz.canal) garantirLigacao(peer);
+  if (!canal || canal !== voz.canal) {
+    if (voz.aSerVistoPor.delete(peer)) actualizarEspectadores();
+    fecharFluxoRecebido(peer);
+  }
   if (voz.canal && !canal && voz.pcs.has(peer)) {
     voz.pcs.get(peer).pc.close();
     voz.pcs.delete(peer);
@@ -1386,11 +1569,16 @@ function anunciarEstado() {
 /* --- assistir a uma transmissão -------------------------------------------- */
 
 function assistir(peer) {
+  if (voz.aVer && voz.aVer !== peer) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
   voz.aVer = peer;
+  // Quem transmite tem de saber que estou a ver: e essa lista que decide o que sai da
+  // maquina dele. Sem isto o ecra era codificado para ninguem.
+  if (peer !== voz.eu) sinalizar(peer, { tipo: 'assistir', ligado: true });
   desenharVoz();
 }
 
 function pararDeAssistir() {
+  if (voz.aVer && voz.aVer !== voz.eu) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
   voz.aVer = null;
   desenharVoz();
 }
@@ -1438,4 +1626,74 @@ function pararDeAssistir() {
   };
   diz(`WebCodecs presente · config H.264 1080p: prefere-hardware=${await aceita('prefer-hardware')}`
     + ` prefere-software=${await aceita('prefer-software')} indiferente=${await aceita('no-preference')}`);
+})();
+
+/* ---------- autoteste da partilha de ecrã ---------------------------------- */
+
+/* Corre só com `bruma --autoteste`. Parte do princípio de que nada funciona e vai
+   verificando: os pedaços chegam? o vídeo aceita-os? tem dimensões? o tempo anda?
+   Cada uma dessas perguntas falha de maneira diferente e em sítios diferentes. */
+(async () => {
+  if (!window.__TAURI__) return;
+  if (!(await invoke('autoteste_pedido').catch(() => false))) return;
+
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  const fluxo = fluxoDePedacos();
+  document.body.append(fluxo.el);          // o MediaSource só anda com o elemento no DOM
+  fluxo.el.style.cssText = 'position:fixed;width:2px;height:2px;opacity:0;pointer-events:none';
+
+  let pedacos = 0, bytes = 0;
+  const inteiro = [];   // o mesmo vídeo, para o provar por um caminho que não é o MSE
+  const canal = new window.__TAURI__.core.Channel();
+  canal.onmessage = p => {
+    const b = p instanceof ArrayBuffer ? new Uint8Array(p) : new Uint8Array(p);
+    pedacos += 1; bytes += b.length;
+    if (b.length && b[0] === ETIQUETA_BYTES) inteiro.push(b.subarray(1));
+    fluxo.empurrar(b);
+  };
+
+  try {
+    const r = await invoke('comecar_a_partilhar',
+      { servidor: 'autoteste', canalVoz: 'autoteste', saida: canal });
+    diz(`autoteste: a captar a ${r.largura}x${r.altura}`);
+  } catch (e) {
+    return diz(`autoteste FALHOU a arrancar: ${e}`);
+  }
+
+  await new Promise(r => setTimeout(r, 6000));
+  await invoke('parar_de_partilhar').catch(() => {});
+
+  const v = fluxo.el;
+  const intervalos = [];
+  for (let i = 0; i < v.buffered.length; i++) {
+    intervalos.push(`${v.buffered.start(i).toFixed(2)}-${v.buffered.end(i).toFixed(2)}`);
+  }
+  diz(`autoteste: ${pedacos} pedaços, ${(bytes / 1e6).toFixed(1)} MB`
+    + ` | vídeo ${v.videoWidth}x${v.videoHeight}, readyState=${v.readyState}`
+    + ` | descodificados=${v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : '?'}`
+    + ` | bufferizado=[${intervalos.join(', ')}] t=${v.currentTime.toFixed(2)}`
+    + ` | erro=${v.error ? v.error.code : 'nenhum'}`
+    + (v.error && v.error.message ? ` "${v.error.message}"` : ''));
+  fluxo.fechar();
+
+  /* E a segunda prova, por fora do MSE: os mesmos bytes num <video> comum. Se este toca
+     e o de cima não, o ficheiro está bom e o problema é do dialeto que o MSE exige; se
+     nenhum toca, o problema está antes, no que estamos a produzir. Sem separar as duas
+     coisas, o passo seguinte é adivinhar. */
+  const simples = document.createElement('video');
+  simples.muted = true;
+  simples.style.cssText = 'position:fixed;width:2px;height:2px;opacity:0';
+  document.body.append(simples);
+  simples.src = URL.createObjectURL(new Blob(inteiro, { type: 'video/mp4' }));
+  await new Promise(r => {
+    simples.onloadeddata = r;
+    simples.onerror = r;
+    setTimeout(r, 5000);
+  });
+  diz(`autoteste (sem MSE, ficheiro inteiro): ${simples.videoWidth}x${simples.videoHeight}`
+    + ` readyState=${simples.readyState} duração=${simples.duration}`
+    + ` erro=${simples.error ? simples.error.code : 'nenhum'}`
+    + (simples.error && simples.error.message ? ` "${simples.error.message}"` : ''));
+  simples.remove();
+  v.remove();
 })();
