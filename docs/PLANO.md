@@ -30,7 +30,8 @@ para que isso não obrigue a reescrever o núcleo.
 | Estado mutável | **CRDT (`loro` 1.13)** só para canais, cargos, membros, reações e edições | É aqui que há fusão a sério. O log de mensagens não precisa disto. |
 | Identidade | Ed25519 no dispositivo + mnemónica BIP39 de 12 palavras | Zero PII. A mesma chave é o `NodeId` do iroh. |
 | Cripto de grupo | **Sender keys** por época (Fase 1) → **MLS/OpenMLS 0.8.1** (Fase 3) | Chat E2EE de pé em dias; troca isolada atrás de um trait `GroupKeyAgreement`. |
-| Média | **WebRTC mesh** (≤6) + **SFU LiveKit opcional** | Mesh não precisa de infra; o SFU é a opção para canais maiores *e* para esconder o IP na chamada. |
+| Voz | **WebRTC mesh** (≤6) + **SFU LiveKit opcional** | Mesh não precisa de infra; o SFU é a opção para canais maiores *e* para esconder o IP na chamada. |
+| Ecrã | **Captura e codificação nativas em Rust, NALs por iroh, WebCodecs a descodificar** | Decidido pelo Spike 4. Tira a barra do WebView2, usa a NVENC (6% a 3440×1440 contra o AV1 por software), dispensa TURN para vídeo e deixa de expor o IP. Custo: o controlo de congestão passa a ser nosso. |
 | Moderação | **Expulsão por rotação de chave de época** | Sem autoridade central, a única garantia real é matemática: o expulso deixa de conseguir decifrar. |
 | Anexos | **`iroh-blobs`** (BLAKE3, content-addressed) | Transferência P2P resumível e verificada, cifrada antes de sair do cliente. |
 | BD local | SQLite + SQLCipher (`rusqlite`) | O histórico real vive aqui, cifrado com chave derivada da identidade. |
@@ -126,6 +127,26 @@ Partilhar ecrã com áudio do sistema entre dois clientes.
   vs sem, e se o AV1 usa hardware (NVENC) ou cai em libaom por software.
 - Caminho B: captura nativa em Rust (`scap` 0.0.8) publicada pelo crate `livekit` 0.8.3.
 - **Gate**: se nenhum der ecrã+áudio fiável no Windows, parar e reavaliar (Electron ou janela dedicada).
+
+**Spike 4 — captura nativa do ecrã.** — **EXECUTADO, PASSA (21/08/2026)**
+Nasceu de duas coisas medidas: o WebView2 desenha por cima da app a barra "está a partilhar uma
+janela" e **não há maneira suportada de a esconder** (o evento `ScreenCaptureStarting` só tem
+`Cancel` e `Handled`, e nenhum a tira — a barra é o indicador de segurança dele, não um enfeite);
+e o Spike 2 apanhou o AV1 a correr por software com a NVENC parada ao lado.
+
+Capturar e codificar em Rust (`windows-capture` 2.0.1 + Media Foundation) resolve as duas. Medido
+a 3440×1440: **56,9 fps a captar, 54,5 fps a captar e codificar** (4% de custo), p95 de 18,4 ms,
+7,1 Mbps, e o `nvidia-smi` a marcar **0% de NVENC sem codificar contra 6–7% a codificar** — que é
+a prova de que o caminho usa mesmo o hardware, e não só de que o hardware existe. Regiões sujas
+disponíveis em todos os frames. Ver `spikes/spike4-captura/README.md`.
+
+**Consequência para o plano — o vídeo deixa de ir por WebRTC.** Em vez de montar uma segunda pilha
+de média, os NALs vão pelo iroh, que já é autenticado e cifrado, e são descodificados do outro lado
+com o `VideoDecoder` do WebCodecs. Isso dispensa ICE e DTLS para o vídeo, dispensa o TURN nessa
+parte, e **tira a partilha de ecrã da limitação nº 1** (era o WebRTC que furava o NAT por fora do
+iroh e expunha o IP). A voz continua em WebRTC na webview. O preço, assumido: perdemos o controlo
+de congestão do WebRTC e o orçamento de upload passa de desejável a obrigatório.
+**Por confirmar:** o `VideoDecoder` do lado de quem vê — é o próximo gate.
 
 **Spike 3 — Modo Fantasma.** — **EXECUTADO, BLOQUEADO (21/08/2026)**
 Dois peers a sincronizar chat por `.onion` com arti embutido, sem tor externo e sem portas abertas.
@@ -232,9 +253,11 @@ argumento para o caminho nativo em Rust.
 
 ## Limitações que o desenho assume
 
-1. **Numa chamada mesh os participantes veem o teu IP.** O WebRTC faz o seu próprio NAT traversal e o
-   relay do iroh não o cobre. Esconder isso exige TURN ou o SFU opcional — é uma escolha por canal, com
-   aviso na UI, não um problema resolvido por omissão.
+1. **Numa chamada de voz os participantes veem o teu IP.** O WebRTC faz o seu próprio NAT traversal
+   e o relay do iroh não o cobre. Esconder isso exige TURN ou o SFU opcional — é uma escolha por canal,
+   com aviso na UI, não um problema resolvido por omissão.
+   **Deixou de valer para a partilha de ecrã** desde o Spike 4: o vídeo vai pelo iroh, que tem relay
+   próprio, portanto quem vê o teu ecrã não fica com o teu endereço. Continua a valer para a voz.
 2. **O relay público do n0 vê metadados** — que NodeIds falam entre si, quando e quanto volume. Nunca vê
    conteúdo. Mitigação disponível a qualquer momento: alojar o próprio `iroh-relay`.
 3. **Sender keys não dão forward secrecy dentro de uma época.** Um dispositivo comprometido lê as

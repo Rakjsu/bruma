@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["apps/desktop", "spikes/spike-common", "spikes/spike1-net", "spikes/spike2-screen", "spikes/spike3-ghost"]
+members = ["apps/desktop", "spikes/spike-common", "spikes/spike1-net", "spikes/spike2-screen", "spikes/spike3-ghost", "spikes/spike4-captura"]
 
 [workspace.package]
 edition = "2021"
