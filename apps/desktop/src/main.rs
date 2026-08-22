@@ -44,6 +44,9 @@ fn main() {
             let ecra = Arc::new(comandos::Ecra::default());
             let _ = comandos::ECRA.set(ecra.clone());
             app.manage(ecra);
+            let voz = Arc::new(comandos::Voz::default());
+            let _ = comandos::VOZ.set(voz.clone());
+            app.manage(voz);
             let janela = app.handle().clone();
 
             // A rede precisa de um runtime async; o Tauri já traz um.
@@ -78,6 +81,9 @@ fn main() {
             comandos::capacidades,
             comandos::autoteste_pedido,
             comandos::receber_ecra,
+            comandos::receber_voz,
+            comandos::enviar_voz,
+            comandos::qualidade,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
             comandos::definir_espectadores,

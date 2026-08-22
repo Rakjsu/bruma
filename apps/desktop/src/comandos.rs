@@ -513,3 +513,87 @@ pub fn autoteste_pedido() -> u32 {
     }
     0
 }
+
+/* ==========================================================================
+Voz.
+
+Vai pelo mesmo caminho do ecrã — o iroh — e não por WebRTC. A diferença prática é que
+deixa de ser preciso configurar seja o que for: sem STUN, sem TURN, sem colar endereços
+de servidores em duas máquinas. E, como o ecrã, deixa também de expor o endereço de
+quem fala, porque não há um segundo túnel a furar o router por fora.
+
+O som é codificado e descodificado na webview, com o Opus que ela já traz. O Rust não
+olha para dentro dos pedaços: só os leva de um lado ao outro.
+========================================================================== */
+
+#[derive(Default)]
+pub struct Voz {
+    /// Onde a webview quer receber o som dos outros.
+    pub entrada: SyncMutex<Option<Channel<InvokeResponseBody>>>,
+}
+
+#[tauri::command]
+pub fn receber_voz(canal: Channel<InvokeResponseBody>, voz: State<Arc<Voz>>) {
+    *voz.entrada.lock().unwrap() = Some(canal);
+}
+
+/// Um pedaço de som para cada pessoa da sala.
+///
+/// A interface é que diz a quem, porque é ela que sabe quem está na chamada. O Rust não
+/// guarda essa lista para não haver duas versões da mesma verdade.
+#[tauri::command]
+pub fn enviar_voz(para: Vec<String>, dados: Vec<u8>, rede: State<Arc<Rede>>) {
+    rede.enviar_voz(&para, &dados);
+}
+
+/// Chamado pela camada de rede a cada datagrama de voz que chega.
+///
+/// Vai para a webview com a chave de quem falou à frente, como o ecrã: sem isso não havia
+/// como saber a que pessoa pertence o som, e numa sala com várias a falar ao mesmo tempo
+/// isso é a diferença entre ouvir uma conversa e ouvir uma confusão.
+pub fn voz_recebida(peer: &str, dados: &[u8]) {
+    let Some(voz) = VOZ.get() else { return };
+    let Some(canal) = voz.entrada.lock().unwrap().clone() else {
+        return;
+    };
+    let chave = peer.as_bytes();
+    let n = chave.len().min(255);
+    let mut corpo = Vec::with_capacity(1 + n + dados.len());
+    corpo.push(n as u8);
+    corpo.extend_from_slice(&chave[..n]);
+    corpo.extend_from_slice(dados);
+    let _ = canal.send(InvokeResponseBody::Raw(corpo));
+}
+
+pub static VOZ: std::sync::OnceLock<Arc<Voz>> = std::sync::OnceLock::new();
+
+/// A qualidade da ligação a cada pessoa, medida pelo próprio transporte.
+///
+/// Isto vinha das estatísticas do WebRTC. Agora vem do iroh, e diz mais: além do tempo de
+/// ida e volta, sabe-se se a ligação é **direta** ou se está a passar por um relay — que é
+/// a diferença entre o router ter sido furado ou não, e a coisa mais útil que se pode
+/// mostrar a quem se está a queixar de que a chamada está má.
+#[tauri::command]
+pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::Value> {
+    let Ok(ligacoes) = rede.ligacoes.lock() else {
+        return Vec::new();
+    };
+    peers
+        .iter()
+        .filter_map(|p| {
+            let c = ligacoes.get(p)?;
+            let caminhos = c.paths();
+            let escolhido = caminhos.iter().find(|x| x.is_selected());
+            let (relay, ms) = match escolhido {
+                Some(x) => (
+                    x.is_relay(),
+                    c.rtt(x.id())
+                        .map(|d| d.as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0),
+                ),
+                None => (false, 0.0),
+            };
+            Some(serde_json::json!({ "peer": p, "relay": relay, "ms": ms }))
+        })
+        .collect()
+}

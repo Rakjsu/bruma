@@ -18,15 +18,16 @@ explicado.
 |---|---|---|
 | Entrar, criar servidor, convidar | deve funcionar | vai pelo iroh |
 | Mensagens, e receber o que se perdeu | deve funcionar | vai pelo iroh |
-| **Partilha de ecrã** | deve funcionar | desde a v0.5.0 vai pelo iroh também |
-| **Voz** | **não vai ligar** | falta configurar servidores de ligação — ver abaixo |
+| **Partilha de ecrã** | deve funcionar | desde a v0.5.0 vai pelo iroh |
+| **Voz** | deve funcionar | desde a v0.6.0 vai pelo iroh |
+| Câmara | de fora por agora | era a última coisa em WebRTC; volta pelo mesmo caminho |
 
-A voz é a única coisa que ainda depende de WebRTC, e o WebRTC precisa de um servidor que
-lhe diga por onde furar o router. Sem isso ele só encontra caminhos dentro da rede local,
-e entre duas casas não há nenhum. **Não é uma avaria: é configuração que falta.**
+**Não há nada para configurar.** Até à v0.5.2 a voz ia por WebRTC e precisava de um
+servidor STUN ou TURN colado à mão nas duas máquinas, ou não ligava fora da rede local.
+Deixou de precisar.
 
-Há um servidor de ligação pronto (coturn, no Oracle do Brasil), mas as portas dele estão
-fechadas na firewall da Oracle. Enquanto estiverem, a voz não liga a ninguém de fora.
+Se o router não se deixar furar, a ligação passa por um relay em vez de falhar — fica mais
+lenta, e a barra da chamada diz **"por relay"** para não ser um mistério.
 
 ---
 
@@ -46,9 +47,10 @@ O ficheiro é `Bruma_x.y.z_x64-setup.exe`.
 > O instalador não é anónimo por ser desconhecido; é desconhecido porque não foi comprado
 > um certificado. São coisas diferentes e convém dizê-lo em vez de pedir confiança cega.
 
-**Os dois têm de ter a mesma versão.** O formato das mensagens na rede mudou na v0.5.0
-para passar a levar vídeo: uma app v0.4.x e uma v0.5.x não se entendem, e a ligação cai
-sem explicação útil.
+**Os dois têm de ter a v0.6.0 ou mais recente.** O formato das mensagens na rede mudou na
+v0.5.0 para levar vídeo, e a voz passou a andar em datagramas na v0.6.0. Uma app v0.4.x
+com uma v0.5.x cai sem explicação útil; uma v0.5.x com uma v0.6.x fala e mostra o ecrã,
+mas fica muda.
 
 Na primeira abertura cada um escolhe um nome. **Não há registo, nem e-mail, nem password**
 — é criada uma chave neste computador e é ela a identidade.
@@ -94,10 +96,15 @@ exatamente o tipo de coisa que nunca se vê a testar na mesma máquina.
 
 ---
 
-## 4 · Partilha de ecrã
+## 4 · Voz e partilha de ecrã
 
-Os dois entram no mesmo canal de voz. **A voz não vai funcionar** (ver o quadro em cima),
-mas a partilha de ecrã não depende dela.
+Os dois entram no mesmo canal de voz. Deve aparecer **Voz conectada** em baixo — e ao lado,
+o tempo de ida e volta e, se for o caso, um aviso de que está a passar por relay.
+
+Falem. O anel verde deve acender à volta de quem está a falar, tanto no painel como na
+lista da direita.
+
+Depois, a partilha de ecrã:
 
 1. Um carrega em **Partilhar ecrã** (o segundo botão da fila, em baixo).
 2. Do outro lado, o painel dessa pessoa deve mudar para *"está a transmitir"* com um botão
@@ -113,30 +120,6 @@ quer dizer que o aviso passou e os dados não. Diz-me e eu sei onde procurar.
 
 ---
 
-## 5 · Para a voz funcionar (só tu podes fazer isto)
-
-Na consola da Oracle, na instância do Brasil:
-
-**Networking → Virtual Cloud Network → Security Lists → Default → Add Ingress Rules**
-
-Três regras, todas com origem `0.0.0.0/0`:
-
-| Protocolo | Portas |
-|---|---|
-| UDP | 3478 |
-| TCP | 3478 |
-| UDP | 50000–50200 |
-
-Depois, **nos dois computadores**: botão direito na app → *Servidores de ligação* → colar:
-
-```
-turn:bruma:uvvqIcnTW19wgvJumCTl0gBpk0OC@168.138.155.90:3478
-```
-
-Avisa-me quando abrires e eu confirmo daqui que o servidor responde, antes de valer a pena
-tentarem a voz.
-
----
 
 ## O que me dizer no fim
 

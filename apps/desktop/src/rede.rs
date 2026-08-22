@@ -79,6 +79,12 @@ pub struct Rede {
     pub endpoint: Endpoint,
     /// Entradas criadas localmente, para as sessões abertas difundirem.
     pub tx: broadcast::Sender<Saida>,
+    /// As ligações abertas, por peer.
+    ///
+    /// O resto do módulo trabalha por difusão: escreve-se num canal e cada sessão decide
+    /// se lhe diz respeito. Para a voz isso não serve — a voz vai em **datagramas**, que
+    /// são enviados na ligação e não num stream, e é preciso ter a ligação à mão.
+    pub ligacoes: std::sync::Mutex<std::collections::HashMap<String, Connection>>,
 }
 
 impl Rede {
@@ -94,6 +100,7 @@ impl Rede {
         let rede = Arc::new(Rede {
             endpoint: endpoint.clone(),
             tx,
+            ligacoes: Default::default(),
         });
 
         // Aceitar ligações de quem nos conhece.
@@ -158,6 +165,28 @@ impl Rede {
     /// Um pedaco de ecra para cada espectador. Quem nao carregou em "Assistir" nao
     /// aparece nesta lista e nao recebe nada -- e a diferenca entre gastar uma copia de
     /// upload e gastar seis.
+    /// Manda um pedaço de voz a cada pessoa da sala, em datagramas.
+    ///
+    /// **Datagramas e não streams, e a diferença é toda.** Um stream QUIC é fiável e
+    /// ordenado: se um pacote se perde, tudo o que vem atrás fica à espera dele. Para um
+    /// ficheiro é o que se quer; para voz ao vivo é o pior possível — o atraso acumula e
+    /// nunca mais encolhe. Um pacote de voz perdido não vale a pena reenviar, porque
+    /// quando chegasse já tinha passado a vez dele.
+    ///
+    /// Falhas aqui são normais e não se registam: um datagrama grande de mais ou um buffer
+    /// cheio significa que aquele bocado de som se perdeu, e é assim que deve ser.
+    pub fn enviar_voz(&self, para: &[String], dados: &[u8]) {
+        let Ok(ligacoes) = self.ligacoes.lock() else {
+            return;
+        };
+        let bytes = bytes::Bytes::copy_from_slice(dados);
+        for p in para {
+            if let Some(c) = ligacoes.get(p) {
+                let _ = c.send_datagram(bytes.clone());
+            }
+        }
+    }
+
     pub fn enviar_video(&self, para: &[String], servidor: &str, canal: &str, dados: Arc<Vec<u8>>) {
         for p in para {
             let _ = self.tx.send(Saida::Video {
@@ -213,6 +242,19 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
 
     let peer = conn.remote_id().to_string();
     let _ = janela.emit("peer-ligado", &peer);
+
+    if let Ok(mut l) = rede.ligacoes.lock() {
+        l.insert(peer.clone(), conn.clone());
+    }
+
+    // A voz chega por aqui, fora do stream de controlo: um datagrama por pedaço de som.
+    let voz_conn = conn.clone();
+    let voz_peer = peer.clone();
+    let mut ouvinte = tokio::spawn(async move {
+        while let Ok(d) = voz_conn.read_datagram().await {
+            crate::comandos::voz_recebida(&voz_peer, &d);
+        }
+    });
 
     let meu_nome = app.nome.lock().unwrap().clone();
     escrever(&mut envia, &Msg::Ola { nome: meu_nome }).await?;
@@ -291,6 +333,7 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
     loop {
         tokio::select! {
             _ = &mut leitor => break,
+            _ = &mut ouvinte => break,
             got = sub.recv() => match got {
                 Ok(saida) => {
                     let quadro = match saida {
@@ -324,6 +367,10 @@ async fn sessao(conn: Connection, rede: Arc<Rede>, app: Arc<App>, janela: AppHan
         }
     }
     leitor.abort();
+    ouvinte.abort();
+    if let Ok(mut l) = rede.ligacoes.lock() {
+        l.remove(&peer);
+    }
     let _ = janela.emit("peer-desligado", &peer);
     Ok(())
 }
@@ -461,5 +508,52 @@ async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
             })
         }
         outro => bail!("tipo de quadro desconhecido: {outro}"),
+    }
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    /// A voz vai em datagramas, e datagramas não são streams: se o iroh não os suportar,
+    /// ou se o par não os aceitar, o `send_datagram` falha em silêncio e a chamada fica
+    /// muda sem um único erro. Isto prova que atravessam mesmo.
+    ///
+    /// Usa-se o preset sem relay e liga-se pelo endereço direto: o que está em causa é o
+    /// transporte, não a descoberta, e depender de servidores externos tornava um teste
+    /// de correção num teste de rede.
+    #[tokio::test]
+    async fn um_datagrama_atravessa_a_ligacao() {
+        let a = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint A");
+        let b = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint B");
+
+        let endereco_b = b.addr();
+        let ouvinte = tokio::spawn(async move {
+            let incoming = b.accept().await.expect("ligação a chegar");
+            let conn = incoming.await.expect("aceitar");
+            conn.read_datagram().await.expect("datagrama")
+        });
+
+        let conn = a.connect(endereco_b, ALPN).await.expect("ligar");
+        assert!(
+            conn.max_datagram_size().is_some(),
+            "o par tem de aceitar datagramas, senão a voz não sai daqui"
+        );
+        conn.send_datagram(bytes::Bytes::from_static("ola voz".as_bytes()))
+            .expect("enviar");
+
+        let recebido = tokio::time::timeout(std::time::Duration::from_secs(10), ouvinte)
+            .await
+            .expect("não chegou a tempo")
+            .expect("tarefa");
+        assert_eq!(&recebido[..], b"ola voz");
     }
 }

@@ -30,7 +30,7 @@ para que isso não obrigue a reescrever o núcleo.
 | Estado mutável | **CRDT (`loro` 1.13)** só para canais, cargos, membros, reações e edições | É aqui que há fusão a sério. O log de mensagens não precisa disto. |
 | Identidade | Ed25519 no dispositivo + mnemónica BIP39 de 12 palavras | Zero PII. A mesma chave é o `NodeId` do iroh. |
 | Cripto de grupo | **Sender keys** por época (Fase 1) → **MLS/OpenMLS 0.8.1** (Fase 3) | Chat E2EE de pé em dias; troca isolada atrás de um trait `GroupKeyAgreement`. |
-| Voz | **WebRTC mesh** (≤6) + **SFU LiveKit opcional** | Mesh não precisa de infra; o SFU é a opção para canais maiores *e* para esconder o IP na chamada. |
+| Voz | **Opus codificado na webview, datagramas por iroh** | Decidido na v0.6.0. Era a última coisa a exigir configuração à mão (STUN/TURN) para funcionar fora da rede local. Datagramas e não streams: um pacote de voz perdido não vale a pena reenviar, porque chegaria depois da vez dele. |
 | Ecrã | **Captura e codificação nativas em Rust, NALs por iroh, WebCodecs a descodificar** | Decidido pelo Spike 4. Tira a barra do WebView2, usa a NVENC (6% a 3440×1440 contra o AV1 por software), dispensa TURN para vídeo e deixa de expor o IP. Custo: o controlo de congestão passa a ser nosso. |
 | Moderação | **Expulsão por rotação de chave de época** | Sem autoridade central, a única garantia real é matemática: o expulso deixa de conseguir decifrar. |
 | Anexos | **`iroh-blobs`** (BLAKE3, content-addressed) | Transferência P2P resumível e verificada, cifrada antes de sair do cliente. |
@@ -262,11 +262,11 @@ argumento para o caminho nativo em Rust.
 
 ## Limitações que o desenho assume
 
-1. **Numa chamada de voz os participantes veem o teu IP.** O WebRTC faz o seu próprio NAT traversal
-   e o relay do iroh não o cobre. Esconder isso exige TURN ou o SFU opcional — é uma escolha por canal,
-   com aviso na UI, não um problema resolvido por omissão.
-   **Deixou de valer para a partilha de ecrã** desde o Spike 4: o vídeo vai pelo iroh, que tem relay
-   próprio, portanto quem vê o teu ecrã não fica com o teu endereço. Continua a valer para a voz.
+1. ~~**Numa chamada os participantes veem o teu IP.**~~ **Deixou de valer.** Era o WebRTC que fazia o
+   seu próprio furo no NAT, por fora do iroh. O ecrã saiu do WebRTC no Spike 4 e a voz saiu na v0.6.0;
+   já não há WebRTC nenhum na app. Tudo passa pela mesma ligação do iroh, que tem relay próprio.
+   **O que fica em aberto:** a câmara, que era a última a usar WebRTC e está de fora até voltar pelo
+   mesmo caminho.
 2. **O relay público do n0 vê metadados** — que NodeIds falam entre si, quando e quanto volume. Nunca vê
    conteúdo. Mitigação disponível a qualquer momento: alojar o próprio `iroh-relay`.
 3. **Sender keys não dão forward secrecy dentro de uma época.** Um dispositivo comprometido lê as

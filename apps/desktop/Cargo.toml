@@ -1,6 +1,6 @@
 [package]
 name = "bruma"
-version = "0.5.2"
+version = "0.6.0"
 edition.workspace = true
 publish = false
 
@@ -17,6 +17,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
+# O `send_datagram` do iroh recebe `Bytes`, e nao um Vec.
+bytes = "1"
 anyhow = "1"
 data-encoding = "2"
 tauri-plugin-updater = "2"
