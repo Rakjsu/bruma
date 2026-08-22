@@ -1041,6 +1041,39 @@ function fluxoDePedacos() {
   };
 }
 
+/** Abre o seletor: o que há para transmitir, com miniatura, à escolha. */
+async function escolherFonte() {
+  abrir('veu-fontes');
+  const lista = $('#lista-fontes');
+  lista.innerHTML = '<p class="fontes__espera">a olhar para as janelas…</p>';
+  const fontes = await invoke('fontes_de_partilha').catch(() => []);
+  if ($('#veu-fontes').hidden) return;   // cancelou antes de a lista chegar
+  lista.textContent = '';
+  if (!fontes.length) {
+    lista.append(elemento('p', 'fontes__espera', 'não encontrei nada para partilhar'));
+    return;
+  }
+  let tipoAnterior = null;
+  for (const f of fontes) {
+    if (f.tipo !== tipoAnterior) {
+      tipoAnterior = f.tipo;
+      lista.append(elemento('div', 'fontes__titulo', f.tipo === 'ecra' ? 'Ecrãs' : 'Janelas'));
+    }
+    const cartao = elemento('button', 'fonte');
+    if (f.miniatura) {
+      const img = document.createElement('img');
+      img.src = f.miniatura;
+      cartao.append(img);
+    }
+    const nome = elemento('span', null, f.titulo);
+    nome.title = f.titulo;
+    cartao.append(nome);
+    cartao.onclick = () => { fechar('veu-fontes'); iniciarPartilha(f.id); };
+    lista.append(cartao);
+  }
+}
+$('#fechar-fontes').onclick = () => fechar('veu-fontes');
+
 async function alternarEcra() {
   if (voz.ecra) {
     await invoke('parar_de_partilhar').catch(() => {});
@@ -1053,6 +1086,11 @@ async function alternarEcra() {
     return;
   }
   if (!voz.canal || !voz.servidor) return;
+  escolherFonte();
+}
+
+async function iniciarPartilha(fonte) {
+  if (voz.ecra || !voz.canal || !voz.servidor) return;
 
   // O canal fica aberto desde já, mas o Rust só manda por ele quando estivermos mesmo
   // a olhar (ver_meu_ecra). Criar o <video> agora e deixá-lo a apanhar pedaços às
@@ -1067,6 +1105,7 @@ async function alternarEcra() {
     await invoke('comecar_a_partilhar', {
       servidor: voz.servidor,
       canalVoz: voz.canal,
+      fonte,
       saida: canal,
     });
   } catch (e) {
@@ -1478,7 +1517,13 @@ $('#btn-jogo').onclick = async () => {
     await desenharMensagens();
     await entrarEmVoz(s.id, sala.id);
   }
-  alternarEcra();
+  if (voz.ecra) { alternarEcra(); return; }   // já a transmitir: o botão pára
+  // O monitor-com-seta promete transmitir O JOGO, não abrir um menu: procura-se a
+  // janela dele pelo título e só se cai no seletor se ela tiver desaparecido.
+  const fontes = await invoke('fontes_de_partilha').catch(() => []);
+  const doJogo = jogoAberto && fontes.find(f => f.tipo === 'janela' && f.titulo === jogoAberto.titulo);
+  if (doJogo) iniciarPartilha(doJogo.id);
+  else escolherFonte();
 };
 
 setInterval(verJogo, 5000);
@@ -1818,8 +1863,12 @@ function pararDeAssistir() {
 
   try {
     const r = await invoke('comecar_a_partilhar',
-      { servidor: 'autoteste', canalVoz: 'autoteste', saida: canal });
+      { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1', saida: canal });
     await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
+    const fontes = await invoke('fontes_de_partilha').catch(() => []);
+    const comImagem = fontes.filter(f => f.miniatura && f.miniatura.length > 2000).length;
+    diz(`autoteste fontes: ${fontes.length} no total, ${comImagem} com miniatura`
+      + ` (${fontes.slice(0, 4).map(f => f.tipo + ':' + f.titulo.slice(0, 18)).join(' | ')})`);
     diz(`autoteste: a captar a ${r.largura}x${r.altura}`);
   } catch (e) {
     return diz(`autoteste FALHOU a arrancar: ${e}`);
@@ -2000,7 +2049,9 @@ function pararDeAssistir() {
     // projeto e o único que nunca tinha sido visto entre dois pares.
     if (modo === '') {
       await esperar(3000);
-      await alternarEcra();
+      // Diretamente, sem o seletor: num teste automatico nao ha quem clique no menu.
+      await iniciarPartilha('ecra:1');
+      anunciarEstado();
       diz(`par ANFITRIAO a partilhar=${!!voz.ecra}`);
     }
 

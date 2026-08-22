@@ -9,6 +9,7 @@ mod comandos;
 mod ecra;
 mod estado;
 mod fmp4;
+mod fontes;
 mod jogo;
 mod modelo;
 mod mse;
@@ -29,6 +30,17 @@ fn main() {
             ),
             None => println!("nada detetado"),
         }
+        return;
+    }
+
+    // `bruma --fontes` despeja o que o seletor de partilha mostraria, com as miniaturas,
+    // para %TEMP%ruma-fontes.json. Serve para inspecionar o menu sem abrir a app —
+    // e foi como se provou que os BMP desenhados à mão renderizam mesmo num <img>.
+    if std::env::args().any(|a| a == "--fontes") {
+        let fontes = fontes::fontes_de_partilha();
+        let destino = std::env::temp_dir().join("bruma-fontes.json");
+        std::fs::write(&destino, serde_json::to_vec(&fontes).unwrap()).unwrap();
+        println!("{} fontes em {}", fontes.len(), destino.display());
         return;
     }
 
@@ -87,6 +99,7 @@ fn main() {
             comandos::autoteste_par,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
+            fontes::fontes_de_partilha,
             comandos::ver_meu_ecra,
             comandos::parar_de_ver_meu_ecra,
             comandos::definir_espectadores,

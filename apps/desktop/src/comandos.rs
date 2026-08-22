@@ -421,6 +421,7 @@ pub fn receber_ecra(canal: Channel<InvokeResponseBody>, ecra: State<Arc<Ecra>>) 
 pub fn comecar_a_partilhar(
     servidor: String,
     canal_voz: String,
+    fonte: String,
     saida: Channel<InvokeResponseBody>,
     ecra: State<Arc<Ecra>>,
     rede: State<Arc<Rede>>,
@@ -465,9 +466,10 @@ pub fn comecar_a_partilhar(
         }
     });
 
+    let alvo = crate::ecra::Alvo::analisar(&fonte).map_err(erro)?;
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        crate::ecra::comecar(&mut e, entrega).map_err(erro)?
+        crate::ecra::comecar(&mut e, alvo, entrega).map_err(erro)?
     };
     Ok(serde_json::json!({ "largura": largura, "altura": altura }))
 }

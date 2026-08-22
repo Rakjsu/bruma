@@ -23,6 +23,29 @@ use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// O que se vai capturar: um monitor pelo índice, ou uma janela pelo handle.
+///
+/// O handle é só um número — reconstrói-se o `Window` dentro da thread da captura,
+/// porque os tipos do capturador guardam ponteiros que não atravessam threads.
+#[derive(Clone, Copy)]
+pub enum Alvo {
+    Ecra(usize),
+    Janela(isize),
+}
+
+impl Alvo {
+    /// `ecra:0` ou `janela:123456`, tal como o seletor os anuncia.
+    pub fn analisar(texto: &str) -> Result<Self> {
+        if let Some(n) = texto.strip_prefix("ecra:") {
+            return Ok(Alvo::Ecra(n.parse()?));
+        }
+        if let Some(n) = texto.strip_prefix("janela:") {
+            return Ok(Alvo::Janela(n.parse()?));
+        }
+        Err(anyhow!("fonte desconhecida: {texto}"))
+    }
+}
+
 /// Quem manda os pedaços para fora: um para a webview local, outro para a rede.
 pub type Entrega = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
@@ -55,6 +78,7 @@ mod win {
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
+    use windows_capture::window::Window;
 
     use crate::fmp4::Codificador;
 
@@ -64,6 +88,12 @@ mod win {
         /// Buffer reutilizado para tirar o enchimento do fim das linhas. Sem isto era uma
         /// alocação de 20 MB por frame, sessenta vezes por segundo.
         scratch: Vec<u8>,
+        /// O tamanho com que o codificador foi aberto. Uma JANELA muda de tamanho a
+        /// meio — o codificador não. Ver `on_frame_arrived`.
+        lar: u32,
+        alt: u32,
+        /// Tela persistente para onde se copiam frames de tamanho diferente do inicial.
+        tela: Vec<u8>,
     }
 
     // SAFETY: o `Sessao` guarda ponteiros COM, que em geral não atravessam threads. Aqui
@@ -86,6 +116,9 @@ mod win {
                 codificador: Some(codificador),
                 parar,
                 scratch: Vec::new(),
+                lar,
+                alt,
+                tela: Vec::new(),
             })
         }
 
@@ -101,10 +134,34 @@ mod win {
                 controlo.stop();
                 return Ok(());
             }
+            let (f_lar, f_alt) = (frame.width(), frame.height());
             let buf = frame.buffer()?;
             let bytes = buf.as_nopadding_buffer(&mut self.scratch);
+
             if let Some(c) = self.codificador.as_mut() {
-                c.frame(bytes)?;
+                if f_lar == self.lar && f_alt == self.alt {
+                    c.frame(bytes)?;
+                } else {
+                    // A janela mudou de tamanho e o codificador não muda com ela — o MP4
+                    // declara as dimensões no cabeçalho, uma vez. Copia-se o que couber
+                    // para uma tela do tamanho original: encolher deixa margem preta,
+                    // crescer corta. Imperfeito e assumido — a alternativa era a
+                    // transmissão MORRER ao primeiro redimensionar, que é pior.
+                    let destino = (self.lar * self.alt * 4) as usize;
+                    if self.tela.len() != destino {
+                        self.tela = vec![0u8; destino];
+                    }
+                    let linhas = f_alt.min(self.alt) as usize;
+                    let largura = (f_lar.min(self.lar) * 4) as usize;
+                    for y in 0..linhas {
+                        let de = y * (f_lar * 4) as usize;
+                        let para = y * (self.lar * 4) as usize;
+                        self.tela[para..para + largura].copy_from_slice(&bytes[de..de + largura]);
+                    }
+                    let tela = std::mem::take(&mut self.tela);
+                    c.frame(&tela)?;
+                    self.tela = tela;
+                }
             }
             Ok(())
         }
@@ -125,27 +182,74 @@ mod win {
         )
     }
 
-    /// Arranca a captura numa thread própria. Devolve quando a captura já está a correr.
-    pub fn arrancar(parar: Arc<AtomicBool>, entrega: Entrega) -> Result<(u32, u32)> {
-        let monitor = Monitor::primary().map_err(|e| anyhow!("sem monitor: {e:?}"))?;
-        let lar = monitor.width().map_err(|e| anyhow!("{e:?}"))?;
-        let alt = monitor.height().map_err(|e| anyhow!("{e:?}"))?;
+    fn tamanho_do_alvo(alvo: super::Alvo) -> Result<(u32, u32)> {
+        match alvo {
+            super::Alvo::Ecra(i) => {
+                let m = Monitor::from_index(i).map_err(|e| anyhow!("sem esse ecrã: {e:?}"))?;
+                Ok((
+                    m.width().map_err(|e| anyhow!("{e:?}"))?,
+                    m.height().map_err(|e| anyhow!("{e:?}"))?,
+                ))
+            }
+            super::Alvo::Janela(h) => {
+                let j = Window::from_raw_hwnd(h as *mut std::ffi::c_void);
+                if !j.is_valid() {
+                    return Err(anyhow!("essa janela já fechou"));
+                }
+                Ok((
+                    j.width().map_err(|e| anyhow!("{e:?}"))? as u32,
+                    j.height().map_err(|e| anyhow!("{e:?}"))? as u32,
+                ))
+            }
+        }
+    }
+
+    /// Arranca a captura do alvo escolhido numa thread própria.
+    pub fn arrancar(
+        alvo: super::Alvo,
+        parar: Arc<AtomicBool>,
+        entrega: Entrega,
+    ) -> Result<(u32, u32)> {
+        let (lar, alt) = tamanho_do_alvo(alvo)?;
         let (ls, aa) = caber(lar, alt);
 
         std::thread::spawn(move || {
-            let definicoes = Settings::new(
-                monitor,
-                CursorCaptureSettings::WithCursor,
-                // A moldura amarela do Windows é o equivalente da barra do WebView2: se
-                // não sair, trocava-se um aviso por outro.
-                DrawBorderSettings::WithoutBorder,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (lar, alt, ls, aa, parar, entrega),
-            );
-            if let Err(e) = Sessao::start(definicoes) {
+            // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
+            // ponteiros COM que não atravessam threads; o Alvo é só números e atravessa.
+            let flags = (lar, alt, ls, aa, parar, entrega);
+            // Função e não closure: os dois ramos passam tipos diferentes (Monitor e
+            // Window) e uma closure fixa-se no primeiro que vê.
+            fn definicoes<T: TryInto<windows_capture::settings::GraphicsCaptureItemType>>(
+                item: T,
+                flags: Flags,
+            ) -> Settings<Flags, T> {
+                Settings::new(
+                    item,
+                    CursorCaptureSettings::WithCursor,
+                    // A moldura amarela do Windows é o equivalente da barra do WebView2:
+                    // se não sair, trocava-se um aviso por outro.
+                    DrawBorderSettings::WithoutBorder,
+                    SecondaryWindowSettings::Default,
+                    MinimumUpdateIntervalSettings::Default,
+                    DirtyRegionSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                )
+            }
+            let resultado = match alvo {
+                super::Alvo::Ecra(i) => match Monitor::from_index(i) {
+                    Ok(m) => Sessao::start(definicoes(m, flags)),
+                    Err(e) => {
+                        eprintln!("[ecrã] o ecrã desapareceu: {e:?}");
+                        return;
+                    }
+                },
+                super::Alvo::Janela(h) => Sessao::start(definicoes(
+                    Window::from_raw_hwnd(h as *mut std::ffi::c_void),
+                    flags,
+                )),
+            };
+            if let Err(e) = resultado {
                 eprintln!("[ecrã] a captura terminou: {e:?}");
             }
         });
@@ -161,7 +265,11 @@ mod win {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    pub fn arrancar(_parar: Arc<AtomicBool>, _entrega: Entrega) -> Result<(u32, u32)> {
+    pub fn arrancar(
+        _alvo: super::Alvo,
+        _parar: Arc<AtomicBool>,
+        _entrega: Entrega,
+    ) -> Result<(u32, u32)> {
         Err(anyhow!(
             "a captura nativa por enquanto só existe no Windows"
         ))
@@ -169,12 +277,12 @@ mod win {
 }
 
 /// Começa a partilhar. Os pedaços vão para `entrega` assim que existem.
-pub fn comecar(estado: &mut Estado, entrega: Entrega) -> Result<(u32, u32)> {
+pub fn comecar(estado: &mut Estado, alvo: Alvo, entrega: Entrega) -> Result<(u32, u32)> {
     if estado.a_partilhar() {
         return Err(anyhow!("já estás a partilhar"));
     }
     let parar = Arc::new(AtomicBool::new(false));
-    let tamanho = win::arrancar(parar.clone(), entrega)?;
+    let tamanho = win::arrancar(alvo, parar.clone(), entrega)?;
     estado.parar = Some(parar);
     Ok(tamanho)
 }
