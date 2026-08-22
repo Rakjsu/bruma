@@ -51,11 +51,21 @@ pub const ETIQUETA_CODEC: u8 = 1;
 /// Quem recebe os pedaços à medida que saem.
 pub type Escoadouro = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Quanto do passado se guarda. O sink recua para corrigir tamanhos de caixas, e não
+/// pode recuar para além do que ainda temos — mas o recuo é sempre dentro do fragmento em
+/// curso, que é da ordem das centenas de kilobytes. Quatro megabytes são folga de sobra.
+const JANELA: u64 = 4 * 1024 * 1024;
+
 struct Estado {
     dados: Vec<u8>,
+    /// Posição absoluta do primeiro byte que ainda temos em `dados`.
+    ///
+    /// Sem isto o buffer crescia para sempre: uma hora de partilha a 7 Mbps são mais de
+    /// três gigabytes guardados por nada, porque o que já saiu nunca mais é preciso.
+    base: u64,
     pos: u64,
-    /// Até onde é que já foi entregue para fora.
-    entregue: usize,
+    /// Até onde é que já foi entregue para fora, em posição absoluta.
+    entregue: u64,
     /// Quantas caixas já foram anunciadas no diagnóstico.
     vistas: usize,
     /// Soma das durações dos fragmentos já entregues, para o `tfdt` de cada um.
@@ -75,6 +85,7 @@ impl FluxoDeSaida {
         Self {
             estado: Mutex::new(Estado {
                 dados: Vec::with_capacity(1 << 20),
+                base: 0,
                 pos: 0,
                 entregue: 0,
                 vistas: 0,
@@ -94,13 +105,19 @@ impl FluxoDeSaida {
     /// com a caixa toda na mão.
     fn escrever(&self, bytes: &[u8]) -> u32 {
         let mut e = self.estado.lock().unwrap();
-        let inicio = e.pos as usize;
+        // Se o sink recuar para antes do que ainda temos, não há nada de bom a fazer: os
+        // bytes que ele quer corrigir já saíram. Prefere-se recusar a escrever no sítio
+        // errado, que produziria vídeo estragado sem dar erro.
+        let Some(inicio) = e.pos.checked_sub(e.base).map(|v| v as usize) else {
+            eprintln!("[ecrã] o codificador recuou para fora da janela; pedaço ignorado");
+            return 0;
+        };
         let fim = inicio + bytes.len();
         if e.dados.len() < fim {
             e.dados.resize(fim, 0);
         }
         e.dados[inicio..fim].copy_from_slice(bytes);
-        e.pos = fim as u64;
+        e.pos = e.base + fim as u64;
 
         // O MSE come SEGMENTOS, nao caixas soltas: o de inicializacao e `ftyp`+`moov`
         // juntos, e cada segmento de media e um `moof`+`mdat` junto. Entregar as caixas
@@ -113,9 +130,13 @@ impl FluxoDeSaida {
         // recuar por ele recuava a mais.
         let mut inicio_na_origem = e.entregue;
         let mut pendente: u64 = 0;
-        while let Some(tam) = crate::mse::tamanho_da_caixa(&e.dados, e.entregue) {
-            let i = e.entregue;
-            e.entregue = i + tam;
+        while let Some(tam) = {
+            let desde = (e.entregue - e.base) as usize;
+            crate::mse::tamanho_da_caixa(&e.dados, desde)
+        } {
+            let i = (e.entregue - e.base) as usize;
+            let absoluta = e.entregue;
+            e.entregue += tam as u64;
             if crate::mse::VER_CAIXAS.load(std::sync::atomic::Ordering::Relaxed) && e.vistas < 14 {
                 e.vistas += 1;
                 println!("  [ecrã] caixa {}", crate::mse::nome_da_caixa(&e.dados, i));
@@ -134,7 +155,7 @@ impl FluxoDeSaida {
                 }
             }
             let traduzida = if crate::mse::e_moof(&e.dados, i) {
-                crate::mse::corrigir_moof(caixa, i as u64, e.tempo + pendente)
+                crate::mse::corrigir_moof(caixa, absoluta, e.tempo + pendente)
             } else {
                 None
             };
@@ -166,6 +187,15 @@ impl FluxoDeSaida {
         // sem o `mdat` dele.
         if !segmento.is_empty() {
             e.entregue = inicio_na_origem;
+        }
+
+        // E deita-se fora o passado que ja saiu, deixando a janela de folga para os
+        // recuos do sink. Sem isto o buffer so cresce.
+        let guardar_a_partir = e.entregue.saturating_sub(JANELA);
+        if guardar_a_partir > e.base {
+            let cortar = (guardar_a_partir - e.base) as usize;
+            e.dados.drain(..cortar);
+            e.base = guardar_a_partir;
         }
         drop(e);
 
@@ -200,15 +230,14 @@ impl IMFByteStream_Impl for FluxoDeSaida_Impl {
     }
 
     fn GetLength(&self) -> windows::core::Result<u64> {
-        Ok(self.estado.lock().unwrap().dados.len() as u64)
+        let e = self.estado.lock().unwrap();
+        Ok(e.base + e.dados.len() as u64)
     }
 
     fn SetLength(&self, tamanho: u64) -> windows::core::Result<()> {
-        self.estado
-            .lock()
-            .unwrap()
-            .dados
-            .resize(tamanho as usize, 0);
+        let mut e = self.estado.lock().unwrap();
+        let novo = tamanho.saturating_sub(e.base) as usize;
+        e.dados.resize(novo, 0);
         Ok(())
     }
 
@@ -223,12 +252,12 @@ impl IMFByteStream_Impl for FluxoDeSaida_Impl {
 
     fn IsEndOfStream(&self) -> windows::core::Result<BOOL> {
         let e = self.estado.lock().unwrap();
-        Ok(BOOL::from(e.pos as usize >= e.dados.len()))
+        Ok(BOOL::from(e.pos >= e.base + e.dados.len() as u64))
     }
 
     fn Read(&self, pb: *mut u8, cb: u32, lidos: *mut u32) -> windows::core::Result<()> {
         let mut e = self.estado.lock().unwrap();
-        let inicio = (e.pos as usize).min(e.dados.len());
+        let inicio = e.pos.saturating_sub(e.base).min(e.dados.len() as u64) as usize;
         let n = (cb as usize).min(e.dados.len() - inicio);
         // SAFETY: o chamador garante `cb` bytes em `pb`; copia-se no máximo isso.
         unsafe {
@@ -237,7 +266,7 @@ impl IMFByteStream_Impl for FluxoDeSaida_Impl {
                 *lidos = n as u32;
             }
         }
-        e.pos = (inicio + n) as u64;
+        e.pos = e.base + (inicio + n) as u64;
         Ok(())
     }
 
@@ -463,18 +492,13 @@ fn juntar64(t: &IMFMediaType, chave: &windows::core::GUID, alto: u32, baixo: u32
 /// ajudava nada: o `MFCreateFMPEG4MediaSink` respondia `MF_E_SHUTDOWN`, "Shutdown() foi
 /// chamado", quando o problema era exatamente o contrário — nunca tinha sido arrancado.
 fn arrancar_media_foundation() -> Result<()> {
-    use std::sync::Once;
-    static UMA_VEZ: Once = Once::new();
-    static mut RESULTADO: Option<windows::core::Error> = None;
-
-    UMA_VEZ.call_once(|| unsafe {
-        if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
-            RESULTADO = Some(e);
-        }
+    static RESULTADO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let erro = RESULTADO.get_or_init(|| unsafe {
+        MFStartup(MF_VERSION, MFSTARTUP_FULL)
+            .err()
+            .map(|e| e.to_string())
     });
-    // SAFETY: só se lê depois do `call_once`, que sincroniza a escrita.
-    #[allow(static_mut_refs)]
-    match unsafe { RESULTADO.as_ref() } {
+    match erro {
         Some(e) => Err(anyhow!("o Media Foundation não arrancou: {e}")),
         None => Ok(()),
     }

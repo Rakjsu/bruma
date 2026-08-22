@@ -32,7 +32,7 @@ fn main() {
         return;
     }
 
-    if std::env::args().any(|a| a == "--autoteste") {
+    if std::env::args().any(|a| a.starts_with("--autoteste")) {
         mse::VER_CAIXAS.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 

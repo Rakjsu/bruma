@@ -1635,7 +1635,8 @@ function pararDeAssistir() {
    Cada uma dessas perguntas falha de maneira diferente e em sítios diferentes. */
 (async () => {
   if (!window.__TAURI__) return;
-  if (!(await invoke('autoteste_pedido').catch(() => false))) return;
+  const segundos = await invoke('autoteste_pedido').catch(() => 0);
+  if (!segundos) return;
 
   const diz = linha => invoke('capacidades', { linha }).catch(() => {});
   const fluxo = fluxoDePedacos();
@@ -1660,7 +1661,7 @@ function pararDeAssistir() {
     return diz(`autoteste FALHOU a arrancar: ${e}`);
   }
 
-  await new Promise(r => setTimeout(r, 6000));
+  await new Promise(r => setTimeout(r, segundos * 1000));
   await invoke('parar_de_partilhar').catch(() => {});
 
   const v = fluxo.el;

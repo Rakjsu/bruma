@@ -498,7 +498,18 @@ pub static ECRA: std::sync::OnceLock<Arc<Ecra>> = std::sync::OnceLock::new();
 /// só existem mesmo se um `<video>` os aceitar. Um teste em Rust prova metade; este prova
 /// a cadeia toda, e a captura nativa — ao contrário do `getDisplayMedia` — não precisa de
 /// um clique para arrancar.
+/// Quantos segundos deve durar o autoteste, ou 0 se não foi pedido.
+/// `--autoteste` faz 6 segundos; `--autoteste=30` faz trinta — útil para ver se a memória
+/// se aguenta numa partilha longa, que é coisa que seis segundos nunca mostram.
 #[tauri::command]
-pub fn autoteste_pedido() -> bool {
-    std::env::args().any(|a| a == "--autoteste")
+pub fn autoteste_pedido() -> u32 {
+    for a in std::env::args() {
+        if a == "--autoteste" {
+            return 6;
+        }
+        if let Some(n) = a.strip_prefix("--autoteste=") {
+            return n.parse().unwrap_or(6);
+        }
+    }
+    0
 }
