@@ -1922,11 +1922,36 @@ function pararDeAssistir() {
     if (modo === '') {
       servidorId = await invoke('criar_servidor', { nome: 'par' });
       await invoke('criar_canal', { servidor: servidorId, nome: 'sala', tipo: 'voz' });
+      await invoke('criar_canal', { servidor: servidorId, nome: 'geral', tipo: 'texto' });
+
+      // Escrever ANTES de o convidado existir. É a promessa central do projeto — que nada
+      // morre por o outro estar offline — e ninguém guardou isto num servidor: fica aqui,
+      // à espera de alguém a quem o dar.
+      await desenharTudo();
+      const texto = vista.servidores.find(x => x.id === servidorId)
+        .canais.find(c => c.tipo === 'texto');
+      for (let i = 1; i <= 5; i++) {
+        await invoke('enviar', { servidor: servidorId, canal: texto.id, texto: `antes ${i}` });
+      }
+      diz('par ANFITRIAO escreveu 5 mensagens antes de existir convidado');
+
       const convite = await invoke('criar_convite', { servidor: servidorId });
       diz(`par ANFITRIAO convite=${convite}`);
     } else {
       servidorId = await invoke('entrar_com_convite', { codigo: modo });
       diz('par CONVIDADO entrou');
+
+      // O histórico que existia antes de eu existir tem de chegar cá.
+      let msgs = [];
+      for (let i = 0; i < 30 && msgs.length < 5; i++) {
+        await esperar(500);
+        await desenharTudo();
+        const srv = vista.servidores.find(x => x.id === servidorId);
+        const t = srv && srv.canais.find(c => c.tipo === 'texto');
+        if (t) msgs = await invoke('mensagens', { servidor: servidorId, canal: t.id }).catch(() => []);
+      }
+      diz(`par CONVIDADO recebeu ${msgs.length}/5 mensagens escritas antes de ele entrar`
+        + (msgs.length ? ` (primeira: "${msgs[0].texto}", última: "${msgs[msgs.length - 1].texto}")` : ''));
     }
 
     // Esperar que o canal de voz apareça: o convidado só o conhece depois de sincronizar.
