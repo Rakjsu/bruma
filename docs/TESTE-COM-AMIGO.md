@@ -1,125 +1,158 @@
-# Teste do Spike 1 — duas casas, duas redes
+# Testar com um amigo, em casas diferentes
 
-Este é o teste que decide o projeto. Tudo o resto no Bruma assume que dois computadores em casas
-diferentes conseguem falar diretamente, sem servidor. Se isso não se aguentar, a arquitetura muda
-toda — e é muito melhor saber isso agora.
+Este é o teste que decide o projeto. Tudo no Bruma assume que dois computadores em casas
+diferentes se ligam diretamente, sem servidor no meio. **Duas máquinas na mesma casa não
+provam nada** — partilham o mesmo router, e é justamente o router que costuma ser o
+problema.
 
-**Demora uns 15 minutos** e não precisa de instalar nada do lado do teu amigo.
+Demora uns 20 minutos.
 
-## O que enviar ao teu amigo
+---
 
-Um único ficheiro:
+## Antes de começar: o que já se sabe que vai e não vai funcionar
 
-```
-target/release/spike1-net.exe
-```
+Vale a pena saber isto de antemão, para não se perder tempo a investigar o que já está
+explicado.
 
-Pesa cerca de 16 MB. Manda por onde quiseres. Ele não precisa de Rust, nem de Node, nem de nada.
+| | Estado | Porquê |
+|---|---|---|
+| Entrar, criar servidor, convidar | deve funcionar | vai pelo iroh |
+| Mensagens, e receber o que se perdeu | deve funcionar | vai pelo iroh |
+| **Partilha de ecrã** | deve funcionar | desde a v0.5.0 vai pelo iroh também |
+| **Voz** | **não vai ligar** | falta configurar servidores de ligação — ver abaixo |
 
-> O Windows pode avisar que é de um "editor desconhecido" — é normal para um executável sem
-> assinatura digital. Ele tem de escolher *Mais informações → Executar mesmo assim*.
+A voz é a única coisa que ainda depende de WebRTC, e o WebRTC precisa de um servidor que
+lhe diga por onde furar o router. Sem isso ele só encontra caminhos dentro da rede local,
+e entre duas casas não há nenhum. **Não é uma avaria: é configuração que falta.**
 
-## Preparar (cada um na sua casa)
+Há um servidor de ligação pronto (coturn, no Oracle do Brasil), mas as portas dele estão
+fechadas na firewall da Oracle. Enquanto estiverem, a voz não liga a ninguém de fora.
 
-Cada um põe o `spike1-net.exe` numa pasta vazia própria, por exemplo `C:\bruma-teste\`.
-O programa cria lá dentro uma pasta `data/` com a identidade e o histórico.
+---
 
-Abrir uma linha de comandos **nessa pasta** e correr:
+## 1 · Instalar (os dois)
 
-**Tu:**
-```
-spike1-net.exe --name eu
-```
+Descarregar o instalador mais recente:
 
-Vai imprimir uma linha assim:
+**https://github.com/Rakjsu/bruma/releases/latest**
 
-```
-identidade : 27a76005040e171d314e3c4c1c898ecdffebfc2cbe2b4811beaa71807c6650f3
-```
+O ficheiro é `Bruma_x.y.z_x64-setup.exe`.
 
-Copia esse código todo e manda ao teu amigo (WhatsApp, Signal, o que for — não é segredo, é o
-equivalente a um número de telefone).
+> **O Windows vai avisar** que é de um editor desconhecido — *"O Windows protegeu o seu
+> PC"*. É normal e é esperado: assinar uma aplicação de forma a calar esse aviso exige um
+> certificado comercial, que custa algumas centenas de euros por ano. Para instalar:
+> **Mais informações → Executar mesmo assim**.
+>
+> O instalador não é anónimo por ser desconhecido; é desconhecido porque não foi comprado
+> um certificado. São coisas diferentes e convém dizê-lo em vez de pedir confiança cega.
 
-**O teu amigo:**
-```
-spike1-net.exe --name amigo --connect 27a76005040e171d314e3c4c1c898ecdffebfc2cbe2b4811beaa71807c6650f3
-```
+**Os dois têm de ter a mesma versão.** O formato das mensagens na rede mudou na v0.5.0
+para passar a levar vídeo: uma app v0.4.x e uma v0.5.x não se entendem, e a ligação cai
+sem explicação útil.
 
-## O que deve acontecer
+Na primeira abertura cada um escolhe um nome. **Não há registo, nem e-mail, nem password**
+— é criada uma chave neste computador e é ela a identidade.
 
-Nos dois lados aparece:
+---
 
-```
-[ok] Ligado a ...
-[ok] Chave de sessao estabelecida (prekey assinada e verificada)
-```
+## 2 · Um cria o servidor, o outro entra
 
-A partir daí escrevem os dois e carregam Enter. As mensagens devem aparecer do outro lado.
+**Quem cria** (digamos, tu):
 
-## O número que interessa: direto ou por relay
+1. Criar um servidor.
+2. Carregar em **Convidar** e copiar o código.
 
-Nos primeiros segundos vai aparecer uma destas linhas:
+**Manda o convite por um sítio privado** — Signal, WhatsApp, o que for.
 
-```
-[!] caminho inicial: RELAY (hole-punch nao passou -- sinal de CGNAT)
-[ok] passou a DIRETO (...) -- hole-punch feito
-```
+> ⚠️ **O convite contém a chave do servidor.** Quem o tiver consegue ler tudo o que for
+> escrito a partir do momento em que entra. Trata-o como uma password, não como um
+> endereço. Não o ponhas num sítio público.
 
-**Esperem uns 30 segundos antes de tirar conclusões.** O hole-punch acontece depois de a ligação
-abrir, portanto começar em RELAY é normal. O que interessa é se acaba em DIRETO.
+**Quem entra** (o teu amigo): cola o convite.
 
-- **Acabou em DIRETO** → a premissa aguenta-se. Podemos seguir sem infraestrutura nenhuma.
-- **Ficou em RELAY para sempre** → pelo menos um dos lados está atrás de CGNAT. Continua a
-  funcionar, mas todo o tráfego passa por um relay público que não é nosso. Nesse caso a decisão
-  passa a ser alojar um relay próprio, e é melhor sabê-lo agora do que daqui a três meses.
+Deve aparecer o servidor, os canais, e o teu nome na lista de membros. Em cima, o contador
+de ligados passa a **1 ligado**.
 
-## O segundo teste: sobreviver a estar offline
+**Se isto funcionar, a premissa do projeto está provada.** Não há servidor nenhum no meio:
+os dois computadores estão a falar diretamente, e o convite só levou a chave.
 
-Este prova o "não perco mensagens enquanto durmo", que é a razão de não haver servidor.
+---
 
-1. Com os dois ligados, troquem duas ou três mensagens.
-2. **O teu amigo fecha o programa** (Ctrl+C ou fechar a janela).
-3. **Tu escreves mais três mensagens.** Ele não está lá — mas escreve na mesma.
-4. Ele volta a abrir com exatamente o mesmo comando de antes.
-5. **Ele tem de ver as três mensagens que perdeu**, pela ordem certa.
+## 3 · Mensagens, e o que acontece quando alguém fecha
 
-Se isto funcionar, o modelo sem servidor está provado na prática.
+1. Escrevam os dois num canal de texto. Devem aparecer dos dois lados em segundos.
+2. **O teste que interessa:** o teu amigo fecha o Bruma completamente. Tu escreves três ou
+   quatro mensagens. Ele volta a abrir.
+3. As mensagens devem aparecer-lhe todas, pela ordem certa.
 
-## Vale a pena repetir em cenários diferentes
+Isto é o "nada morre por estares offline" — e nota que ninguém as guardou num servidor:
+estavam no computador de quem as escreveu, à espera de alguém a quem as dar.
 
-Cada combinação testa uma coisa distinta:
+**Se as mensagens aparecerem trocadas**, diz-me: a ordenação usa um relógio lógico
+precisamente para aguentar relógios desencontrados entre os EUA e o Brasil, e um erro aí é
+exatamente o tipo de coisa que nunca se vê a testar na mesma máquina.
 
-| Cenário | O que testa |
+---
+
+## 4 · Partilha de ecrã
+
+Os dois entram no mesmo canal de voz. **A voz não vai funcionar** (ver o quadro em cima),
+mas a partilha de ecrã não depende dela.
+
+1. Um carrega em **Partilhar ecrã** (o segundo botão da fila, em baixo).
+2. Do outro lado, o painel dessa pessoa deve mudar para *"está a transmitir"* com um botão
+   **Assistir**.
+3. Carregar em Assistir. O ecrã deve aparecer.
+
+O que se está a provar aqui, e não é pouco: **não aparece nenhuma barra do Windows a dizer
+"está a partilhar"**, e o vídeo vai pelo mesmo caminho cifrado das mensagens — quem vê o
+teu ecrã não fica com o teu endereço.
+
+Se o painel disser *"está a transmitir"* mas a imagem não chegar, isso é informação útil:
+quer dizer que o aviso passou e os dados não. Diz-me e eu sei onde procurar.
+
+---
+
+## 5 · Para a voz funcionar (só tu podes fazer isto)
+
+Na consola da Oracle, na instância do Brasil:
+
+**Networking → Virtual Cloud Network → Security Lists → Default → Add Ingress Rules**
+
+Três regras, todas com origem `0.0.0.0/0`:
+
+| Protocolo | Portas |
 |---|---|
-| fibra de casa ↔ fibra de casa | o caso normal |
-| fibra ↔ dados móveis (hotspot do telemóvel) | **o pior caso** — o móvel é quase sempre CGNAT |
-| um dos lados com VPN ligada | se a VPN estraga o hole-punch |
+| UDP | 3478 |
+| TCP | 3478 |
+| UDP | 50000–50200 |
 
-## O que me interessa saber
+Depois, **nos dois computadores**: botão direito na app → *Servidores de ligação* → colar:
 
-Copia e manda:
+```
+turn:bruma:uvvqIcnTW19wgvJumCTl0gBpk0OC@168.138.155.90:3478
+```
 
-1. A linha do caminho de cada lado (DIRETO ou RELAY, e ao fim de quanto tempo).
-2. Se o teste de offline funcionou.
-3. Que tipo de ligação tem cada um (fibra, cabo, móvel) e o operador.
-4. Qualquer mensagem de erro que tenha aparecido.
+Avisa-me quando abrires e eu confirmo daqui que o servidor responde, antes de valer a pena
+tentarem a voz.
 
-## Se correr mal
+---
 
-**"ligacao falhou"** — normalmente é o ID mal copiado. São 64 caracteres, sem espaços. Confirmem
-que não foi cortado pela app de mensagens.
+## O que me dizer no fim
 
-**Fica preso em "relay : a ligar..."** — não há saída para a internet, ou uma firewall corporativa
-está a bloquear. Vale a pena tentar com o hotspot do telemóvel.
+Mesmo que corra tudo bem, há coisas que só se veem aí:
 
-**O Windows bloqueia o executável** — *Mais informações → Executar mesmo assim*.
+- **Em que passo é que parou**, se parou. Cada passo falha por uma razão diferente.
+- **Quanto tempo demorou a ligar** — se demorou mais de uns segundos, o furo no router
+  falhou e a ligação foi por um relay, o que se nota na velocidade.
+- **Se a partilha de ecrã ficou fluida ou aos solavancos**, e o que estava no ecrã (texto
+  parado gasta quase nada; um jogo gasta muito).
+- Se apareceu alguma janela de erro, o texto dela tal como está.
 
-**A firewall do Windows pergunta** — permitir em redes privadas chega.
+---
 
-## O que o teste não é
+## Se nada ligar
 
-Não há interface, não há voz, não há partilha de ecrã. É de propósito: isto testa uma coisa só, e
-o objetivo é uma resposta clara a uma pergunta, não uma demonstração bonita.
-
-E o teu amigo pode apagar a pasta `C:\bruma-teste\` no fim — a identidade dele vive lá dentro e
-não deixa nada no computador.
+Antes de concluir o que quer que seja, vale a pena isolar o problema com o `spike1-net`,
+que faz só a parte da rede e mais nada — se ele ligar e a app não, o problema não é o
+router. Está em `spikes/spike1-net/README.md`.
