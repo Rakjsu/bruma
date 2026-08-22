@@ -39,13 +39,18 @@ Descarregar o instalador mais recente:
 
 O ficheiro é `Bruma_x.y.z_x64-setup.exe`.
 
-> **O Windows vai avisar** que é de um editor desconhecido — *"O Windows protegeu o seu
-> PC"*. É normal e é esperado: assinar uma aplicação de forma a calar esse aviso exige um
-> certificado comercial, que custa algumas centenas de euros por ano. Para instalar:
-> **Mais informações → Executar mesmo assim**.
+> **O Windows vai avisar duas vezes, e as duas são esperadas.** Primeiro o SmartScreen —
+> *"O Windows protegeu o seu PC"* — porque calar esse aviso exige um certificado comercial
+> que custa centenas de euros por ano: **Mais informações → Executar mesmo assim**. Depois
+> o pedido de administrador (UAC), porque desde a v0.7.0 o Bruma instala-se nos **Arquivos
+> de Programas**, como uma aplicação a sério, e escrever lá exige esse clique.
 >
 > O instalador não é anónimo por ser desconhecido; é desconhecido porque não foi comprado
 > um certificado. São coisas diferentes e convém dizê-lo em vez de pedir confiança cega.
+
+Quem tiver uma versão antiga instalada não precisa de fazer nada: o instalador novo
+remove-a sozinho e **os dados ficam** — a identidade e as mensagens vivem em
+`%APPDATA%\Bruma`, fora da pasta do programa, precisamente para sobreviverem a isto.
 
 **Os dois têm de ter a v0.6.0 ou mais recente.** O formato das mensagens na rede mudou na
 v0.5.0 para levar vídeo, e a voz passou a andar em datagramas na v0.6.0. Uma app v0.4.x
