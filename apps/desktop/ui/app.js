@@ -796,6 +796,7 @@ const voz = {
   aPartilhar: new Set(), // quem está a transmitir o ecrã
   aVer: null,            // de quem estou a ver a transmissão
   aSerVistoPor: new Set(), // quem pediu para ver o MEU ecrã — só a esses se envia
+  vejoMeuEcra: null,       // o <video> da minha própria transmissão, só enquanto olho
   analisadores: new Map(),
   audioCtx: null,
 };
@@ -892,7 +893,8 @@ async function sairDeVoz(anunciar = true) {
   pararDeEnviarVoz();
   for (const chave of [...voz.audio.keys()]) calarPeer(chave);
   if (voz.micro) voz.micro.getTracks().forEach(t => t.stop());
-  if (voz.ecra) { invoke('parar_de_partilhar').catch(() => {}); voz.ecra.fechar(); }
+  if (voz.ecra) invoke('parar_de_partilhar').catch(() => {});
+  if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   for (const chave of [...fluxosRecebidos.keys()]) fecharFluxoRecebido(chave);
   for (const chave of [...voz.analisadores.keys()]) pararDeVigiar(chave);
   voz.falando.clear();
@@ -1042,7 +1044,8 @@ function fluxoDePedacos() {
 async function alternarEcra() {
   if (voz.ecra) {
     await invoke('parar_de_partilhar').catch(() => {});
-    if (voz.ecra.fechar) voz.ecra.fechar();
+    if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
+    if (voz.aVer === voz.eu) voz.aVer = null;
     voz.ecra = null;
     anunciarEstado();
     desenharVoz();
@@ -1051,9 +1054,14 @@ async function alternarEcra() {
   }
   if (!voz.canal || !voz.servidor) return;
 
-  const fluxo = fluxoDePedacos();
+  // O canal fica aberto desde já, mas o Rust só manda por ele quando estivermos mesmo
+  // a olhar (ver_meu_ecra). Criar o <video> agora e deixá-lo a apanhar pedaços às
+  // escuras era o bug do ecrã preto: a fila aparava os antigos e o cabeçalho ia fora.
   const canal = new window.__TAURI__.core.Channel();
-  canal.onmessage = pedaco => fluxo.empurrar(pedaco);
+  canal.onmessage = pedaco => {
+    if (voz.vejoMeuEcra) voz.vejoMeuEcra.empurrar(
+      pedaco instanceof ArrayBuffer ? new Uint8Array(pedaco) : new Uint8Array(pedaco));
+  };
 
   try {
     await invoke('comecar_a_partilhar', {
@@ -1062,11 +1070,10 @@ async function alternarEcra() {
       saida: canal,
     });
   } catch (e) {
-    fluxo.fechar();
     console.warn('não consegui começar a partilhar:', e);
     return;
   }
-  voz.ecra = fluxo;
+  voz.ecra = { fechar() {} };
   anunciarEstado();
   desenharVoz();
   desenharRodape();
@@ -1130,7 +1137,7 @@ function nomeDoPeer(peer) {
  *  perdia-se tudo o que já foi recebido a cada mudança de ecrã.
  */
 function ecraDe(chave) {
-  if (chave === voz.eu) return voz.ecra ? voz.ecra.el : null;
+  if (chave === voz.eu) return voz.vejoMeuEcra ? voz.vejoMeuEcra.el : null;
   const f = fluxosRecebidos.get(chave);
   return f ? f.el : null;
 }
@@ -1690,17 +1697,36 @@ function anunciarEstado() {
 
 /* --- assistir a uma transmissão -------------------------------------------- */
 
+function deixarDeVerOMeu() {
+  if (!voz.vejoMeuEcra) return;
+  invoke('parar_de_ver_meu_ecra').catch(() => {});
+  voz.vejoMeuEcra.fechar();
+  voz.vejoMeuEcra = null;
+}
+
 function assistir(peer) {
-  if (voz.aVer && voz.aVer !== peer) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+  if (voz.aVer && voz.aVer !== peer && voz.aVer !== voz.eu) {
+    sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+  }
+  if (voz.aVer === voz.eu && peer !== voz.eu) deixarDeVerOMeu();
   voz.aVer = peer;
-  // Quem transmite tem de saber que estou a ver: e essa lista que decide o que sai da
-  // maquina dele. Sem isto o ecra era codificado para ninguem.
-  if (peer !== voz.eu) sinalizar(peer, { tipo: 'assistir', ligado: true });
+  if (peer === voz.eu) {
+    // O fluxo nasce AGORA, e só agora é que o Rust abre a torneira — reenviando o
+    // princípio da transmissão primeiro, para o <video> saber o que vai receber.
+    voz.vejoMeuEcra = fluxoDePedacos();
+    desenharVoz();                       // o <video> entra no DOM antes dos pedaços
+    invoke('ver_meu_ecra').catch(() => {});
+    return;
+  }
+  // Quem transmite tem de saber que estou a ver: é essa lista que decide o que sai da
+  // máquina dele. Sem isto o ecrã era codificado para ninguém.
+  sinalizar(peer, { tipo: 'assistir', ligado: true });
   desenharVoz();
 }
 
 function pararDeAssistir() {
-  if (voz.aVer && voz.aVer !== voz.eu) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+  if (voz.aVer === voz.eu) deixarDeVerOMeu();
+  else if (voz.aVer) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
   voz.aVer = null;
   desenharVoz();
 }
@@ -1793,6 +1819,7 @@ function pararDeAssistir() {
   try {
     const r = await invoke('comecar_a_partilhar',
       { servidor: 'autoteste', canalVoz: 'autoteste', saida: canal });
+    await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
     diz(`autoteste: a captar a ${r.largura}x${r.altura}`);
   } catch (e) {
     return diz(`autoteste FALHOU a arrancar: ${e}`);
@@ -1989,6 +2016,10 @@ function pararDeAssistir() {
       const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
       diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
         + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`);
+
+      // O anfitrião olha para o próprio ecrã A MEIO da transmissão — o cenário exato do
+      // bug do ecrã preto: quem começa a ver tarde precisa do cabeçalho reenviado.
+      if (modo === '' && volta === 2 && !voz.aVer) assistir(voz.eu);
 
       // Assim que alguém aparecer a transmitir, o convidado carrega em Assistir e conta o
       // que o <video> conseguiu mesmo descodificar — que é o que separa "chegaram bytes"

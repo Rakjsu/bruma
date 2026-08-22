@@ -393,8 +393,12 @@ pub struct Ecra {
     pub estado: SyncMutex<crate::ecra::Estado>,
     /// Onde a webview quer receber o ecrã dos outros.
     pub entrada: SyncMutex<Option<Channel<InvokeResponseBody>>>,
-    /// Onde ela quer ver o seu próprio.
-    pub propria: SyncMutex<Option<Channel<InvokeResponseBody>>>,
+    /// Onde ela quer ver o seu próprio ecrã — e SE está mesmo a ver.
+    ///
+    /// O booleano vive dentro do mesmo Mutex de propósito: o reenvio do cabeçalho e a
+    /// abertura da torneira têm de ser um gesto só, senão um fragmento escapa entre os
+    /// dois e chega antes do princípio — que é precisamente o bug que isto corrige.
+    pub propria: SyncMutex<Option<(Channel<InvokeResponseBody>, bool)>>,
     /// A que servidor e canal pertence a partilha a decorrer.
     pub onde: SyncMutex<Option<(String, String)>>,
     /// O princípio da transmissão: o nome do codec e o segmento de inicialização.
@@ -423,7 +427,7 @@ pub fn comecar_a_partilhar(
 ) -> R<serde_json::Value> {
     let ecra = ecra.inner().clone();
     let rede = rede.inner().clone();
-    *ecra.propria.lock().unwrap() = Some(saida);
+    *ecra.propria.lock().unwrap() = Some((saida, false));
     *ecra.onde.lock().unwrap() = Some((servidor.clone(), canal_voz.clone()));
 
     ecra.cabecalho.lock().unwrap().clear();
@@ -436,10 +440,14 @@ pub fn comecar_a_partilhar(
                 c.push(pedaco.to_vec());
             }
         }
-        // A pré-visualização local: os bytes vão como estão, sem cabeçalho, porque só há
-        // uma origem possível.
-        if let Some(c) = eco.propria.lock().unwrap().as_ref() {
-            let _ = c.send(InvokeResponseBody::Raw(pedaco.to_vec()));
+        // A pré-visualização local só anda quando há alguém a olhar para ela. Enviar
+        // sempre parecia inofensivo, mas era o bug do ecrã preto: os pedaços fluíam
+        // desde o início, a fila do lado de lá aparava os antigos para não crescer, e
+        // quando a pessoa carregava em "ver o meu ecrã" o cabeçalho já tinha ido fora.
+        if let Some((c, a_ver)) = eco.propria.lock().unwrap().as_ref() {
+            if *a_ver {
+                let _ = c.send(InvokeResponseBody::Raw(pedaco.to_vec()));
+            }
         }
         // E para a rede, um Arc partilhado por todos os espectadores.
         let espectadores = {
@@ -471,6 +479,28 @@ pub fn parar_de_partilhar(ecra: State<Arc<Ecra>>) {
     }
     *ecra.propria.lock().unwrap() = None;
     *ecra.onde.lock().unwrap() = None;
+}
+
+/// Começa (ou retoma) a pré-visualização do próprio ecrã.
+///
+/// Primeiro o princípio da transmissão, depois abre-se a torneira — dentro do mesmo
+/// lock, para nenhum fragmento se meter entre os dois.
+#[tauri::command]
+pub fn ver_meu_ecra(ecra: State<Arc<Ecra>>) {
+    let mut guarda = ecra.propria.lock().unwrap();
+    if let Some((c, a_ver)) = guarda.as_mut() {
+        for p in ecra.cabecalho.lock().unwrap().iter() {
+            let _ = c.send(InvokeResponseBody::Raw(p.clone()));
+        }
+        *a_ver = true;
+    }
+}
+
+#[tauri::command]
+pub fn parar_de_ver_meu_ecra(ecra: State<Arc<Ecra>>) {
+    if let Some((_, a_ver)) = ecra.propria.lock().unwrap().as_mut() {
+        *a_ver = false;
+    }
 }
 
 /// Quem está mesmo a ver. Enquanto esta lista estiver vazia, nada sai desta máquina —

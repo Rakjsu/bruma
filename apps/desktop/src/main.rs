@@ -87,6 +87,8 @@ fn main() {
             comandos::autoteste_par,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
+            comandos::ver_meu_ecra,
+            comandos::parar_de_ver_meu_ecra,
             comandos::definir_espectadores,
             jogo::jogo_em_execucao,
         ])
