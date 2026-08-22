@@ -53,6 +53,7 @@ fn main() {
             ))?;
 
             println!("Bruma pronto.");
+            println!("  dados      : {}", estado::raiz().display());
             println!("  identidade : {}", nucleo.minha_chave());
             println!("  endereço   : {}", rede.id());
 

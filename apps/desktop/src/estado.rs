@@ -20,10 +20,42 @@ use crate::modelo::{self, Aplicavel, Carga, EstadoDoServidor, MensagemVista};
 
 /// Onde vive tudo. Fica ao lado do executável para o spike ser descartável de uma vez;
 /// num instalador a sério isto muda para a pasta de dados do utilizador.
+/// Onde ficam a identidade e os registos.
+///
+/// Isto era `dados`, e portanto dependia da pasta de onde a app fosse aberta. Num
+/// computador de desenvolvimento não se nota; instalada, nota-se muito: um atalho do menu
+/// Iniciar arranca na pasta do executável, e se ela estiver dentro do `Program Files` a
+/// app não consegue lá escrever e nem abre. Pior ainda seria abrir e criar uma identidade
+/// nova por cada sítio de onde fosse lançada — sem servidor, uma identidade perdida é uma
+/// conta perdida.
+///
+/// A ordem é:
+///  1. `BRUMA_DADOS`, para quem quiser mandar (testes, pen, duas contas na mesma máquina);
+///  2. uma pasta `dados` já existente ao lado, que é onde vivem as instalações antigas e o
+///     ambiente de desenvolvimento — não se abandona o que já lá está;
+///  3. a pasta de dados do sistema, que é onde isto devia ter começado.
 pub fn raiz() -> PathBuf {
-    std::env::var("BRUMA_DADOS")
+    if let Ok(escolhida) = std::env::var("BRUMA_DADOS") {
+        return PathBuf::from(escolhida);
+    }
+    let ao_lado = PathBuf::from("dados");
+    if ao_lado.join("identidade.key").exists() {
+        return ao_lado;
+    }
+    pasta_do_sistema().unwrap_or(ao_lado)
+}
+
+#[cfg(windows)]
+fn pasta_do_sistema() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Bruma"))
+}
+
+#[cfg(not(windows))]
+fn pasta_do_sistema() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("dados"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .map(|d| d.join("bruma"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

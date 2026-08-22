@@ -63,27 +63,99 @@ pub struct Log {
 }
 
 impl Log {
+    /// Lê o registo do disco.
+    ///
+    /// O formato é uma entrada por linha. A ordem no ficheiro não significa nada — a ordem
+    /// de leitura sai do relógio lógico, no `ordered()` —, e é isso que permite gravar por
+    /// acrescento em vez de reescrever tudo.
+    ///
+    /// **Uma linha por gravar não invalida o resto.** Se a última linha estiver cortada
+    /// (o computador desligou-se a meio de a escrever), perde-se essa e mais nada. É a
+    /// diferença entre perder uma mensagem e perder o histórico todo, e num programa sem
+    /// servidor não há de onde o recuperar.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let entries = if path.exists() {
+        let mut entries = BTreeMap::new();
+        if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            let list: Vec<Entry> = serde_json::from_str(&raw)?;
-            let mut m = BTreeMap::new();
-            for e in list {
+            // Ficheiros do formato antigo eram um array JSON indentado. Lêem-se uma vez e
+            // ficam convertidos na gravação seguinte.
+            if raw.trim_start().starts_with('[') {
+                for e in serde_json::from_str::<Vec<Entry>>(&raw)? {
+                    e.verify()?;
+                    entries.insert(e.hash_hex()?, e);
+                }
+                let log = Log { entries, path };
+                log.reescrever()?;
+                return Ok(log);
+            }
+            for (n, linha) in raw.lines().enumerate() {
+                if linha.trim().is_empty() {
+                    continue;
+                }
+                let e: Entry = match serde_json::from_str(linha) {
+                    Ok(e) => e,
+                    Err(erro) => {
+                        // Só a ÚLTIMA linha pode estar cortada: é a que estava a ser
+                        // escrita. Uma linha partida no meio é corrupção a sério e não se
+                        // finge que não é.
+                        if n + 1 == raw.lines().count() {
+                            break;
+                        }
+                        return Err(anyhow!("linha {} do registo ilegível: {erro}", n + 1));
+                    }
+                };
                 // Recusa entradas adulteradas mesmo vindas do disco.
                 e.verify()?;
-                m.insert(e.hash_hex()?, e);
+                entries.insert(e.hash_hex()?, e);
             }
-            m
-        } else {
-            BTreeMap::new()
-        };
+        }
         Ok(Log { entries, path })
     }
 
-    fn save(&self) -> Result<()> {
-        let list = self.ordered();
-        std::fs::write(&self.path, serde_json::to_string_pretty(&list)?)?;
+    /// Acrescenta entradas ao fim do ficheiro.
+    ///
+    /// Antes gravava-se o registo inteiro a cada mensagem. Com mil mensagens isso são mil
+    /// reescritas do ficheiro todo, e a milésima escreve mil entradas para acrescentar uma
+    /// — e, pior do que ser lento, o `write` trunca antes de escrever: um corte de energia
+    /// no instante errado apagava o histórico inteiro.
+    fn anexar(&self, novas: &[Entry]) -> Result<()> {
+        use std::io::Write;
+        if novas.is_empty() {
+            return Ok(());
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let mut buf = String::new();
+        for e in novas {
+            buf.push_str(&serde_json::to_string(e)?);
+            buf.push('\n');
+        }
+        f.write_all(buf.as_bytes())?;
+        // Sem isto, o "já gravei" é uma promessa do sistema operativo e não do disco.
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Reescreve o ficheiro do zero. Só se usa na conversão do formato antigo.
+    ///
+    /// Passa por um ficheiro temporário e só depois toma o lugar do outro: enquanto o novo
+    /// não estiver inteiro, o antigo continua a ser o bom. Escrever por cima do próprio
+    /// deixaria uma janela em que não existe nenhum dos dois.
+    fn reescrever(&self) -> Result<()> {
+        use std::io::Write;
+        let temporario = self.path.with_extension("novo");
+        {
+            let mut f = std::fs::File::create(&temporario)?;
+            for e in self.entries.values() {
+                f.write_all(serde_json::to_string(e)?.as_bytes())?;
+                f.write_all(b"\n")?;
+            }
+            f.sync_data()?;
+        }
+        std::fs::rename(&temporario, &self.path)?;
         Ok(())
     }
 
@@ -196,13 +268,13 @@ impl Log {
         };
         e.sig = HEXLOWER.encode(&signing.sign(&e.hash()?).to_bytes());
         self.entries.insert(e.hash_hex()?, e.clone());
-        self.save()?;
+        self.anexar(std::slice::from_ref(&e))?;
         Ok(e)
     }
 
     /// Devolve quantas entradas eram novas. Entradas inválidas são rejeitadas, não confiadas.
     pub fn merge(&mut self, incoming: Vec<Entry>) -> Result<usize> {
-        let mut added = 0;
+        let mut novas = Vec::new();
         for e in incoming {
             if e.verify().is_err() {
                 eprintln!("  [!] entrada rejeitada: assinatura inválida");
@@ -213,14 +285,14 @@ impl Log {
             if let std::collections::btree_map::Entry::Vacant(slot) =
                 self.entries.entry(e.hash_hex()?)
             {
+                novas.push(e.clone());
                 slot.insert(e);
-                added += 1;
             }
         }
-        if added > 0 {
-            self.save()?;
-        }
-        Ok(added)
+        // Uma gravação para o lote todo, e não uma por entrada: quando alguém entra e traz
+        // mil mensagens de histórico, a diferença é entre um write e mil.
+        self.anexar(&novas)?;
+        Ok(novas.len())
     }
 }
 
@@ -302,6 +374,92 @@ mod tests {
         assert_eq!(destino.len(), 0);
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// A propriedade que interessa quando falta a luz: uma linha por gravar custa essa
+    /// mensagem, e mais nada. O formato antigo reescrevia o ficheiro todo a cada mensagem,
+    /// e um corte no instante errado levava o historico inteiro -- que, sem servidor, nao
+    /// se recupera de lado nenhum.
+    #[test]
+    fn linha_cortada_a_meio_da_gravacao_custa_uma_mensagem_e_nao_o_historico() {
+        let path = tmp("corte");
+        {
+            let mut log = Log::load(&path).unwrap();
+            for i in 0..5u64 {
+                log.append_local(&key(1), [0u8; 24], vec![i as u8], 1000 + i)
+                    .unwrap();
+            }
+        }
+        // Simula o computador a desligar-se a meio de escrever a sexta.
+        let mut bruto = std::fs::read_to_string(&path).unwrap();
+        bruto.push_str("{\"author\":\"ab\",\"ts_m");
+        std::fs::write(&path, &bruto).unwrap();
+
+        let log = Log::load(&path).unwrap();
+        assert_eq!(log.len(), 5, "as cinco que ficaram gravadas continuam la");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Uma linha partida no MEIO nao e um corte de energia -- e corrupcao. Ai nao se finge
+    /// que esta tudo bem, porque continuar a acrescentar por cima de um ficheiro estragado
+    /// so espalha o estrago.
+    #[test]
+    fn linha_partida_no_meio_e_erro_e_nao_silencio() {
+        let path = tmp("corrompido");
+        {
+            let mut log = Log::load(&path).unwrap();
+            for i in 0..3u64 {
+                log.append_local(&key(1), [0u8; 24], vec![i as u8], 1000 + i)
+                    .unwrap();
+            }
+        }
+        let bruto = std::fs::read_to_string(&path).unwrap();
+        let mut linhas: Vec<&str> = bruto.lines().collect();
+        linhas[1] = "{isto nao e json";
+        std::fs::write(
+            &path,
+            linhas.join(
+                "
+",
+            ) + "
+",
+        )
+        .unwrap();
+
+        assert!(Log::load(&path).is_err(), "tem de recusar, nao ignorar");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Quem ja tinha o Bruma instalado tem ficheiros no formato antigo. Abrir a app nova
+    /// nao pode perder nada.
+    #[test]
+    fn le_o_formato_antigo_e_converte_sem_perder_nada() {
+        let path_origem = tmp("antigo-origem");
+        let path = tmp("antigo");
+        let mut origem = Log::load(&path_origem).unwrap();
+        let entradas: Vec<Entry> = (0..4u64)
+            .map(|i| {
+                origem
+                    .append_local(&key(1), [0u8; 24], vec![i as u8], 1000 + i)
+                    .unwrap()
+            })
+            .collect();
+
+        // O formato antigo: um array JSON indentado.
+        std::fs::write(&path, serde_json::to_string_pretty(&entradas).unwrap()).unwrap();
+
+        let log = Log::load(&path).unwrap();
+        assert_eq!(log.len(), 4, "nenhuma entrada se perde na conversao");
+
+        // E ficou convertido: o ficheiro deixa de comecar por um parentese reto.
+        let agora = std::fs::read_to_string(&path).unwrap();
+        assert!(!agora.trim_start().starts_with('['), "devia ter reescrito");
+        assert_eq!(agora.lines().count(), 4, "uma entrada por linha");
+
+        // E continua a abrir bem no formato novo.
+        assert_eq!(Log::load(&path).unwrap().len(), 4);
+        let _ = std::fs::remove_file(&path_origem);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
