@@ -30,7 +30,7 @@ anunciar, e passamos a escolher o codificador.
 **Não se monta uma segunda pilha de WebRTC.** Já existe entre pares um transporte
 autenticado e cifrado — o iroh. O caminho curto é capturar em Rust, codificar em Rust,
 mandar os NALs pelo iroh, e descodificar do outro lado com o `VideoDecoder` do WebCodecs,
-que a WebView2 tem e acelera por hardware.
+que a WebView2 tem (medido abaixo — que o use por hardware é outra pergunta, ainda aberta).
 
 O que isso ganha:
 
