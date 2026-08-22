@@ -1,7 +1,9 @@
 # Spike 4 — captura nativa, sem passar pelo `getDisplayMedia`
 
-**Estado: PASSA.** Os quatro gates passaram, e o mais importante — o codificador por
-hardware — passou com prova direta, não por inferência.
+**Estado: PASSA, e já saiu daqui.** Os gates passaram todos, e o caminho está em produção
+desde a v0.5.0 — o `getDisplayMedia` deixou de ser usado e a barra do WebView2 desapareceu
+com ele. O que se aprendeu a traduzir entre o Media Foundation e o MSE está em
+`apps/desktop/src/mse.rs`, com testes.
 
 ```bash
 cargo run -p spike4-captura --release -- 10

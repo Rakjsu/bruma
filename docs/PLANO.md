@@ -128,7 +128,7 @@ Partilhar ecrã com áudio do sistema entre dois clientes.
 - Caminho B: captura nativa em Rust (`scap` 0.0.8) publicada pelo crate `livekit` 0.8.3.
 - **Gate**: se nenhum der ecrã+áudio fiável no Windows, parar e reavaliar (Electron ou janela dedicada).
 
-**Spike 4 — captura nativa do ecrã.** — **EXECUTADO, PASSA (21/08/2026)**
+**Spike 4 — captura nativa do ecrã.** — **EXECUTADO, PASSA, E JÁ EM PRODUÇÃO na v0.5.0**
 Nasceu de duas coisas medidas: o WebView2 desenha por cima da app a barra "está a partilhar uma
 janela" e **não há maneira suportada de a esconder** (o evento `ScreenCaptureStarting` só tem
 `Cancel` e `Handled`, e nenhum a tira — a barra é o indicador de segurança dele, não um enfeite);
@@ -146,7 +146,16 @@ com o `VideoDecoder` do WebCodecs. Isso dispensa ICE e DTLS para o vídeo, dispe
 parte, e **tira a partilha de ecrã da limitação nº 1** (era o WebRTC que furava o NAT por fora do
 iroh e expunha o IP). A voz continua em WebRTC na webview. O preço, assumido: perdemos o controlo
 de congestão do WebRTC e o orçamento de upload passa de desejável a obrigatório.
-**Por confirmar:** o `VideoDecoder` do lado de quem vê — é o próximo gate.
+**Já em produção.** O `getDisplayMedia` saiu da app e a barra do WebView2 saiu com ele.
+Quatro paredes pelo caminho, todas silenciosas: o `MFStartup` esquecido (que devolve
+`MF_E_SHUTDOWN`, o contrário do que se passa), o endereçamento absoluto dos fragmentos que
+o MSE proíbe, o codec declarado que tem de bater certo com o `avcC` real (a NVIDIA produz
+Baseline 4.2, não High 4.0), e o `tfdt` em falta — que um ficheiro dispensa e uma
+transmissão exige. Ver `spikes/spike4-captura/README.md`.
+
+**Por confirmar, e não há como o fazer sozinho:** o caminho até outro computador.
+Localmente está provado de ponta a ponta com `bruma --autoteste` (306 frames
+descodificados, buffer contíguo); entre duas casas nunca correu.
 
 **Spike 3 — Modo Fantasma.** — **EXECUTADO, BLOQUEADO (21/08/2026)**
 Dois peers a sincronizar chat por `.onion` com arti embutido, sem tor externo e sem portas abertas.
