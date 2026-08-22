@@ -361,3 +361,14 @@ pub fn saude(servidor: String, app: State<Arc<App>>) -> R<serde_json::Value> {
         "peers": srv.peers.len(),
     }))
 }
+
+/// O que a webview desta máquina consegue fazer, dito por ela e escrito no arranque.
+///
+/// A partilha de ecrã vai passar a ser captada e codificada em Rust e descodificada aqui
+/// com o WebCodecs (Spike 4). Só que "a WebView2 tem WebCodecs" é uma suposição sobre a
+/// versão que cada pessoa tem instalada, e a resposta muda de máquina para máquina — a
+/// aceleração por hardware ainda mais. Portanto pergunta-se, e fica escrito.
+#[tauri::command]
+pub fn capacidades(linha: String) {
+    println!("  capacidades: {linha}");
+}

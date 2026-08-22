@@ -94,11 +94,30 @@ Media Foundation não prova que o nosso caminho o usa — o `MediaTranscoder` po
 cair no codificador de software na mesma. O que prova é o `nvidia-smi` a marcar 0% na
 passagem sem codificar e 6–7% na que codifica.
 
+## O lado de quem vê — meio respondido
+
+A app pergunta agora à própria webview, no arranque, o que ela consegue descodificar, e
+escreve a resposta. Nesta máquina:
+
+```
+capacidades: WebCodecs presente · config H.264 1080p:
+             prefere-hardware=aceite prefere-software=aceite indiferente=aceite
+```
+
+Portanto o `VideoDecoder` existe na WebView2 e aceita H.264 a 1080p nas três preferências.
+**O que isto não diz** — e é preciso dizê-lo, porque é fácil ler a mais: o
+`isConfigSupported` responde que a *configuração* é aceite, não que a descodificação vá
+parar ao hardware. O `prefer-hardware` é uma dica, e a config devolvida limita-se a
+repetir a preferência que se pediu. Quem responde a "usou mesmo o hardware" é a utilização
+do descodificador da GPU com um stream a sério, tal como se fez do lado do codificador.
+
+E porque a resposta muda com a versão da WebView2 instalada e com a placa de cada um, isto
+fica a correr em todas as máquinas, não só nesta.
+
 ## O que este spike NÃO responde
 
-- **O lado de quem vê.** O `VideoDecoder` do WebCodecs dentro da WebView2 ainda não foi
-  testado. Não se testa a descodificação antes de haver alguma coisa medida para
-  descodificar — é o passo seguinte, e é o próximo gate a sério.
+- **Descodificar a sério.** Aceitar a configuração não é decodificar frames. Falta pegar
+  nos NALs que este spike produz, atirá-los ao `VideoDecoder` e ver imagem.
 - **O `send_frame` devolve em ~0 ms**, porque enfileira em vez de bloquear. Portanto o
   custo real de codificar não é esse número; é a diferença de ritmo entre as duas
   passagens (4%) e os 6% do NVENC.

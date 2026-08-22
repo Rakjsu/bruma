@@ -1409,3 +1409,33 @@ function pararDeAssistir() {
   verJogo();
   desenharRodape();
 })();
+
+/* ---------- o que esta webview consegue descodificar ----------------------- */
+
+/* O ecrã vai passar a chegar como H.264 nosso, descodificado aqui pelo WebCodecs em vez
+   de vir por WebRTC. Isso depende da versão da WebView2 que cada pessoa tem instalada, e
+   a aceleração por hardware depende ainda da placa — não é coisa para se assumir. */
+(async () => {
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  if (typeof VideoDecoder === 'undefined') {
+    return diz('sem WebCodecs — esta webview não descodifica o ecrã nativo');
+  }
+  const perfil = {
+    codec: 'avc1.640028',      // H.264 High, nível 4.0 — chega para 1080p60
+    codedWidth: 1920,
+    codedHeight: 1080,
+    optimizeForLatency: true,
+  };
+  // Cuidado com o que isto responde: o `isConfigSupported` diz que a configuração é
+  // ACEITE, não que a descodificação vá parar ao hardware — o `prefer-hardware` é uma
+  // dica, e a config devolvida limita-se a repetir a preferência pedida. Quem responde a
+  // "usou mesmo o hardware" é a utilização do descodificador da GPU, com stream a sério.
+  const aceita = async preferencia => {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ ...perfil, hardwareAcceleration: preferencia });
+      return r.supported ? 'aceite' : 'recusado';
+    } catch (e) { return `erro: ${e.name}`; }
+  };
+  diz(`WebCodecs presente · config H.264 1080p: prefere-hardware=${await aceita('prefer-hardware')}`
+    + ` prefere-software=${await aceita('prefer-software')} indiferente=${await aceita('no-preference')}`);
+})();

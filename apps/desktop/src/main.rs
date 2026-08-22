@@ -64,6 +64,7 @@ fn main() {
             comandos::enviar_sinal,
             comandos::meu_endereco,
             comandos::saude,
+            comandos::capacidades,
             jogo::jogo_em_execucao,
         ])
         .run(tauri::generate_context!())
