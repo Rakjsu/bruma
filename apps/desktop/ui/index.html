@@ -144,14 +144,6 @@
 
     <!-- vista de voz -->
     <section class="voz" id="vista-voz" hidden>
-      <div class="voz__barra">
-        <span class="voz__estado" id="voz-estado">—</span>
-        <div class="voz__acoes">
-          <button class="btn" id="btn-micro" title="Silenciar o microfone">Microfone ligado</button>
-          <button class="btn btn--primary" id="btn-ecra">Partilhar ecrã</button>
-          <button class="btn" id="btn-sair-voz">Sair</button>
-        </div>
-      </div>
       <div class="voz__grelha" id="voz-grelha"></div>
       <div class="voz__nota" id="voz-nota"></div>
     </section>
@@ -168,9 +160,23 @@
   </main>
 
   <aside class="members">
-    <div id="na-chamada" hidden></div>
-    <div class="members__label">Membros<button class="porque" data-explica="expulsar" aria-label="O que garante uma expulsão">?</button></div>
-    <div id="lista-membros"></div>
+    <div class="members__topo">
+      <div id="na-chamada" hidden></div>
+      <div id="bloco-membros">
+        <div class="members__label">Membros<button class="porque" data-explica="expulsar" aria-label="O que garante uma expulsão">?</button></div>
+        <div id="lista-membros"></div>
+      </div>
+    </div>
+
+    <!-- chat da sala de voz: so existe enquanto estiveres na sala -->
+    <section class="salachat" id="sala-chat" hidden>
+      <div class="members__label">
+        <span id="sala-chat-nome">Chat da sala</span>
+        <button class="porque" data-explica="chat-voz" aria-label="Quem vê este chat">?</button>
+      </div>
+      <div class="salachat__fluxo" id="sala-fluxo"></div>
+      <input class="salachat__entrada" id="sala-entrada" placeholder="Mensagem para a sala" autocomplete="off">
+    </section>
   </aside>
 
   <!-- atualizacao: aparece so quando ha mesmo uma, e nunca instala sem se dizer -->

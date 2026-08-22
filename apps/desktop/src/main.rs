@@ -15,6 +15,20 @@ use std::sync::Arc;
 use tauri::Manager;
 
 fn main() {
+    // `bruma --que-jogo` responde o que o detetor vê neste momento e sai. A deteção é um
+    // palpite sobre as janelas abertas, portanto quando alguém disser "apareceu-me a coisa
+    // errada na barra" isto responde sem ser preciso montar nada.
+    if std::env::args().any(|a| a == "--que-jogo") {
+        match jogo::jogo_em_execucao() {
+            Some(j) => println!(
+                "{} ({}) — pontuação {:.2}",
+                j.titulo, j.processo, j.cobertura
+            ),
+            None => println!("nada detetado"),
+        }
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())

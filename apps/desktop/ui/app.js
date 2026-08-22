@@ -196,6 +196,7 @@ async function desenharMensagens() {
   }
   stream.hidden = false;
   $('#vista-voz').hidden = true;
+  desenharNaChamada();
 
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
@@ -381,6 +382,9 @@ $('#entrada').addEventListener('keydown', async ev => {
 
 listen('servidor-mudou', async ev => {
   await desenharTudo();
+  // O chat da sala vive na coluna da direita, fora da vista de canal: se estivermos a
+  // ler um canal de texto, o desenharTudo não lhe toca e as mensagens novas não apareciam.
+  await desenharChatDaSala();
 });
 listen('peer-ligado', () => { ligados += 1; desenharTopo(); });
 listen('peer-desligado', () => { ligados = Math.max(0, ligados - 1); desenharTopo(); });
@@ -414,6 +418,14 @@ const EXPLICACOES = {
     corpo: [
       'O histórico deste servidor existe nos computadores dos membros, e mais em lado nenhum.',
       '<b>Se ninguém do servidor estiver online, não há nada de onde puxar.</b> É o preço direto de não haver uma máquina no meio.',
+    ],
+  },
+  'chat-voz': {
+    titulo: 'O chat desta sala',
+    corpo: [
+      'É um canal à parte dos canais de texto, e só aparece enquanto estiveres na sala. O histórico fica: sais, voltas, e continua lá.',
+      '<b>Esconder não é o mesmo que cifrar.</b> Isto é uma regra desta app: a mensagem viaja com a chave do servidor, igual a todas as outras, por isso chega ao computador de todos os membros. Um cliente modificado conseguia lê-la sem entrar na sala.',
+      'Para ser garantia a sério, a sala precisava de chave própria — e ainda não tem.',
     ],
   },
   expulsar: {
@@ -809,6 +821,12 @@ function nomeDoPeer(peer) {
  *   - com vídeo a ser visto: o vídeo ocupa tudo;
  *   - sem vídeo: a foto, com anel verde quando a pessoa fala.
  */
+function fluxoDe(chave) {
+  if (chave === voz.eu) return voz.ecra || voz.camara || voz.micro;
+  const l = voz.pcs.get(chave);
+  return l ? l.stream : null;
+}
+
 function painelDeVoz(chave, stream, opcoes = {}) {
   const t = elemento('div', 'tile');
   t.dataset.chave = chave;
@@ -826,12 +844,12 @@ function painelDeVoz(chave, stream, opcoes = {}) {
     pintar(marca, chave);
     bloco.append(marca);
     bloco.append(elemento('b', null, `${nomeDoPeer(chave)} está a transmitir`));
-    if (chave !== voz.eu) {
-      const b = elemento('button', 'btn btn--primary', 'Assistir');
-      b.onclick = () => assistir(chave);
-      bloco.append(b);
-    } else {
-      bloco.append(elemento('span', 'tile__dica', 'os outros veem o teu ecrã'));
+    const b = elemento('button', 'btn btn--primary',
+      chave === voz.eu ? 'Ver o que estás a enviar' : 'Assistir');
+    b.onclick = () => assistir(chave);
+    bloco.append(b);
+    if (chave === voz.eu) {
+      bloco.append(elemento('span', 'tile__dica', 'é o teu ecrã, tal como sai daqui'));
     }
     t.append(bloco);
   } else if (temVideo) {
@@ -956,21 +974,6 @@ function desenharVoz() {
   const ligado = voz.canal === canal.id;
   const outros = [...voz.presentes.entries()].filter(([, c]) => c === canal.id).map(([p]) => p);
 
-  $('#voz-estado').textContent = ligado
-    ? (outros.length
-        ? `Na sala com ${outros.length === 1 ? '1 pessoa' : outros.length + ' pessoas'}.`
-        : 'Estás sozinho nesta sala. Quando alguém entrar, ligam-se automaticamente.')
-    : 'Não estás nesta sala.';
-
-  const trackMicro = voz.micro ? voz.micro.getAudioTracks()[0] : null;
-  $('#btn-micro').textContent = trackMicro
-    ? (trackMicro.enabled ? 'Microfone ligado' : 'Microfone silenciado')
-    : 'Sem microfone';
-  $('#btn-micro').disabled = !ligado || !trackMicro;
-  $('#btn-ecra').textContent = voz.ecra ? 'Parar de partilhar' : 'Partilhar ecrã';
-  $('#btn-ecra').disabled = !ligado;
-  $('#btn-sair-voz').style.display = ligado ? '' : 'none';
-
   const grelha = $('#voz-grelha');
   grelha.textContent = '';
   grelha.classList.toggle('esta-a-ver', !!voz.aVer);
@@ -989,24 +992,21 @@ function desenharVoz() {
 
   // A ver a transmissão de alguém: o ecrã dessa pessoa ocupa tudo e as fotinhas saem.
   if (voz.aVer) {
-    const l = voz.pcs.get(voz.aVer);
     const barra = elemento('div', 'assistindo');
     const voltar = elemento('button', 'btn', '← Voltar à sala');
     voltar.onclick = pararDeAssistir;
     barra.append(voltar);
-    barra.append(elemento('span', 'assistindo__quem', `a ver ${nomeDoPeer(voz.aVer)}`));
+    barra.append(elemento('span', 'assistindo__quem',
+      voz.aVer === voz.eu ? 'a ver o teu próprio ecrã' : `a ver ${nomeDoPeer(voz.aVer)}`));
     grelha.append(barra);
-    grelha.append(painelDeVoz(voz.aVer, l ? l.stream : null, { aVer: true }));
+    grelha.append(painelDeVoz(voz.aVer, fluxoDe(voz.aVer), { aVer: true }));
     $('#voz-nota').textContent = '';
     return;
   }
 
   ajustarGrelha(outros.length + 1);
-  grelha.append(painelDeVoz(voz.eu, voz.ecra || voz.camara || voz.micro));
-  for (const p of outros) {
-    const l = voz.pcs.get(p);
-    grelha.append(painelDeVoz(p, l ? l.stream : null));
-  }
+  grelha.append(painelDeVoz(voz.eu, fluxoDe(voz.eu)));
+  for (const p of outros) grelha.append(painelDeVoz(p, fluxoDe(p)));
 
   const ice = servidoresDeGelo().length;
   $('#voz-nota').textContent = ice
@@ -1015,8 +1015,72 @@ function desenharVoz() {
       'Botão direito → Servidores de ligação para configurar um TURN.';
 }
 
+/** O chat da sala de voz, na coluna da direita.
+ *
+ *  É um canal como os outros — as mensagens ficam no mesmo registo assinado, com o id da
+ *  sala de voz como canal, portanto ficam mesmo separadas das dos canais de texto e o
+ *  histórico sobrevive a sair e voltar.
+ *
+ *  O que aqui se faz é escondê-lo de quem não está na sala. Convém dizer com todas as
+ *  letras o que isso é e o que não é: é uma regra desta app, não da criptografia. A
+ *  mensagem viaja cifrada com a chave do servidor, a mesma de tudo o resto, por isso
+ *  chega ao computador de todos os membros e um cliente modificado conseguia lê-la sem
+ *  nunca entrar na sala. Para ser garantia a sério a sala precisava de chave própria —
+ *  está dito no painel do "?" ao lado do título, para ninguém confiar a mais.
+ */
+async function desenharChatDaSala() {
+  const alvo = $('#sala-chat');
+  if (!alvo) return;
+  if (!voz.canal || !voz.servidor) { alvo.hidden = true; return; }
+
+  const s = vista.servidores.find(x => x.id === voz.servidor);
+  const canal = s && s.canais.find(c => c.id === voz.canal);
+  if (!canal) { alvo.hidden = true; return; }
+
+  alvo.hidden = false;
+  $('#sala-chat-nome').textContent = `Chat · ${canal.nome}`;
+  $('#sala-entrada').placeholder = `Mensagem para ${canal.nome}`;
+
+  const fluxo = $('#sala-fluxo');
+  const colado = fluxo.scrollHeight - fluxo.scrollTop - fluxo.clientHeight < 40;
+  const msgs = await invoke('mensagens', { servidor: s.id, canal: canal.id }).catch(() => []);
+
+  fluxo.textContent = '';
+  if (!msgs.length) {
+    fluxo.append(elemento('div', 'salachat__vazio',
+      'Só quem está nesta sala vê este chat.'));
+    return;
+  }
+  for (const m of msgs) {
+    const linha = elemento('div', 'salachat__msg');
+    linha.append(elemento('span', 'salachat__quem', m.autor_nome));
+    linha.append(elemento('span', 'salachat__txt', m.texto));
+    fluxo.append(linha);
+  }
+  // Só se salta para o fim se já lá estavas: senão roubava-te a leitura a meio.
+  if (colado) fluxo.scrollTop = fluxo.scrollHeight;
+}
+
+$('#sala-entrada').addEventListener('keydown', async ev => {
+  if (ev.key !== 'Enter' || !ev.target.value.trim()) return;
+  if (!voz.canal || !voz.servidor) return;
+  const texto = ev.target.value;
+  ev.target.value = '';
+  try {
+    await invoke('enviar', { servidor: voz.servidor, canal: voz.canal, texto });
+    await desenharChatDaSala();
+  } catch (e) { console.error(e); }
+});
+
 /** A lista lateral de quem está na chamada, com o anel verde de quem fala. */
 function desenharNaChamada() {
+  desenharChatDaSala();
+  // Na chamada, a coluna da direita é só da chamada: quem lá está e o chat da sala. A
+  // lista geral de membros volta assim que saíres — ali dentro não acrescentava nada e
+  // roubava a altura ao chat.
+  const membros = $('#bloco-membros');
+  if (membros) membros.hidden = !!voz.canal;
+
   const alvo = $('#na-chamada');
   if (!alvo) return;
   if (!voz.canal) { alvo.hidden = true; alvo.textContent = ''; return; }
@@ -1042,22 +1106,15 @@ function desenharNaChamada() {
     const transmite = voz.aPartilhar.has(p) || (p === voz.eu && !!voz.ecra);
     bloco.append(elemento('i', null, transmite ? 'a transmitir' : 'na chamada'));
     linha.append(av, bloco);
-    if (transmite && p !== voz.eu) {
+    if (transmite) {
       const b = elemento('button', 'chan__x chan__x--ver', '▸');
-      b.title = 'Assistir';
+      b.title = p === voz.eu ? 'Ver o que estás a enviar' : 'Assistir';
       b.onclick = ev => { ev.stopPropagation(); assistir(p); };
       linha.append(b);
     }
     alvo.append(linha);
   }
 }
-
-$('#btn-micro').onclick = () => {
-  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
-  if (t) { t.enabled = !t.enabled; desenharVoz(); }
-};
-$('#btn-ecra').onclick = alternarEcra;
-$('#btn-sair-voz').onclick = () => sairDeVoz();
 
 listen('presenca', ev => {
   const { peer, canal } = ev.payload;

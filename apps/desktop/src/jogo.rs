@@ -4,6 +4,14 @@
 //! descartam-se as que são obviamente ferramentas, e fica a que tiver mais cara de aplicação
 //! em primeiro plano. É um palpite, e é apresentado como tal — a app diz "tens isto aberto",
 //! não "detetámos o teu jogo".
+//!
+//! O filtro que faz o trabalho todo não é a lista de nomes lá em baixo — é o `alt_tab`. Metade
+//! das máquinas com uma placa gráfica tem meia dúzia de janelas invisíveis em cima de tudo:
+//! o overlay da NVIDIA, o da Razer, o do próprio Discord, o DisplayFusion. Medidas todas numa
+//! máquina real, e todas partilham `WS_EX_TOOLWINDOW` — que é exatamente a maneira de o Windows
+//! dizer "isto não aparece no alt-tab". Nenhuma aplicação a sério tem essa flag, e um jogo
+//! aparece sempre no alt-tab. Uma lista de nomes envelhecia a cada utilitário novo instalado;
+//! esta pergunta não envelhece.
 
 use serde::Serialize;
 
@@ -51,6 +59,11 @@ const NUNCA: &[&str] = &[
     "steamwebhelper",
     "claude",
     "cursor",
+    "nvidia overlay",
+    "nvcontainer",
+    "nvrla",
+    "razerappengine",
+    "displayfusion",
 ];
 
 #[cfg(windows)]
@@ -58,14 +71,41 @@ mod win {
     use super::{Janela, NUNCA};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, MAX_PATH, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN,
+        EnumWindows, GetForegroundWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, SM_CXSCREEN,
+        SM_CYSCREEN, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
+
+    /// Esta janela apareceria no alt-tab?
+    ///
+    /// `WS_EX_TOOLWINDOW` é a resposta direta do Windows a essa pergunta, e `WS_EX_NOACTIVATE`
+    /// marca as janelas que nem sequer aceitam foco — overlays que deixam os cliques passar ao
+    /// lado. Nenhuma das duas descreve algo que uma pessoa esteja a usar.
+    ///
+    /// Falta ainda o caso das janelas *cloaked*: o DWM esconde-as (uma app da Store suspensa, um
+    /// overlay à espera de ser chamado) mas o `IsWindowVisible` continua a dizer que sim, porque
+    /// responde pela flag antiga e não pela composição. É preciso perguntar ao DWM.
+    unsafe fn alt_tab(hwnd: HWND) -> bool {
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0 != 0 || ex & WS_EX_NOACTIVATE.0 != 0 {
+            return false;
+        }
+        let mut escondida = 0u32;
+        let pedido = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut escondida as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        // Se o DWM não souber responder, não se inventa: só se descarta o que ele confirma.
+        pedido.is_err() || escondida == 0
+    }
 
     struct Recolha {
         janelas: Vec<Janela>,
@@ -75,7 +115,7 @@ mod win {
     unsafe extern "system" fn visitar(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let recolha = &mut *(lparam.0 as *mut Recolha);
 
-        if !IsWindowVisible(hwnd).as_bool() {
+        if !IsWindowVisible(hwnd).as_bool() || !alt_tab(hwnd) {
             return true.into();
         }
 
