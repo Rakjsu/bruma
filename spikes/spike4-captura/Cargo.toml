@@ -8,10 +8,14 @@ publish = false
 anyhow = "1"
 
 [target.'cfg(windows)'.dependencies]
+# O macro #[implement] gera codigo que procura `windows_core` na raiz do crate,
+# por isso ele tem de ser dependencia direta e nao so vir por dentro do `windows`.
+windows-core = "0.62"
 windows-capture = "2"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
   "Storage_Streams",
+
 ] }

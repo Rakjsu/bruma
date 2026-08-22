@@ -68,6 +68,9 @@ Codificadores de H.264 que o Media Foundation oferece nesta máquina:
 
 | | resultado |
 |---|---|
+| G4 · sai em pedaços, não só no fim | **PASSA** — primeiro aos 319 ms, 50 pedaços em 5 s |
+| G4 · cadência serve para ver ao vivo | **PASSA** — pior intervalo 329 ms |
+| G4 · é mesmo MP4 fragmentado | **PASSA** — `ftyp uuid pdin moov moof mdat moof mdat …` |
 | G1 · existe codificador por hardware | **PASSA** — `NVIDIA H.264 Encoder MFT` |
 | G1 · e o nosso caminho usa-o mesmo | **PASSA** — 6–7% de uso do NVENC a codificar, 0% a não codificar |
 | G2 · captura chega aos 50 fps | **PASSA** — 56,9 fps |
@@ -114,6 +117,41 @@ do descodificador da GPU com um stream a sério, tal como se fez do lado do codi
 E porque a resposta muda com a versão da WebView2 instalada e com a placa de cada um, isto
 fica a correr em todas as máquinas, não só nesta.
 
+## Transmitir, não gravar
+
+Captar e codificar não chega: um MP4 normal só fica legível no fim, porque o índice é
+escrito depois de tudo. Isso é um ficheiro, não uma transmissão. A saída passa por um
+**sink de MP4 fragmentado** (`MFCreateFMPEG4MediaSink`) que escreve o cabeçalho uma vez e
+a seguir despeja fragmentos independentes, e por um `IMFByteStream` implementado por nós
+que, em vez de gravar, chama uma função com os bytes acabados de sair.
+
+Escolheu-se o `IMFSinkWriter` em vez de falar diretamente com o MFT de H.264 por duas
+razões concretas, que são onde se perde tempo: **ele insere sozinho a conversão de cor**
+(a captura dá BGRA, os codificadores de hardware querem NV12, e fazer isso no CPU a
+3440×1440 custa mais do que codificar) e **trata do MFT assíncrono da NVIDIA**, que não se
+usa com um `ProcessInput`/`ProcessOutput` simples. Também faz a redução para 1920×804 —
+é assim que um ecrã ultrawide cabe no upload de alguém.
+
+### A armadilha que custou uma tarde e não dá erro nenhum
+
+Com `BeginWrite` e `EndWrite` a devolver `E_NOTIMPL`, **o sink não falha: fica à espera
+para sempre**. Sem uma linha de aviso, sem exceção, sem nada no log. De fora parecia que a
+captura era lenta — foi preciso ver que o processo tinha 5,8 s de CPU parados e 503 MB para
+perceber que estava bloqueado e não a trabalhar.
+
+O sink escreve pelo caminho assíncrono, e um `IMFByteStream` que só implementa o síncrono
+está incompleto de uma maneira que o compilador não apanha. Agora escreve-se logo (é para
+memória, não vale a pena adiar) e avisa-se pela fila de trabalho do Media Foundation, em
+vez de chamar o `Invoke` diretamente — isso reentraria no sink a meio de ele escrever.
+
+### Como se sabe que é vídeo e não bytes com boa aparência
+
+Contar bytes não distingue vídeo de lixo. O spike lê as caixas de topo do resultado e
+exige a ordem certa: `ftyp`, depois `moov` uma vez, e a seguir **pares `moof`+`mdat`
+repetidos** — e é nos pares repetidos que está a diferença entre um ficheiro e uma
+transmissão. O ficheiro fica em `%TEMP%ruma-spike4.mp4` para se poder abrir e confirmar
+com os olhos, que é a única verificação que nenhum teste substitui.
+
 ## O que este spike NÃO responde
 
 - **Descodificar a sério.** Aceitar a configuração não é decodificar frames. Falta pegar
@@ -123,6 +161,9 @@ fica a correr em todas as máquinas, não só nesta.
   passagens (4%) e os 6% do NVENC.
 - **Máquinas sem NVENC.** Os amigos com GPUs mais antigas ou Intel/AMD caem noutro MFT.
   A lista mostra que há alternativas de software, mas o custo delas não foi medido.
-- **Elementary stream.** O `VideoSettingsSubType` tem `H264ES` (NALs crus, sem
-  contentor), que é o que queremos mandar pelo iroh. Esta medição usou o H.264 dentro de
-  MP4 em memória, porque o objetivo era o ritmo e o débito, não o formato de saída.
+- **A latência do fragmento.** Os fragmentos saem em rajadas, com até ~330 ms entre elas.
+  Para partilha de ecrã serve — o plano já tinha assumido que ~150 ms por salto era
+  irrelevante aqui —, mas não serve para nada onde a resposta imediata conte. Reduzir isto
+  significa fragmentos mais curtos, ou trocar o contentor por NALs crus com WebCodecs.
+- **Máquinas sem NVENC.** Os amigos com GPUs mais antigas ou Intel/AMD caem noutro MFT.
+  A lista mostra que há alternativas de software, mas o custo delas não foi medido.

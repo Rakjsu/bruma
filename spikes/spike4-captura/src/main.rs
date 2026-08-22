@@ -47,6 +47,9 @@
 //! testa a descodificação antes de existir alguma coisa medida para descodificar.
 
 #[cfg(windows)]
+mod fmp4;
+
+#[cfg(windows)]
 mod medicoes {
     use anyhow::{anyhow, Result};
     use std::sync::{Arc, Mutex};
@@ -296,6 +299,199 @@ mod medicoes {
         }
     }
 
+    /* ===================================================================== G4
+    Transmitir: os pedacos saem ENQUANTO se grava, ou so no fim?
+
+    E a diferenca entre um ficheiro e uma transmissao, e nao se ve pelo tamanho
+    final -- ve-se pelo instante em que o primeiro pedaco aparece e pela cadencia
+    dos seguintes.
+    ===================================================================== */
+
+    pub struct Pedacos {
+        pub quantos: usize,
+        pub bytes: u64,
+        /// As caixas de topo do MP4, pela ordem em que apareceram.
+        pub caixas: Vec<String>,
+        /// Onde ficou o ficheiro, para se poder abrir e confirmar com os olhos.
+        pub ficheiro: String,
+        pub primeiro_ms: f64,
+        /// Intervalo mediano entre pedacos: e a latencia que quem ve vai sentir.
+        pub intervalo_p50_ms: f64,
+        pub intervalo_pior_ms: f64,
+    }
+
+    struct Emissor {
+        codificador: Option<crate::fmp4::Codificador>,
+        inicio: Instant,
+        duracao: Duration,
+        frames: usize,
+        scratch: Vec<u8>,
+    }
+
+    type FlagsE = (
+        u32,
+        u32,
+        u32,
+        u32,
+        u64,
+        Arc<Mutex<Vec<(f64, usize)>>>,
+        Arc<Mutex<Vec<u8>>>,
+    );
+
+    // SAFETY: o `Emissor` guarda ponteiros COM, que o Rust nao da como Send -- e faz bem,
+    // porque em geral nao sao. Aqui sao, por construcao: o `start` cria a fila de despacho
+    // na thread que o chama, chama o `new` nessa thread, e entrega os frames nessa mesma
+    // thread. O `Emissor` nasce e morre onde e usado; a exigencia de Send vem da assinatura
+    // do trait, nao de haver travessia real. Se algum dia se passar a `start_free_threaded`,
+    // esta garantia cai e o codificador tem de ser criado do lado de la.
+    unsafe impl Send for Emissor {}
+
+    impl GraphicsCaptureApiHandler for Emissor {
+        type Flags = FlagsE;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            let (lar, alt, lar_saida, alt_saida, segundos, registo, tudo) = ctx.flags;
+            let inicio = Instant::now();
+            let reg = registo.clone();
+            let marca = inicio;
+            let codificador = crate::fmp4::Codificador::novo(
+                lar,
+                alt,
+                lar_saida,
+                alt_saida,
+                60,
+                8_000_000,
+                Arc::new(move |pedaco: &[u8]| {
+                    let ms = marca.elapsed().as_secs_f64() * 1000.0;
+                    reg.lock().unwrap().push((ms, pedaco.len()));
+                    // Guarda-se tambem tudo junto: e o que permite abrir o resultado e
+                    // confirmar que aquilo e mesmo video, e nao bytes com boa aparencia.
+                    tudo.lock().unwrap().extend_from_slice(pedaco);
+                }),
+            )?;
+            Ok(Self {
+                codificador: Some(codificador),
+                inicio,
+                duracao: Duration::from_secs(segundos),
+                frames: 0,
+                scratch: Vec::new(),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            controlo: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            {
+                let buf = frame.buffer()?;
+                // O buffer da captura vem com enchimento no fim de cada linha; o
+                // codificador quer as linhas coladas.
+                let bytes = buf.as_nopadding_buffer(&mut self.scratch);
+                if let Some(c) = self.codificador.as_mut() {
+                    c.frame(bytes)?;
+                }
+            }
+            self.frames += 1;
+
+            if self.inicio.elapsed() >= self.duracao {
+                if let Some(c) = self.codificador.take() {
+                    c.terminar()?;
+                }
+                controlo.stop();
+            }
+            Ok(())
+        }
+
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Limita ao que faz sentido enviar. Um ecra ultrawide inteiro nao cabe no upload de
+    /// ninguem, e o plano ja dizia para nao passar de 1080p. Par a par porque o H.264
+    /// trabalha em blocos e recusa dimensoes impares.
+    fn caber(lar: u32, alt: u32) -> (u32, u32) {
+        let fator = (1920.0 / lar as f64).min(1080.0 / alt as f64).min(1.0);
+        let par = |v: f64| ((v.round() as u32) / 2) * 2;
+        (
+            par(lar as f64 * fator).max(2),
+            par(alt as f64 * fator).max(2),
+        )
+    }
+
+    pub fn transmitir(segundos: u64) -> Result<Pedacos> {
+        let monitor = Monitor::primary().map_err(|e| anyhow!("sem monitor: {e:?}"))?;
+        let lar = monitor.width().map_err(|e| anyhow!("{e:?}"))?;
+        let alt = monitor.height().map_err(|e| anyhow!("{e:?}"))?;
+        let (ls, as_) = caber(lar, alt);
+
+        println!("G4 . transmitir em pedacos");
+        println!("   {lar}x{alt} -> {ls}x{as_}, durante {segundos}s");
+
+        let registo = Arc::new(Mutex::new(Vec::new()));
+        let tudo = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let definicoes = Settings::new(
+            monitor,
+            CursorCaptureSettings::WithCursor,
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            (lar, alt, ls, as_, segundos, registo.clone(), tudo.clone()),
+        );
+
+        // Aqui usa-se o `start` e nao o `start_free_threaded`: o codificador guarda
+        // ponteiros COM, que nao atravessam threads. E nao precisam de atravessar --
+        // com o `start`, o handler nasce e morre na mesma thread onde a captura corre.
+        Emissor::start(definicoes).map_err(|e| anyhow!("captura falhou: {e:?}"))?;
+
+        let r = registo.lock().unwrap();
+        let bytes: u64 = r.iter().map(|(_, n)| *n as u64).sum();
+        let primeiro = r.first().map(|(ms, _)| *ms).unwrap_or(0.0);
+        let mut gaps: Vec<f64> = r.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let inteiro = tudo.lock().unwrap();
+        let caixas = caixas_de_topo(&inteiro);
+        let destino = std::env::temp_dir().join("bruma-spike4.mp4");
+        std::fs::write(&destino, &inteiro[..]).ok();
+
+        Ok(Pedacos {
+            quantos: r.len(),
+            bytes,
+            caixas,
+            ficheiro: destino.to_string_lossy().into_owned(),
+            primeiro_ms: primeiro,
+            intervalo_p50_ms: percentil(&gaps, 0.50),
+            intervalo_pior_ms: gaps.last().copied().unwrap_or(0.0),
+        })
+    }
+
+    /// Le a lista de caixas de topo de um MP4.
+    ///
+    /// Um ficheiro que abre e um ficheiro com as caixas certas pela ordem certa: `ftyp`,
+    /// depois `moov` uma vez, e a seguir pares `moof`+`mdat` -- e nos pares que esta a
+    /// diferenca entre um ficheiro e uma transmissao. Contar bytes nao distingue video de
+    /// lixo; isto distingue.
+    fn caixas_de_topo(dados: &[u8]) -> Vec<String> {
+        let mut nomes = Vec::new();
+        let mut i = 0usize;
+        while i + 8 <= dados.len() && nomes.len() < 64 {
+            let tam =
+                u32::from_be_bytes([dados[i], dados[i + 1], dados[i + 2], dados[i + 3]]) as usize;
+            let nome = String::from_utf8_lossy(&dados[i + 4..i + 8]).to_string();
+            if tam < 8 {
+                break;
+            }
+            nomes.push(nome);
+            i += tam;
+        }
+        nomes
+    }
+
     fn percentil(ordenados: &[f64], p: f64) -> f64 {
         if ordenados.is_empty() {
             return 0.0;
@@ -398,6 +594,19 @@ fn main() -> anyhow::Result<()> {
     let fps_sem = ritmo(&sem);
     let fps_com = ritmo(&com);
 
+    let pedacos = medicoes::transmitir(segundos)?;
+    println!(
+        "   {} pedacos, {:.1} MB, primeiro aos {:.0} ms, intervalo p50 {:.0} ms (pior {:.0} ms)",
+        pedacos.quantos,
+        pedacos.bytes as f64 / 1_000_000.0,
+        pedacos.primeiro_ms,
+        pedacos.intervalo_p50_ms,
+        pedacos.intervalo_pior_ms
+    );
+    let resumo: Vec<&str> = pedacos.caixas.iter().take(10).map(|s| s.as_str()).collect();
+    println!("   caixas: {}", resumo.join(" "));
+    println!("   ficheiro: {}", pedacos.ficheiro);
+
     println!("\n-- gates -------------------------------------------------");
     veredicto("G1 . codificador por hardware existe", hardware > 0);
     veredicto("G2 . captura chega aos 50 fps", fps_sem > 50.0);
@@ -409,6 +618,21 @@ fn main() -> anyhow::Result<()> {
     veredicto(
         "G3 . codificar nao estrangula (perde < 20%)",
         fps_sem > 0.0 && fps_com >= fps_sem * 0.8,
+    );
+    veredicto(
+        "G4 . sai em pedacos, nao so no fim",
+        pedacos.quantos > 5 && pedacos.primeiro_ms < 3000.0,
+    );
+    veredicto(
+        "G4 . cadencia util para ver ao vivo (pior < 500 ms)",
+        pedacos.intervalo_pior_ms > 0.0 && pedacos.intervalo_pior_ms < 500.0,
+    );
+    veredicto(
+        "G4 . e mesmo MP4 fragmentado (ftyp, moov, e pares moof+mdat)",
+        pedacos.caixas.first().map(|c| c == "ftyp").unwrap_or(false)
+            && pedacos.caixas.iter().any(|c| c == "moov")
+            && pedacos.caixas.iter().filter(|c| *c == "moof").count() > 1
+            && pedacos.caixas.iter().filter(|c| *c == "mdat").count() > 1,
     );
 
     if fps_sem > 0.0 {
