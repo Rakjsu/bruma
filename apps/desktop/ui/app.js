@@ -1998,7 +1998,12 @@ async function desenharRodape() {
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
     $('#btn-camara').disabled = false;
     $('#btn-camara').classList.toggle('is-on', !!voz.camara);
-    $('#btn-camara').title = voz.camara ? 'Desligar a câmara' : 'Ligar a câmara';
+    $('#btn-camara').classList.toggle('is-cortado', !!camaraFalhou);
+    // A razão da falha GANHA ao texto normal. Sem isto, o rodapé — que se redesenha de
+    // três em três segundos — apagava a explicação logo a seguir ao clique, e a pessoa
+    // ficava com um botão que não faz nada e não diz porquê.
+    $('#btn-camara').title = camaraFalhou
+      || (voz.camara ? 'Desligar a câmara' : 'Ligar a câmara');
     $('#btn-ruido').classList.toggle('is-cortado', !ruidoSuprimido);
     $('#btn-ruido').title = ruidoSuprimido
       ? 'Supressão de ruído ligada'
@@ -2053,7 +2058,11 @@ $('#btn-ruido').onclick = async () => {
 $('#btn-desligar').onclick = () => sairDeVoz();
 $('#btn-partilhar').onclick = () => alternarEcra();
 
+/** Porque é que a câmara não abriu, se não abriu. Sobrevive aos redesenhos do rodapé. */
+let camaraFalhou = null;
+
 $('#btn-camara').onclick = async () => {
+  camaraFalhou = null;
   if (voz.camara) {
     pararDeEnviarCamara();
     anunciarEstado();
@@ -2067,12 +2076,10 @@ $('#btn-camara').onclick = async () => {
     // Recusar a permissão é uma resposta, não uma avaria. Mas tem de SE VER: um aviso só
     // na consola é o mesmo que não haver aviso nenhum para quem carregou no botão.
     console.warn('a câmara não abriu:', e);
-    const b = $('#btn-camara');
-    b.classList.add('is-cortado');
-    b.title = `A câmara não abriu: ${e && e.message ? e.message : e}`;
+    camaraFalhou = `A câmara não abriu: ${e && e.message ? e.message : e}`;
+    desenharRodape();
     return;
   }
-  $('#btn-camara').classList.remove('is-cortado');
   anunciarEstado();
   desenharVoz();
   desenharRodape();
