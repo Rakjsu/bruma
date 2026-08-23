@@ -94,6 +94,11 @@ mod win {
         alt: u32,
         /// Tela persistente para onde se copiam frames de tamanho diferente do inicial.
         tela: Vec<u8>,
+        /// Medição: quantos frames o Windows entregou e quantos foram codificados.
+        recebidos: u64,
+        codificados: u64,
+        inicio: std::time::Instant,
+        fps: u32,
     }
 
     // SAFETY: o `Sessao` guarda ponteiros COM, que em geral não atravessam threads. Aqui
@@ -119,6 +124,10 @@ mod win {
                 lar,
                 alt,
                 tela: Vec::new(),
+                recebidos: 0,
+                codificados: 0,
+                inicio: std::time::Instant::now(),
+                fps,
             })
         }
 
@@ -128,17 +137,40 @@ mod win {
             controlo: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
             if self.parar.load(Ordering::Relaxed) {
+                // O relógio da média LIDO ao codificador, não recalculado aqui. A primeira
+                // versão desta medição refazia a conta antiga (frames ÷ ips) e por isso
+                // continuou a dar números errados depois de a correcção já estar feita:
+                // um instrumento que repete a suposição do bug não consegue vê-lo curado.
+                let media = self.codificador.as_ref().map_or(0.0, |c| c.relogio_media());
                 if let Some(c) = self.codificador.take() {
                     c.terminar()?;
                 }
+                // O veredicto da captura, em números: o ritmo pedido tem de bater com o
+                // ritmo entregue, e o relógio da média com o relógio da parede. Quando
+                // não bate, o vídeo do outro lado corre devagar e o buffer cresce sem fim.
+                let s = self.inicio.elapsed().as_secs_f64().max(0.001);
+                eprintln!(
+                    "[ecrã] {:.1}s: {} entregues ({:.1}/s), {} codificados ({:.1}/s),                      pedido {} ips; média {:.1}s para {:.1}s de parede (x{:.2})",
+                    s,
+                    self.recebidos,
+                    self.recebidos as f64 / s,
+                    self.codificados,
+                    self.codificados as f64 / s,
+                    self.fps,
+                    media,
+                    s,
+                    media / s,
+                );
                 controlo.stop();
                 return Ok(());
             }
+            self.recebidos += 1;
             let (f_lar, f_alt) = (frame.width(), frame.height());
             let buf = frame.buffer()?;
             let bytes = buf.as_nopadding_buffer(&mut self.scratch);
 
             if let Some(c) = self.codificador.as_mut() {
+                self.codificados += 1;
                 if f_lar == self.lar && f_alt == self.alt {
                     c.frame(bytes)?;
                 } else {
@@ -249,7 +281,13 @@ mod win {
                     // se não sair, trocava-se um aviso por outro.
                     DrawBorderSettings::WithoutBorder,
                     SecondaryWindowSettings::Default,
-                    MinimumUpdateIntervalSettings::Default,
+                    // O ritmo pedido travado na ORIGEM: o Windows nem chega a capturar o
+                    // frame que viria cedo demais. Travar aqui poupa a captura inteira —
+                    // travar no nosso lado só pouparia a codificação, depois de a placa
+                    // gráfica já ter feito o trabalho.
+                    MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(
+                        1.0 / flags.4.max(1) as f64,
+                    )),
                     DirtyRegionSettings::Default,
                     ColorFormat::Bgra8,
                     flags,

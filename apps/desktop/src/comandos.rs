@@ -591,6 +591,31 @@ pub fn autoteste_pedido() -> u32 {
     0
 }
 
+/// A altura que o autoteste deve pedir: `--altura=1440`. Como o `--fps`, existe para se
+/// poder PROVAR que a escolha muda o que sai — e a prova é ler as dimensões no MP4
+/// produzido, com um leitor que não seja o nosso.
+#[tauri::command]
+pub fn autoteste_altura() -> u32 {
+    for a in std::env::args() {
+        if let Some(n) = a.strip_prefix("--altura=") {
+            return n.parse().unwrap_or(720);
+        }
+    }
+    720
+}
+
+/// O ritmo que o autoteste deve pedir: `--fps=15`. Existe para se poder PROVAR que o
+/// número escolhido no menu muda o que sai — medindo o mesmo ecrã a ritmos diferentes.
+#[tauri::command]
+pub fn autoteste_fps() -> u32 {
+    for a in std::env::args() {
+        if let Some(n) = a.strip_prefix("--fps=") {
+            return n.parse().unwrap_or(30);
+        }
+    }
+    30
+}
+
 /* ==========================================================================
 Voz.
 

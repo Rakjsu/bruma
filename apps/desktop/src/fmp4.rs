@@ -106,11 +106,18 @@ impl FluxoDeSaida {
     fn escrever(&self, bytes: &[u8]) -> u32 {
         let mut e = self.estado.lock().unwrap();
         // Se o sink recuar para antes do que ainda temos, não há nada de bom a fazer: os
-        // bytes que ele quer corrigir já saíram. Prefere-se recusar a escrever no sítio
-        // errado, que produziria vídeo estragado sem dar erro.
+        // bytes que ele quer corrigir já saíram. Descarta-se o remendo — mas conta-se como
+        // escrito.
+        //
+        // Devolver 0 seria dizer ao Media Foundation "não escrevi nada", e ele traduz isso
+        // por `E_UNEXPECTED` — foi o "Falha catastrófica (0x8000FFFF)" que aparecia a
+        // 1440p ao PARAR de partilhar, com a transmissão inteira já entregue e boa (283
+        // frames descodificados, sem erro nenhum do lado de quem via). O recuo é o
+        // `Finalize` a voltar ao início para arrumar um ficheiro; numa transmissão ao vivo
+        // esse arrumar não existe, porque os bytes já foram vistos. Aceitar e deitar fora
+        // é o comportamento certo aqui, e não escreve nada no sítio errado.
         let Some(inicio) = e.pos.checked_sub(e.base).map(|v| v as usize) else {
-            eprintln!("[ecrã] o codificador recuou para fora da janela; pedaço ignorado");
-            return 0;
+            return bytes.len() as u32;
         };
         let fim = inicio + bytes.len();
         if e.dados.len() < fim {
@@ -363,9 +370,11 @@ impl IMFByteStream_Impl for FluxoDeSaida_Impl {
 pub struct Codificador {
     escritor: IMFSinkWriter,
     fluxo: u32,
-    /// 100 ns por frame, que é a unidade do Media Foundation.
-    passo: i64,
-    relogio: i64,
+    /// Quando a captura começou. Os instantes das amostras saem DAQUI e não de um
+    /// contador de frames — ver `frame`.
+    inicio: std::time::Instant,
+    /// Fim da última amostra, em unidades de 100 ns desde `inicio`.
+    ultimo: i64,
     /// Bytes de um frame de entrada, com as linhas coladas.
     tamanho_entrada: u32,
 }
@@ -441,14 +450,28 @@ impl Codificador {
             Ok(Self {
                 escritor,
                 fluxo: 0,
-                passo: 10_000_000 / fps.max(1) as i64,
-                relogio: 0,
+                inicio: std::time::Instant::now(),
+                ultimo: 0,
                 tamanho_entrada: largura * 4 * altura,
             })
         }
     }
 
     /// Um frame, em BGRA, com as linhas coladas (sem enchimento no fim de cada uma).
+    ///
+    /// # O relógio vem da PAREDE, não da contagem de frames
+    ///
+    /// Antes, cada amostra durava `1/fps` e o relógio andava um passo por frame. Parece
+    /// certo e não é: a captura do Windows só entrega frames quando o ecrã MUDA, por isso
+    /// o número de frames por segundo não é o que se pediu — é o que aconteceu. Medido num
+    /// ecrã sossegado: pedidos 15 ips, entregues 2,1/s; o relógio da média chegava a 1,1 s
+    /// enquanto a parede ia em 8,3 s. Quem estava a ver recebia câmara lenta e ficava cada
+    /// vez mais atrasado, para sempre.
+    ///
+    /// Agora o instante e a duração de cada amostra saem do relógio real. A linha temporal
+    /// passa a bater com o tempo, entregue o Windows os frames ao ritmo que entregar — e é
+    /// por isso que esta correcção vale mais do que travar o ritmo: torna o sistema imune
+    /// ao ritmo, em vez de depender de ele ser o esperado.
     pub fn frame(&mut self, bgra: &[u8]) -> Result<()> {
         unsafe {
             let esperado = self.tamanho_entrada;
@@ -462,13 +485,24 @@ impl Codificador {
 
             let amostra: IMFSample = MFCreateSample()?;
             amostra.AddBuffer(&buffer)?;
-            amostra.SetSampleTime(self.relogio)?;
-            amostra.SetSampleDuration(self.passo)?;
-            self.relogio += self.passo;
+            // Este frame ocupa desde o fim do anterior até agora. A soma das durações
+            // fica igual ao tempo real decorrido, que é exactamente o que o `tfdt` do MSE
+            // lê para situar cada fragmento no tempo.
+            let agora = (self.inicio.elapsed().as_nanos() / 100) as i64;
+            let duracao = (agora - self.ultimo).max(1);
+            amostra.SetSampleTime(self.ultimo)?;
+            amostra.SetSampleDuration(duracao)?;
+            self.ultimo = agora;
 
             self.escritor.WriteSample(self.fluxo, &amostra)?;
             Ok(())
         }
+    }
+
+    /// Onde vai a linha temporal da média, em segundos. Serve para a medição poder
+    /// comparar com o relógio da parede: os dois têm de andar juntos.
+    pub fn relogio_media(&self) -> f64 {
+        self.ultimo as f64 / 10_000_000.0
     }
 
     pub fn terminar(self) -> Result<()> {

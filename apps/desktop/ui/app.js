@@ -1995,7 +1995,9 @@ function pararDeAssistir() {
   try {
     const r = await invoke('comecar_a_partilhar',
       { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1',
-        altura: 720, fps: 30, debito: 0, saida: canal });
+        altura: await invoke('autoteste_altura').catch(() => 720),
+        fps: await invoke('autoteste_fps').catch(() => 30),
+        debito: 0, saida: canal });
     await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
     const fontes = await invoke('fontes_de_partilha').catch(() => []);
     const comImagem = fontes.filter(f => f.miniatura && f.miniatura.length > 2000).length;

@@ -92,6 +92,8 @@ fn main() {
             comandos::saude,
             comandos::capacidades,
             comandos::autoteste_pedido,
+            comandos::autoteste_fps,
+            comandos::autoteste_altura,
             comandos::receber_ecra,
             comandos::receber_voz,
             comandos::enviar_voz,
