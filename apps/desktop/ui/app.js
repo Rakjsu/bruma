@@ -1163,7 +1163,9 @@ function desenharMenuTransmissao() {
     for (const [valor, rotulo] of opcoes) {
       const b = elemento('button', 'menu-trans__opcao', rotulo);
       if (valor === atual) b.classList.add('is-activa');
-      b.onclick = () => aoEscolher(valor);
+      // Escolher fecha o submenu, como no Discord: a lista aberta depois da decisão é
+      // só ruído entre a pessoa e o resto do menu.
+      b.onclick = () => { sub.hidden = true; aoEscolher(valor); };
       sub.append(b);
     }
   }
@@ -2321,10 +2323,20 @@ function pararDeAssistir() {
       + ` modos=${document.querySelectorAll('[data-modo]').length}`
       + ` resumo="${$('#resumo-qualidade').textContent}"`);
     for (const nome of ['altura', 'fps', 'debito']) {
+      const sub = $('#sub-' + nome);
       document.querySelector(`[data-abre="${nome}"]`).click();
-      diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`);
+      const aberto = !sub.hidden && sub.getBoundingClientRect().height > 0;
       document.querySelector(`[data-abre="${nome}"]`).click();
+      // O atributo hidden não chega: o bug dos submenus eternos era o display:flex a
+      // vencê-lo. Mede-se a ALTURA REAL, que é o que os olhos veem.
+      const fechado = sub.getBoundingClientRect().height === 0;
+      diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`
+        + ` abre=${aberto} fecha=${fechado}`);
     }
+    const linhaAudio = document.querySelector('.menu-trans__linha--inerte');
+    const rotuloAudio = linhaAudio.querySelector('b').getBoundingClientRect();
+    diz(`ui silenciar: rotulo ${Math.round(rotuloAudio.width)}x${Math.round(rotuloAudio.height)}`
+      + ` (uma linha se altura < 22)`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
     document.querySelector('[data-modo="pers"]').click();

@@ -524,6 +524,15 @@ html, body {
 }
 
 .menu-trans__sub { padding: 2px 6px 6px 14px; display: flex; flex-direction: column; gap: 1px; }
+/* A mesma armadilha do .veu, esquecida aqui: um display:flex de autor VENCE o
+   display:none que o atributo hidden traz do navegador. Sem esta linha os submenus
+   ficavam abertos para sempre — o toggle funcionava, o CSS ignorava-o. */
+.menu-trans__sub[hidden] { display: none; }
+
+/* E a checkbox do silenciar: a regra global `.caixa input { width: 100% }` é para os
+   campos de texto dos diálogos — numa checkbox incha-a e esmaga o rótulo para três
+   linhas. Volta ao tamanho natural. */
+.menu-trans input[type="checkbox"] { width: auto; margin: 0; accent-color: var(--mist); }
 .menu-trans__opcao {
   display: flex; align-items: center; justify-content: space-between;
   padding: 7px 10px; border: 0; border-radius: 6px; background: transparent;
