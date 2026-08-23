@@ -2155,4 +2155,27 @@ function pararDeAssistir() {
     const emCima = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     diz(`ui quem esta no ponto do fechar: ${emCima ? emCima.className || emCima.tagName : 'nada'}`);
   }
+
+  // E o seletor de fontes, que só existe aberto: abre-se, espera-se pelas miniaturas,
+  // mede-se a grelha e fecha-se. Foi um erro de cascata aqui (caixa a 420px, uma coluna)
+  // que só um screenshot do dono apanhou — nunca mais sem medição.
+  try {
+    await escolherFonte();
+  } catch (e) {
+    diz(`ui seletor REBENTOU ao abrir: ${e && e.message ? e.message : e}`);
+  }
+  await new Promise(r => setTimeout(r, 3500));
+  const caixaF = document.querySelector('.caixa--fontes');
+  const grelha = document.querySelector('.fontes');
+  const cartoes = document.querySelectorAll('.fonte');
+  if (caixaF && grelha) {
+    const colunas = getComputedStyle(grelha).gridTemplateColumns.split(' ').length;
+    const c1 = cartoes[0] ? cartoes[0].getBoundingClientRect() : null;
+    diz(`ui seletor: caixa=${Math.round(caixaF.getBoundingClientRect().width)}px`
+      + ` colunas=${colunas} cartoes=${cartoes.length}`
+      + (c1 ? ` primeiro=${Math.round(c1.width)}x${Math.round(c1.height)}` : ''));
+  } else {
+    diz('ui seletor: NAO ABRIU');
+  }
+  fechar('veu-fontes');
 })();
