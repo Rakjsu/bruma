@@ -484,6 +484,28 @@ html, body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* --- qualidade da transmissão --------------------------------------------- */
+
+.abas--mini { margin: 0; flex: 1; }
+.abas--mini .aba { padding: 7px 0; font-size: 12px; }
+.qualidade {
+  border-top: 1px solid var(--line); margin-top: 10px; padding-top: 12px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.qualidade__grupo { display: flex; align-items: center; gap: 12px; }
+.qualidade__rotulo {
+  font: 600 10.5px/1 var(--ui); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--dim); width: 150px; flex: none;
+}
+.qualidade__nota { color: var(--dim); font-size: 11.5px; margin: 0; }
+.qualidade__resumo { color: var(--dim); font: 500 12px/1 var(--ui); }
+.caixa__acoes--fontes { display: flex; align-items: center; gap: 8px; }
+.caixa__vao { flex: 1; }
+.btn--ico { padding: 9px 11px; display: grid; place-items: center; color: var(--dim); }
+.btn--ico svg { fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
+.btn--ico:hover { color: var(--text); }
+.btn--ico.is-on { color: var(--mist); border-color: var(--mist); }
+
 /* --- diagnóstico da rede ------------------------------------------------- */
 
 .diag { font: 400 12px/1.6 var(--mono, monospace); color: var(--muted); }

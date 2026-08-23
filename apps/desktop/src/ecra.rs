@@ -103,15 +103,15 @@ mod win {
     // `start_free_threaded`, esta garantia cai.
     unsafe impl Send for Sessao {}
 
-    type Flags = (u32, u32, u32, u32, Arc<AtomicBool>, Entrega);
+    type Flags = (u32, u32, u32, u32, u32, u32, Arc<AtomicBool>, Entrega);
 
     impl GraphicsCaptureApiHandler for Sessao {
         type Flags = Flags;
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (lar, alt, ls, aa, parar, entrega) = ctx.flags;
-            let codificador = Codificador::novo(lar, alt, ls, aa, 60, 8_000_000, entrega)?;
+            let (lar, alt, ls, aa, fps, bitrate, parar, entrega) = ctx.flags;
+            let codificador = Codificador::novo(lar, alt, ls, aa, fps, bitrate, entrega)?;
             Ok(Self {
                 codificador: Some(codificador),
                 parar,
@@ -171,15 +171,27 @@ mod win {
         }
     }
 
-    /// Limita ao que faz sentido enviar. Um ecrã ultrawide inteiro não cabe no upload de
-    /// ninguém. Par a par porque o H.264 trabalha em blocos e recusa dimensões ímpares.
-    fn caber(lar: u32, alt: u32) -> (u32, u32) {
-        let fator = (1920.0 / lar as f64).min(1080.0 / alt as f64).min(1.0);
+    /// Limita à altura escolhida, mantendo a proporção. `0` significa nativa — vai como
+    /// está. Par a par porque o H.264 trabalha em blocos e recusa dimensões ímpares.
+    fn caber(lar: u32, alt: u32, max_alt: u32) -> (u32, u32) {
+        let fator = if max_alt == 0 {
+            1.0
+        } else {
+            (max_alt as f64 / alt as f64).min(1.0)
+        };
         let par = |v: f64| ((v.round() as u32) / 2) * 2;
         (
             par(lar as f64 * fator).max(2),
             par(alt as f64 * fator).max(2),
         )
+    }
+
+    /// O débito que uma escolha de qualidade merece: ~0,065 bits por pixel por imagem,
+    /// que a 1080p60 dá os ~8 Mbps já medidos no Spike 4. Com teto, porque o upload de
+    /// casa é finito — e com chão, porque abaixo disso o H.264 vira aguarela.
+    fn debito(lar: u32, alt: u32, fps: u32) -> u32 {
+        let bruto = (lar as u64 * alt as u64 * fps as u64) as f64 * 0.065;
+        (bruto as u32).clamp(2_500_000, 20_000_000)
     }
 
     fn tamanho_do_alvo(alvo: super::Alvo) -> Result<(u32, u32)> {
@@ -207,16 +219,19 @@ mod win {
     /// Arranca a captura do alvo escolhido numa thread própria.
     pub fn arrancar(
         alvo: super::Alvo,
+        qualidade: super::Qualidade,
         parar: Arc<AtomicBool>,
         entrega: Entrega,
     ) -> Result<(u32, u32)> {
         let (lar, alt) = tamanho_do_alvo(alvo)?;
-        let (ls, aa) = caber(lar, alt);
+        let (ls, aa) = caber(lar, alt, qualidade.max_altura);
+        let fps = qualidade.fps.clamp(15, 60);
+        let bitrate = debito(ls, aa, fps);
 
         std::thread::spawn(move || {
             // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
             // ponteiros COM que não atravessam threads; o Alvo é só números e atravessa.
-            let flags = (lar, alt, ls, aa, parar, entrega);
+            let flags = (lar, alt, ls, aa, fps, bitrate, parar, entrega);
             // Função e não closure: os dois ramos passam tipos diferentes (Monitor e
             // Window) e uma closure fixa-se no primeiro que vê.
             fn definicoes<T: TryInto<windows_capture::settings::GraphicsCaptureItemType>>(
@@ -267,6 +282,7 @@ mod win {
 
     pub fn arrancar(
         _alvo: super::Alvo,
+        _q: super::Qualidade,
         _parar: Arc<AtomicBool>,
         _entrega: Entrega,
     ) -> Result<(u32, u32)> {
@@ -277,12 +293,25 @@ mod win {
 }
 
 /// Começa a partilhar. Os pedaços vão para `entrega` assim que existem.
-pub fn comecar(estado: &mut Estado, alvo: Alvo, entrega: Entrega) -> Result<(u32, u32)> {
+/// A qualidade que a pessoa escolheu no seletor.
+#[derive(Clone, Copy)]
+pub struct Qualidade {
+    /// Altura máxima em pixels; 0 = nativa.
+    pub max_altura: u32,
+    pub fps: u32,
+}
+
+pub fn comecar(
+    estado: &mut Estado,
+    alvo: Alvo,
+    qualidade: Qualidade,
+    entrega: Entrega,
+) -> Result<(u32, u32)> {
     if estado.a_partilhar() {
         return Err(anyhow!("já estás a partilhar"));
     }
     let parar = Arc::new(AtomicBool::new(false));
-    let tamanho = win::arrancar(alvo, parar.clone(), entrega)?;
+    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega)?;
     estado.parar = Some(parar);
     Ok(tamanho)
 }

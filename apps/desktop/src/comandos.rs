@@ -422,6 +422,8 @@ pub fn comecar_a_partilhar(
     servidor: String,
     canal_voz: String,
     fonte: String,
+    altura: u32,
+    fps: u32,
     saida: Channel<InvokeResponseBody>,
     ecra: State<Arc<Ecra>>,
     rede: State<Arc<Rede>>,
@@ -467,9 +469,13 @@ pub fn comecar_a_partilhar(
     });
 
     let alvo = crate::ecra::Alvo::analisar(&fonte).map_err(erro)?;
+    let qualidade = crate::ecra::Qualidade {
+        max_altura: altura,
+        fps,
+    };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        crate::ecra::comecar(&mut e, alvo, entrega).map_err(erro)?
+        crate::ecra::comecar(&mut e, alvo, qualidade, entrega).map_err(erro)?
     };
     Ok(serde_json::json!({ "largura": largura, "altura": altura }))
 }

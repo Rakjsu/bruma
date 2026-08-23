@@ -1087,6 +1087,55 @@ document.querySelectorAll('#abas-fontes .aba').forEach(a => {
 });
 $('#fechar-fontes').onclick = () => fechar('veu-fontes');
 
+/* --- a qualidade da transmissão, atrás da engrenagem ----------------------- */
+
+/** O que a pessoa escolheu; sobrevive a reinícios. 1080p60 é o mesmo padrão de sempre —
+ *  mudar a escolha só muda transmissões novas, nunca uma a decorrer. */
+function qualidadeDePartilha() {
+  try {
+    const q = JSON.parse(localStorage.getItem('bruma.qualidade') || '{}');
+    return { altura: Number.isFinite(q.altura) ? q.altura : 1080, fps: q.fps === 30 ? 30 : 60 };
+  } catch (e) {
+    return { altura: 1080, fps: 60 };
+  }
+}
+
+function desenharQualidade() {
+  const q = qualidadeDePartilha();
+  document.querySelectorAll('#opcoes-altura .aba').forEach(b => {
+    b.classList.toggle('is-activa', Number(b.dataset.altura) === q.altura);
+  });
+  document.querySelectorAll('#opcoes-fps .aba').forEach(b => {
+    b.classList.toggle('is-activa', Number(b.dataset.fps) === q.fps);
+  });
+  $('#resumo-qualidade').textContent =
+    `${q.altura === 0 ? 'Nativa' : q.altura + 'p'} · ${q.fps} ips`;
+}
+
+$('#btn-qualidade').onclick = () => {
+  const p = $('#painel-qualidade');
+  p.hidden = !p.hidden;
+  $('#btn-qualidade').classList.toggle('is-on', !p.hidden);
+  desenharQualidade();
+};
+document.querySelectorAll('#opcoes-altura .aba').forEach(b => {
+  b.onclick = () => {
+    const q = qualidadeDePartilha();
+    q.altura = Number(b.dataset.altura);
+    localStorage.setItem('bruma.qualidade', JSON.stringify(q));
+    desenharQualidade();
+  };
+});
+document.querySelectorAll('#opcoes-fps .aba').forEach(b => {
+  b.onclick = () => {
+    const q = qualidadeDePartilha();
+    q.fps = Number(b.dataset.fps);
+    localStorage.setItem('bruma.qualidade', JSON.stringify(q));
+    desenharQualidade();
+  };
+});
+desenharQualidade();
+
 async function alternarEcra() {
   if (voz.ecra) {
     await invoke('parar_de_partilhar').catch(() => {});
@@ -1114,11 +1163,14 @@ async function iniciarPartilha(fonte) {
       pedaco instanceof ArrayBuffer ? new Uint8Array(pedaco) : new Uint8Array(pedaco));
   };
 
+  const q = qualidadeDePartilha();
   try {
     await invoke('comecar_a_partilhar', {
       servidor: voz.servidor,
       canalVoz: voz.canal,
       fonte,
+      altura: q.altura,
+      fps: q.fps,
       saida: canal,
     });
   } catch (e) {
@@ -1876,7 +1928,8 @@ function pararDeAssistir() {
 
   try {
     const r = await invoke('comecar_a_partilhar',
-      { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1', saida: canal });
+      { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1',
+        altura: 720, fps: 30, saida: canal });
     await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
     const fontes = await invoke('fontes_de_partilha').catch(() => []);
     const comImagem = fontes.filter(f => f.miniatura && f.miniatura.length > 2000).length;
@@ -2193,6 +2246,14 @@ function pararDeAssistir() {
       const n = document.querySelectorAll('.fonte').length;
       diz(`ui aba ${aba.dataset.aba}: ${n} cartoes`);
     }
+    // A engrenagem abre o painel de qualidade, e as opções estão todas lá.
+    $('#btn-qualidade').click();
+    const painel = $('#painel-qualidade');
+    diz(`ui qualidade: aberto=${!painel.hidden}`
+      + ` alturas=${document.querySelectorAll('#opcoes-altura .aba').length}`
+      + ` fps=${document.querySelectorAll('#opcoes-fps .aba').length}`
+      + ` resumo="${$('#resumo-qualidade').textContent}"`);
+    $('#btn-qualidade').click();
   } else {
     diz('ui seletor: NAO ABRIU');
   }
