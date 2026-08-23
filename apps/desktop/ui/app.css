@@ -444,9 +444,25 @@ html, body {
    no ficheiro, e com uma classe só a última ganhava — o seletor abria com 420px, os
    cartões caíam para UMA coluna e cada miniatura enchia a linha inteira. */
 .caixa.caixa--fontes { width: min(720px, 92vw); }
+/* O comutador Janelas | Ecrãs, como o do Discord: um separador por tipo de fonte, em
+   vez de uma lista corrida com títulos pelo meio. */
+.abas {
+  display: flex; gap: 4px; padding: 4px; margin: 2px 0 12px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+}
+.aba {
+  flex: 1; padding: 9px 0; border: 0; border-radius: 7px; cursor: pointer;
+  background: transparent; color: var(--dim); font: 500 13px/1 var(--ui);
+  transition: background .15s, color .15s;
+}
+.aba:hover { color: var(--text); }
+.aba.is-activa { background: var(--raise); color: var(--text); }
+
 .fontes {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 10px; max-height: 60vh; overflow-y: auto; padding: 4px 2px;
+  /* Altura estável entre separadores: saltar de tamanho a cada clique é tonto. */
+  min-height: 180px;
 }
 .fontes__espera { color: var(--dim); grid-column: 1/-1; text-align: center; padding: 30px 0; }
 .fontes__titulo {

@@ -1041,24 +1041,24 @@ function fluxoDePedacos() {
   };
 }
 
-/** Abre o seletor: o que há para transmitir, com miniatura, à escolha. */
-async function escolherFonte() {
-  abrir('veu-fontes');
+/** Abre o seletor: um separador por tipo de fonte, como no Discord —
+ *  Janelas num, Ecrãs noutro, cada um só com o seu. */
+let fontesEmMemoria = [];
+let abaActiva = 'janela';
+
+function desenharFontes() {
   const lista = $('#lista-fontes');
-  lista.innerHTML = '<p class="fontes__espera">a olhar para as janelas…</p>';
-  const fontes = await invoke('fontes_de_partilha').catch(() => []);
-  if ($('#veu-fontes').hidden) return;   // cancelou antes de a lista chegar
+  document.querySelectorAll('#abas-fontes .aba').forEach(a => {
+    a.classList.toggle('is-activa', a.dataset.aba === abaActiva);
+  });
   lista.textContent = '';
-  if (!fontes.length) {
-    lista.append(elemento('p', 'fontes__espera', 'não encontrei nada para partilhar'));
+  const visiveis = fontesEmMemoria.filter(f => f.tipo === abaActiva);
+  if (!visiveis.length) {
+    lista.append(elemento('p', 'fontes__espera',
+      abaActiva === 'ecra' ? 'não encontrei ecrãs' : 'não encontrei janelas para partilhar'));
     return;
   }
-  let tipoAnterior = null;
-  for (const f of fontes) {
-    if (f.tipo !== tipoAnterior) {
-      tipoAnterior = f.tipo;
-      lista.append(elemento('div', 'fontes__titulo', f.tipo === 'ecra' ? 'Ecrãs' : 'Janelas'));
-    }
+  for (const f of visiveis) {
     const cartao = elemento('button', 'fonte');
     if (f.miniatura) {
       const img = document.createElement('img');
@@ -1072,6 +1072,19 @@ async function escolherFonte() {
     lista.append(cartao);
   }
 }
+
+async function escolherFonte() {
+  abrir('veu-fontes');
+  const lista = $('#lista-fontes');
+  lista.innerHTML = '<p class="fontes__espera">a olhar para as janelas…</p>';
+  fontesEmMemoria = await invoke('fontes_de_partilha').catch(() => []);
+  if ($('#veu-fontes').hidden) return;   // cancelou antes de a lista chegar
+  desenharFontes();
+}
+
+document.querySelectorAll('#abas-fontes .aba').forEach(a => {
+  a.onclick = () => { abaActiva = a.dataset.aba; desenharFontes(); };
+});
 $('#fechar-fontes').onclick = () => fechar('veu-fontes');
 
 async function alternarEcra() {
@@ -2174,6 +2187,12 @@ function pararDeAssistir() {
     diz(`ui seletor: caixa=${Math.round(caixaF.getBoundingClientRect().width)}px`
       + ` colunas=${colunas} cartoes=${cartoes.length}`
       + (c1 ? ` primeiro=${Math.round(c1.width)}x${Math.round(c1.height)}` : ''));
+    // E os dois separadores, um a um: cada um só pode mostrar o seu tipo.
+    for (const aba of document.querySelectorAll('#abas-fontes .aba')) {
+      aba.click();
+      const n = document.querySelectorAll('.fonte').length;
+      diz(`ui aba ${aba.dataset.aba}: ${n} cartoes`);
+    }
   } else {
     diz('ui seletor: NAO ABRIU');
   }
