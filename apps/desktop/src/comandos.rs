@@ -428,6 +428,7 @@ pub fn comecar_a_partilhar(
     altura: u32,
     fps: u32,
     debito: u32,
+    com_som: bool,
     saida: Channel<InvokeResponseBody>,
     ecra: State<Arc<Ecra>>,
     rede: State<Arc<Rede>>,
@@ -477,6 +478,7 @@ pub fn comecar_a_partilhar(
         max_altura: altura,
         fps,
         debito,
+        com_som,
     };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;

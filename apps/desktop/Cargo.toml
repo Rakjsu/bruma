@@ -1,6 +1,6 @@
 [package]
 name = "bruma"
-version = "0.9.4"
+version = "0.9.5"
 edition.workspace = true
 publish = false
 
@@ -37,5 +37,8 @@ windows = { version = "0.62", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
   "Win32_Media_MediaFoundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
   "Win32_System_Com",
 ] }

@@ -14,6 +14,7 @@ mod jogo;
 mod modelo;
 mod mse;
 mod rede;
+mod som;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -36,6 +37,13 @@ fn main() {
     // `bruma --fontes` despeja o que o seletor de partilha mostraria, com as miniaturas,
     // para %TEMP%ruma-fontes.json. Serve para inspecionar o menu sem abrir a app —
     // e foi como se provou que os BMP desenhados à mão renderizam mesmo num <img>.
+    if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--ouvir=").map(str::to_owned)) {
+        let s: u64 = n.parse().unwrap_or(6);
+        if let Err(e) = som::medir(s) {
+            eprintln!("[som] {e:?}");
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--fontes") {
         let fontes = fontes::fontes_de_partilha();
         let destino = std::env::temp_dir().join("bruma-fontes.json");

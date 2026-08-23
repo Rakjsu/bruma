@@ -332,11 +332,10 @@
 
       <div class="menu-trans__sep"></div>
 
-      <div class="menu-trans__linha menu-trans__linha--inerte"
-           title="O áudio do sistema ainda não segue na transmissão — quando seguir, silencia-se aqui.">
-        <span class="menu-trans__texto"><b>Silenciar áudio da transmissão</b><i>o áudio ainda não segue — em breve</i></span>
-        <input type="checkbox" disabled>
-      </div>
+      <button class="menu-trans__linha" id="linha-som">
+        <span class="menu-trans__texto"><b>Silenciar áudio da transmissão</b><i id="desc-som">o som das colunas segue com a imagem</i></span>
+        <input type="checkbox" id="mudo-transmissao" tabindex="-1">
+      </button>
 
       <button class="menu-trans__linha" data-abre="debito">
         <span class="menu-trans__texto"><b>Avançado</b><i>quanto upload gastar</i></span>

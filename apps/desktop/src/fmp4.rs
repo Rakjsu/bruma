@@ -69,7 +69,8 @@ struct Estado {
     /// Quantas caixas já foram anunciadas no diagnóstico.
     vistas: usize,
     /// Soma das durações dos fragmentos já entregues, para o `tfdt` de cada um.
-    tempo: u64,
+    /// Onde vai o relógio de cada faixa. Com som são duas, e cada uma tem o seu.
+    tempo: crate::mse::Tempos,
 }
 
 #[implement(IMFByteStream)]
@@ -89,7 +90,7 @@ impl FluxoDeSaida {
                 pos: 0,
                 entregue: 0,
                 vistas: 0,
-                tempo: 0,
+                tempo: Default::default(),
             }),
             para,
             ultimos: AtomicU32::new(0),
@@ -136,7 +137,7 @@ impl FluxoDeSaida {
         // do que ja se juntou: o `moof` traduzido e 8 bytes mais curto que o original, e
         // recuar por ele recuava a mais.
         let mut inicio_na_origem = e.entregue;
-        let mut pendente: u64 = 0;
+        let mut pendente = crate::mse::Tempos::default();
         while let Some(tam) = {
             let desde = (e.entregue - e.base) as usize;
             crate::mse::tamanho_da_caixa(&e.dados, desde)
@@ -162,18 +163,18 @@ impl FluxoDeSaida {
                 }
             }
             let traduzida = if crate::mse::e_moof(&e.dados, i) {
-                crate::mse::corrigir_moof(caixa, absoluta, e.tempo + pendente)
+                crate::mse::corrigir_moof(caixa, absoluta, &e.tempo.mais(&pendente))
             } else {
                 None
             };
             match traduzida {
-                Some((v, duracao)) => {
+                Some((v, duracoes)) => {
                     segmento.extend_from_slice(&v);
                     // O relógio só anda quando o segmento SAIR. Um `moof` cujo `mdat`
                     // ainda não chegou é reprocessado na escrita seguinte, e somar aqui
                     // contava-o duas e três vezes — os fragmentos iam parar a instantes
                     // cada vez mais tardios e o vídeo ficava cheio de buracos.
-                    pendente += duracao;
+                    pendente.juntar(&duracoes);
                 }
                 None => segmento.extend_from_slice(caixa),
             }
@@ -185,8 +186,8 @@ impl FluxoDeSaida {
                 com_etiqueta.push(ETIQUETA_BYTES);
                 com_etiqueta.append(&mut segmento);
                 saida.push(com_etiqueta);
-                e.tempo += pendente;
-                pendente = 0;
+                e.tempo.juntar(&pendente);
+                pendente = Default::default();
                 inicio_na_origem = e.entregue;
             }
         }
@@ -370,13 +371,17 @@ impl IMFByteStream_Impl for FluxoDeSaida_Impl {
 pub struct Codificador {
     escritor: IMFSinkWriter,
     fluxo: u32,
-    /// Quando a captura começou. Os instantes das amostras saem DAQUI e não de um
-    /// contador de frames — ver `frame`.
+    /// Quando a partilha começou. Os instantes das amostras saem DAQUI e não de um
+    /// contador de frames — ver `frame`. Vem de fora porque o som usa o MESMO relógio: se
+    /// cada um tivesse o seu, a imagem e o som ficavam separados pelo tempo que a abertura
+    /// do dispositivo demorasse.
     inicio: std::time::Instant,
     /// Fim da última amostra, em unidades de 100 ns desde `inicio`.
     ultimo: i64,
     /// Bytes de um frame de entrada, com as linhas coladas.
     tamanho_entrada: u32,
+    /// O fluxo do som, quando existe. `None` quando a partilha vai muda.
+    fluxo_som: Option<u32>,
 }
 
 impl Codificador {
@@ -393,6 +398,8 @@ impl Codificador {
         alt_saida: u32,
         fps: u32,
         bitrate: u32,
+        som: Option<crate::som::Formato>,
+        origem: std::time::Instant,
         para: Escoadouro,
     ) -> Result<Self> {
         arrancar_media_foundation()?;
@@ -415,7 +422,52 @@ impl Codificador {
 
             // MP4 fragmentado: cabeçalho uma vez, e a seguir fragmentos independentes.
             // É isto que faz a diferença entre um ficheiro e uma transmissão.
-            let sink = MFCreateFMPEG4MediaSink(&byte_stream, None, &saida)?;
+            // A faixa de som entra AQUI, na criação do sink — não se acrescenta depois.
+            // O AAC é a escolha certa por ser o que o contentor MP4 e o MSE já falam: não
+            // acrescenta codificador nenhum ao projecto nem um segundo caminho na rede.
+            let som_saida: Option<IMFMediaType> = match som {
+                Some(f) => {
+                    let t: IMFMediaType = MFCreateMediaType()?;
+                    t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                    t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+                    t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, ritmo_aac(f.ritmo))?;
+                    t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, f.canais.min(2) as u32)?;
+                    t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                    t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16_000)?;
+                    // AAC cru, sem o cabeçalho ADTS: dentro de um MP4 o cabeçalho está no
+                    // `esds` e repeti-lo em cada bloco seria lixo que alguns leitores
+                    // recusam. E o nível 2 é o perfil que cobre estéreo a 48 kHz.
+                    t.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+                    t.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+                    Some(t)
+                }
+                None => None,
+            };
+            // A ordem é (fluxo, VÍDEO, ÁUDIO). Vale a pena dizer porquê: até aqui o código
+            // passava o vídeo no lugar do áudio e funcionava à mesma — o sink não valida os
+            // lugares, cria um fluxo por cada tipo que lhe dão. Com uma faixa só isso nunca
+            // se notou; com duas, dava `MF_E_TOPO_CODEC_NOT_FOUND`, porque ficava a
+            // procurar um transformador de BGRA para AAC.
+            let sink = MFCreateFMPEG4MediaSink(&byte_stream, &saida, som_saida.as_ref())?;
+
+            // E qual dos fluxos é qual? PERGUNTA-SE, em vez de se assumir que o vídeo é o
+            // zero. Assumir era o mesmo erro outra vez, só que mais tarde e mais difícil de
+            // ver: com os índices trocados o vídeo iria pelo caminho do som, em silêncio.
+            let mut fluxo_video = 0u32;
+            let mut indice_som = None;
+            for i in 0..sink.GetStreamSinkCount().unwrap_or(0) {
+                let Ok(fluxo) = sink.GetStreamSinkByIndex(i) else {
+                    continue;
+                };
+                let Ok(tipo) = fluxo.GetMediaTypeHandler().and_then(|h| h.GetMajorType()) else {
+                    continue;
+                };
+                if tipo == MFMediaType_Video {
+                    fluxo_video = i;
+                } else if tipo == MFMediaType_Audio {
+                    indice_som = Some(i);
+                }
+            }
 
             let atributos: IMFAttributes = {
                 let mut a = None;
@@ -443,15 +495,41 @@ impl Codificador {
             entrada.SetUINT32(&MF_MT_DEFAULT_STRIDE, largura * 4)?;
             juntar64(&entrada, &MF_MT_FRAME_RATE, fps, 1)?;
             juntar64(&entrada, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
-            escritor.SetInputMediaType(0, &entrada, None)?;
+            escritor.SetInputMediaType(fluxo_video, &entrada, None)?;
+
+            // O som entra em PCM de 16 bits; o sink writer põe o codificador de AAC pelo
+            // meio sozinho — e, se o dispositivo der um ritmo que o AAC não fala, põe
+            // também o reamostrador. É a mesma razão por que o vídeo entra em BGRA.
+            let fluxo_som = match som.zip(indice_som) {
+                Some((f, indice)) => {
+                    let t: IMFMediaType = MFCreateMediaType()?;
+                    let canais = f.canais.min(2) as u32;
+                    t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                    t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                    t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, f.ritmo)?;
+                    t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, canais)?;
+                    t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                    t.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, canais * 2)?;
+                    t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, f.ritmo * canais * 2)?;
+                    match escritor.SetInputMediaType(indice, &t, None) {
+                        Ok(()) => Some(indice),
+                        Err(e) => {
+                            eprintln!("[som] o som não entra no contentor: {e:?}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
 
             escritor.BeginWriting()?;
 
             Ok(Self {
                 escritor,
-                fluxo: 0,
-                inicio: std::time::Instant::now(),
+                fluxo: fluxo_video,
+                inicio: origem,
                 ultimo: 0,
+                fluxo_som,
                 tamanho_entrada: largura * 4 * altura,
             })
         }
@@ -499,6 +577,31 @@ impl Codificador {
         }
     }
 
+    /// Um bocado de som, em PCM de 16 bits intercalado. Silencioso se a partilha for muda.
+    pub fn som(&mut self, pcm: &[u8], instante: i64, duracao: i64) -> Result<()> {
+        let Some(fluxo) = self.fluxo_som else {
+            return Ok(());
+        };
+        if pcm.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(pcm.len() as u32)?;
+            let mut destino: *mut u8 = std::ptr::null_mut();
+            buffer.Lock(&mut destino, None, None)?;
+            std::ptr::copy_nonoverlapping(pcm.as_ptr(), destino, pcm.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(pcm.len() as u32)?;
+
+            let amostra: IMFSample = MFCreateSample()?;
+            amostra.AddBuffer(&buffer)?;
+            amostra.SetSampleTime(instante)?;
+            amostra.SetSampleDuration(duracao.max(1))?;
+            self.escritor.WriteSample(fluxo, &amostra)?;
+        }
+        Ok(())
+    }
+
     /// Onde vai a linha temporal da média, em segundos. Serve para a medição poder
     /// comparar com o relógio da parede: os dois têm de andar juntos.
     pub fn relogio_media(&self) -> f64 {
@@ -508,6 +611,16 @@ impl Codificador {
     pub fn terminar(self) -> Result<()> {
         unsafe { self.escritor.Finalize()? };
         Ok(())
+    }
+}
+
+/// O codificador de AAC do Windows só fala 44100 e 48000. Para o resto, escolhe-se o mais
+/// perto e deixa-se o sink writer pôr o reamostrador — em vez de recusar o som todo.
+fn ritmo_aac(ritmo: u32) -> u32 {
+    if ritmo == 44_100 {
+        44_100
+    } else {
+        48_000
     }
 }
 

@@ -1107,6 +1107,9 @@ function qualidadeDePartilha() {
     altura: Number.isFinite(q.altura) ? q.altura : 1080,
     fps: [15, 30, 60].includes(q.fps) ? q.fps : 60,
     debito: Number.isFinite(q.debito) ? q.debito : 0,
+    // Liga por omissão, como no Discord: quem partilha um jogo ou um vídeo quer que se
+    // ouça, e quem não quer diz aqui — em vez de descobrir a meio que ninguém ouviu nada.
+    som: q.som !== false,
   };
 }
 
@@ -1114,8 +1117,10 @@ function qualidadeDePartilha() {
 function qualidadeEfetiva() {
   const q = qualidadeDePartilha();
   const base = MODOS[q.modo] || { altura: q.altura, fps: q.fps };
-  return { altura: base.altura, fps: base.fps, debito: q.debito };
+  return { altura: base.altura, fps: base.fps, debito: q.debito, som: q.som };
 }
+
+$('#linha-som').onclick = () => guardarQualidade({ som: !qualidadeDePartilha().som });
 
 function guardarQualidade(mudanca) {
   const q = { ...qualidadeDePartilha(), ...mudanca };
@@ -1145,6 +1150,12 @@ function desenharMenuTransmissao() {
   $('#valor-altura').textContent = rotuloDe(OPCOES_ALTURA, efetiva.altura);
   $('#valor-fps').textContent = rotuloDe(OPCOES_FPS, efetiva.fps);
   $('#valor-debito').textContent = rotuloDe(OPCOES_DEBITO, q.debito);
+  // A caixa diz SILENCIAR: marcada é som desligado. É a mesma leitura do Discord, e é o
+  // contrário do que a variável guarda — daí a negação estar aqui, uma vez só.
+  $('#mudo-transmissao').checked = !q.som;
+  $('#desc-som').textContent = q.som
+    ? 'o som das colunas segue com a imagem'
+    : 'a transmissão vai muda';
 
   const nome = q.modo === 'jogos' ? 'Jogos' : q.modo === 'texto' ? 'Texto' : null;
   $('#resumo-qualidade').textContent =
@@ -1237,6 +1248,7 @@ async function iniciarPartilha(fonte) {
       altura: q.altura,
       fps: q.fps,
       debito: q.debito,
+      comSom: q.som,
       saida: canal,
     });
   } catch (e) {
@@ -1997,7 +2009,7 @@ function pararDeAssistir() {
       { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1',
         altura: await invoke('autoteste_altura').catch(() => 720),
         fps: await invoke('autoteste_fps').catch(() => 30),
-        debito: 0, saida: canal });
+        debito: 0, comSom: true, saida: canal });
     await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
     const fontes = await invoke('fontes_de_partilha').catch(() => []);
     const comImagem = fontes.filter(f => f.miniatura && f.miniatura.length > 2000).length;
@@ -2019,6 +2031,10 @@ function pararDeAssistir() {
   diz(`autoteste: ${pedacos} pedaços, ${(bytes / 1e6).toFixed(1)} MB`
     + ` | vídeo ${v.videoWidth}x${v.videoHeight}, readyState=${v.readyState}`
     + ` | descodificados=${v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : '?'}`
+    // "sem erro" não prova que o som toca: prova que ninguém se queixou. Estes bytes são o
+    // navegador a dizer que DESCODIFICOU som — é a diferença entre a faixa existir e a
+    // faixa funcionar, e foi por não a medir que o vídeo já passou por bom estando parado.
+    + ` | som descodificado=${v.webkitAudioDecodedByteCount ?? '?'} bytes`
     + ` | bufferizado=[${intervalos.join(', ')}] t=${v.currentTime.toFixed(2)}`
     + ` | erro=${v.error ? v.error.code : 'nenhum'}`
     + (v.error && v.error.message ? ` "${v.error.message}"` : ''));
@@ -2335,10 +2351,14 @@ function pararDeAssistir() {
       diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`
         + ` abre=${aberto} fecha=${fechado}`);
     }
-    const linhaAudio = document.querySelector('.menu-trans__linha--inerte');
-    const rotuloAudio = linhaAudio.querySelector('b').getBoundingClientRect();
+    const rotuloAudio = $('#linha-som').querySelector('b').getBoundingClientRect();
+    const antes = $('#mudo-transmissao').checked;
+    $('#linha-som').click();
+    const depois = $('#mudo-transmissao').checked;
+    $('#linha-som').click();
     diz(`ui silenciar: rotulo ${Math.round(rotuloAudio.width)}x${Math.round(rotuloAudio.height)}`
-      + ` (uma linha se altura < 22)`);
+      + ` (uma linha se altura < 22) alterna=${antes !== depois}`
+      + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
     document.querySelector('[data-modo="pers"]').click();

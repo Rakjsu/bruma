@@ -168,94 +168,175 @@ pub fn codec_do_moov(moov: &[u8]) -> Option<String> {
     let (avcc, _) = procurar(moov, avc1 + CABECALHO + 78, avc1 + tam, b"avcC")?;
     // [cabeçalho 8][configurationVersion 1][perfil 1][compatibilidade 1][nível 1]
     let p = moov.get(avcc + CABECALHO + 1..avcc + CABECALHO + 4)?;
-    Some(format!("avc1.{:02X}{:02X}{:02X}", p[0], p[1], p[2]))
+    let video = format!("avc1.{:02X}{:02X}{:02X}", p[0], p[1], p[2]);
+
+    // E o som, se a partilha o levar. O navegador VALIDA o que se lhe declara contra o que
+    // recebe, e é literal: com a faixa de som presente e o mime a falar só de vídeo, recusa
+    // o segmento inteiro com "audio object type 0x40 does not match what is specified in
+    // the mimetype". Declarar de mais também não serve — daí ler-se o que lá está.
+    match procurar(moov, CABECALHO, moov.len(), b"mp4a") {
+        Some(_) => Some(format!("{video}, mp4a.40.2")),
+        None => Some(video),
+    }
+}
+
+/// Quanto tempo já passou em cada faixa. Com som, um `moof` traz DUAS faixas, e cada uma
+/// tem o seu relógio: o vídeo anda a 10 MHz, o som ao ritmo de amostragem. Somar tudo ao
+/// mesmo contador punha o som a começar onde o vídeo acabou.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Tempos {
+    faixas: Vec<(u32, u64)>,
+}
+
+impl Tempos {
+    pub fn de(&self, faixa: u32) -> u64 {
+        self.faixas
+            .iter()
+            .find(|(f, _)| *f == faixa)
+            .map_or(0, |(_, t)| *t)
+    }
+
+    pub fn somar(&mut self, faixa: u32, quanto: u64) {
+        match self.faixas.iter_mut().find(|(f, _)| *f == faixa) {
+            Some((_, t)) => *t += quanto,
+            None => self.faixas.push((faixa, quanto)),
+        }
+    }
+
+    /// Junta o que estava pendente ao que já estava contado.
+    pub fn juntar(&mut self, outros: &Tempos) {
+        for (f, t) in &outros.faixas {
+            self.somar(*f, *t);
+        }
+    }
+
+    /// A soma de dois relógios, sem mexer em nenhum — para traduzir sem ainda commitar.
+    pub fn mais(&self, outros: &Tempos) -> Tempos {
+        let mut r = self.clone();
+        r.juntar(outros);
+        r
+    }
 }
 
 /// Traduz um `moof` para o dialeto do MSE.
 ///
-/// `posicao` é onde este `moof` começa no fluxo original e `tempo` é a soma das durações
-/// dos fragmentos anteriores. Devolve a caixa traduzida e a duração deste fragmento, para
-/// o chamador poder continuar a contar.
+/// `posicao` é onde este `moof` começa no fluxo original e `tempos` diz em que instante
+/// cada faixa vai. Devolve a caixa traduzida e as durações DESTE fragmento, faixa a faixa,
+/// para o chamador continuar a contar.
+///
+/// # Porque é que isto tem de tratar de VÁRIAS faixas
+///
+/// Enquanto a partilha era muda havia um `traf` por `moof` e bastava traduzir o primeiro.
+/// Com o som, o Media Foundation escreve DOIS — está medido: 35 `moof`, todos com 2 `traf`,
+/// faixas 1 e 2. A versão anterior traduzia o primeiro e copiava o resto tal e qual, o que
+/// deixava a segunda faixa com o endereço absoluto que o MSE recusa. Pior: recusava o
+/// segmento inteiro, e o sintoma aparecia no vídeo.
 ///
 /// Devolve `None` quando a caixa não tem a forma esperada — e aí ela segue como estava.
-pub fn corrigir_moof(moof: &[u8], posicao: u64, tempo: u64) -> Option<(Vec<u8>, u64)> {
+pub fn corrigir_moof(moof: &[u8], posicao: u64, tempos: &Tempos) -> Option<(Vec<u8>, Tempos)> {
     let fim = moof.len();
     if fim < CABECALHO || tipo_em(moof, 0)? != b"moof" {
         return None;
     }
 
-    let (traf_i, traf_tam) = filha(moof, CABECALHO, fim, b"traf")?;
-    let traf_fim = traf_i + traf_tam;
-    let (tfhd_i, tfhd_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"tfhd")?;
-    let (trun_i, trun_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"trun")?;
-
-    let flags_tfhd = u32_em(moof, tfhd_i + CABECALHO)? & 0x00FF_FFFF;
-    let tem_base = flags_tfhd & TFHD_BASE_DATA_OFFSET != 0;
-    let ja_tem_tfdt = filha(moof, traf_i + CABECALHO, traf_fim, b"tfdt").is_some();
-    if !tem_base && ja_tem_tfdt {
-        return None; // já está no dialeto certo
-    }
-    if !tem_base {
-        return None; // forma que não se conhece; não se adivinha
-    }
-
-    // [cabeçalho 8][versão+flags 4][track_ID 4][base_data_offset 8]
-    let base_i = tfhd_i + CABECALHO + 4 + 4;
-    let base = u64_em(moof, base_i)?;
-    if tfhd_tam < (base_i - tfhd_i) + 8 {
-        return None;
-    }
-
-    let duracao = duracao_do_trun(moof, trun_i, trun_tam)?;
-
-    // Monta-se de novo, em vez de remendar o original: são três mexidas com tamanhos
-    // diferentes (tirar 8, pôr 20, corrigir três caixas) e remendar dava índices a mudar
-    // debaixo dos pés.
-    let tfdt = caixa_tfdt(tempo);
-    let novo_traf_tam = traf_tam - 8 + tfdt.len();
-    let novo_moof_tam = fim - 8 + tfdt.len();
-
-    let mut novo = Vec::with_capacity(novo_moof_tam);
-    // moof: cabeçalho com o tamanho novo, e tudo até ao traf
-    novo.extend_from_slice(&(novo_moof_tam as u32).to_be_bytes());
-    novo.extend_from_slice(b"moof");
-    novo.extend_from_slice(&moof[CABECALHO..traf_i]);
-    // traf: cabeçalho com o tamanho novo
-    novo.extend_from_slice(&(novo_traf_tam as u32).to_be_bytes());
-    novo.extend_from_slice(b"traf");
-    // tfhd: sem o endereço absoluto e com a flag que o MSE quer
-    let flags_novas = (flags_tfhd & !TFHD_BASE_DATA_OFFSET) | TFHD_DEFAULT_BASE_IS_MOOF;
-    let versao_tfhd = moof[tfhd_i + CABECALHO];
-    novo.extend_from_slice(&((tfhd_tam - 8) as u32).to_be_bytes());
-    novo.extend_from_slice(b"tfhd");
-    novo.extend_from_slice(&(((versao_tfhd as u32) << 24) | flags_novas).to_be_bytes());
-    novo.extend_from_slice(&moof[tfhd_i + CABECALHO + 4..base_i]);
-    novo.extend_from_slice(&moof[base_i + 8..tfhd_i + tfhd_tam]);
-    // tfdt: a peça que faltava
-    novo.extend_from_slice(&tfdt);
-    // o resto do traf, com o trun já corrigido
-    let mut i = tfhd_i + tfhd_tam;
-    while i + CABECALHO <= traf_fim {
+    // Primeira passagem: encontrar todos os `traf` e ver se há alguma coisa a fazer.
+    let mut trafs = Vec::new();
+    let mut i = CABECALHO;
+    while i + CABECALHO <= fim {
         let tam = u32_em(moof, i)? as usize;
-        if tam < CABECALHO || i + tam > traf_fim {
+        if tam < CABECALHO || i + tam > fim {
             return None;
         }
-        if i == trun_i {
-            novo.extend_from_slice(&corrigir_trun(
-                &moof[trun_i..trun_i + trun_tam],
-                base,
-                posicao,
-                tfdt.len(),
-            )?);
-        } else if tipo_em(moof, i)? != b"tfdt" {
-            novo.extend_from_slice(&moof[i..i + tam]);
+        if tipo_em(moof, i)? == b"traf" {
+            trafs.push((i, tam));
         }
         i += tam;
     }
-    // o que vier depois do traf dentro do moof
-    novo.extend_from_slice(&moof[traf_fim..fim]);
+    if trafs.is_empty() {
+        return None;
+    }
 
-    Some((novo, duracao))
+    // O `moof` cresce o mesmo para todas as faixas, e o `data_offset` de CADA `trun` tem de
+    // contar com o crescimento TOTAL — não só com o da sua própria faixa. É por aqui que
+    // uma versão ingénua se engana: corrige a primeira faixa bem e manda a segunda apontar
+    // para o meio do sítio errado.
+    const TFDT: usize = 20;
+    let delta_total = trafs.len() as i64 * (TFDT as i64 - 8);
+
+    let mut corpo = Vec::with_capacity(fim + trafs.len() * TFDT);
+    let mut duracoes = Tempos::default();
+    let mut anterior = CABECALHO;
+
+    for (traf_i, traf_tam) in &trafs {
+        let (traf_i, traf_tam) = (*traf_i, *traf_tam);
+        let traf_fim = traf_i + traf_tam;
+        // o que houver entre o traf anterior e este (o `mfhd`, por exemplo)
+        corpo.extend_from_slice(&moof[anterior..traf_i]);
+        anterior = traf_fim;
+
+        let (tfhd_i, tfhd_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"tfhd")?;
+        let (trun_i, trun_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"trun")?;
+
+        let flags_tfhd = u32_em(moof, tfhd_i + CABECALHO)? & 0x00FF_FFFF;
+        if flags_tfhd & TFHD_BASE_DATA_OFFSET == 0 {
+            // Ou já está no dialeto certo, ou é uma forma que não se conhece. Em nenhum
+            // dos casos se adivinha: a caixa segue inteira como estava.
+            return None;
+        }
+
+        // [cabeçalho 8][versão+flags 4][track_ID 4][base_data_offset 8]
+        let faixa = u32_em(moof, tfhd_i + CABECALHO + 4)?;
+        let base_i = tfhd_i + CABECALHO + 4 + 4;
+        if tfhd_tam < (base_i - tfhd_i) + 8 {
+            return None;
+        }
+        let base = u64_em(moof, base_i)?;
+
+        // O `tfdt` diz onde este fragmento COMEÇA: o tempo desta faixa antes de lhe somar
+        // a duração que ele traz.
+        let tfdt = caixa_tfdt(tempos.de(faixa) + duracoes.de(faixa));
+        duracoes.somar(faixa, duracao_do_trun(moof, trun_i, trun_tam)?);
+
+        let novo_traf_tam = traf_tam - 8 + tfdt.len();
+        corpo.extend_from_slice(&(novo_traf_tam as u32).to_be_bytes());
+        corpo.extend_from_slice(b"traf");
+        // tfhd: sem o endereço absoluto e com a flag que o MSE quer
+        let flags_novas = (flags_tfhd & !TFHD_BASE_DATA_OFFSET) | TFHD_DEFAULT_BASE_IS_MOOF;
+        let versao_tfhd = moof[tfhd_i + CABECALHO];
+        corpo.extend_from_slice(&((tfhd_tam - 8) as u32).to_be_bytes());
+        corpo.extend_from_slice(b"tfhd");
+        corpo.extend_from_slice(&(((versao_tfhd as u32) << 24) | flags_novas).to_be_bytes());
+        corpo.extend_from_slice(&moof[tfhd_i + CABECALHO + 4..base_i]);
+        corpo.extend_from_slice(&moof[base_i + 8..tfhd_i + tfhd_tam]);
+        corpo.extend_from_slice(&tfdt);
+
+        let mut k = tfhd_i + tfhd_tam;
+        while k + CABECALHO <= traf_fim {
+            let tam = u32_em(moof, k)? as usize;
+            if tam < CABECALHO || k + tam > traf_fim {
+                return None;
+            }
+            if k == trun_i {
+                corpo.extend_from_slice(&corrigir_trun(
+                    &moof[trun_i..trun_i + trun_tam],
+                    base,
+                    posicao,
+                    delta_total,
+                )?);
+            } else if tipo_em(moof, k)? != b"tfdt" {
+                corpo.extend_from_slice(&moof[k..k + tam]);
+            }
+            k += tam;
+        }
+    }
+    // o que vier depois do último traf
+    corpo.extend_from_slice(&moof[anterior..fim]);
+
+    let mut novo = Vec::with_capacity(corpo.len() + CABECALHO);
+    novo.extend_from_slice(&((corpo.len() + CABECALHO) as u32).to_be_bytes());
+    novo.extend_from_slice(b"moof");
+    novo.extend_from_slice(&corpo);
+    Some((novo, duracoes))
 }
 
 /// A caixa que diz em que instante este fragmento começa. Versão 1 para o tempo caber em
@@ -302,7 +383,7 @@ fn duracao_do_trun(d: &[u8], trun_i: usize, trun_tam: usize) -> Option<u64> {
 
 /// O `data_offset` contava a partir do endereço absoluto; passa a contar a partir do
 /// início do `moof`, já com o tamanho que ele ficou a ter.
-fn corrigir_trun(trun: &[u8], base: u64, posicao: u64, tamanho_tfdt: usize) -> Option<Vec<u8>> {
+fn corrigir_trun(trun: &[u8], base: u64, posicao: u64, delta: i64) -> Option<Vec<u8>> {
     let flags = u32_em(trun, CABECALHO)? & 0x00FF_FFFF;
     if flags & TRUN_DATA_OFFSET == 0 {
         return Some(trun.to_vec());
@@ -310,8 +391,8 @@ fn corrigir_trun(trun: &[u8], base: u64, posicao: u64, tamanho_tfdt: usize) -> O
     // [cabeçalho 8][versão+flags 4][sample_count 4][data_offset 4]
     let off_i = CABECALHO + 4 + 4;
     let antigo = u32_em(trun, off_i)? as i32 as i64;
-    // O moof perdeu 8 bytes (o endereço absoluto) e ganhou os do tfdt.
-    let delta = tamanho_tfdt as i64 - 8;
+    // `delta` é o crescimento do moof INTEIRO — todas as faixas — porque o `mdat` vem a
+    // seguir ao moof todo, não a seguir a este `traf`.
     let relativo = (base as i64 + antigo) - posicao as i64 + delta;
     if !(i32::MIN as i64..=i32::MAX as i64).contains(&relativo) {
         return None;
@@ -330,6 +411,100 @@ mod testes {
         v.extend_from_slice(tipo);
         v.extend_from_slice(corpo);
         v
+    }
+
+    /// Um `moof` com DUAS faixas, como o Media Foundation o escreve quando a partilha
+    /// leva som. Foi medido em ficheiro real: 35 `moof`, todos com 2 `traf`, faixas 1 e 2.
+    fn moof_de_duas_faixas(base_a: u64, base_b: u64) -> Vec<u8> {
+        fn um_traf(faixa: u32, base: u64, data_offset: i32, amostras: u32, dur: u32) -> Vec<u8> {
+            let mut tfhd = Vec::new();
+            tfhd.extend_from_slice(&(TFHD_BASE_DATA_OFFSET).to_be_bytes());
+            tfhd.extend_from_slice(&faixa.to_be_bytes());
+            tfhd.extend_from_slice(&base.to_be_bytes());
+            let tfhd = caixa(b"tfhd", &tfhd);
+
+            let mut trun = Vec::new();
+            trun.extend_from_slice(&(TRUN_DATA_OFFSET | TRUN_SAMPLE_DURATION).to_be_bytes());
+            trun.extend_from_slice(&amostras.to_be_bytes());
+            trun.extend_from_slice(&data_offset.to_be_bytes());
+            for _ in 0..amostras {
+                trun.extend_from_slice(&dur.to_be_bytes());
+            }
+            let trun = caixa(b"trun", &trun);
+
+            let mut traf = tfhd;
+            traf.extend_from_slice(&trun);
+            caixa(b"traf", &traf)
+        }
+        let mut corpo = caixa(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 7]);
+        corpo.extend_from_slice(&um_traf(1, base_a, 100, 3, 512));
+        corpo.extend_from_slice(&um_traf(2, base_b, 400, 5, 1024));
+        caixa(b"moof", &corpo)
+    }
+
+    /// A armadilha das duas faixas: cada uma tem de ganhar o SEU `tfdt`, e os dois
+    /// `data_offset` têm de contar com o crescimento do `moof` INTEIRO — não só com o do
+    /// seu próprio `traf`. A versão de uma faixa só traduzia a primeira e copiava a
+    /// segunda tal e qual, o que fazia o MSE recusar o segmento todo.
+    #[test]
+    fn duas_faixas_sao_ambas_traduzidas() {
+        let moof = moof_de_duas_faixas(5000, 9000);
+        let antes = moof.len();
+        let mut tempos = Tempos::default();
+        tempos.somar(1, 70_000);
+        tempos.somar(2, 48_000);
+
+        let (novo, duracoes) = corrigir_moof(&moof, 4000, &tempos).expect("devia traduzir");
+
+        // duas faixas: -8 e +20 em cada uma
+        assert_eq!(novo.len(), antes + 2 * (20 - 8));
+        assert_eq!(u32_em(&novo, 0).unwrap() as usize, novo.len());
+        assert_eq!(duracoes.de(1), 3 * 512, "a faixa 1 conta as suas amostras");
+        assert_eq!(duracoes.de(2), 5 * 1024, "e a faixa 2 as dela");
+
+        // Percorre-se o resultado e exige-se que NENHUM traf tenha ficado por traduzir.
+        let mut i = CABECALHO;
+        let mut trafs = 0;
+        let mut vistos = Vec::new();
+        while i + CABECALHO <= novo.len() {
+            let tam = u32_em(&novo, i).unwrap() as usize;
+            if tipo_em(&novo, i).unwrap() == b"traf" {
+                trafs += 1;
+                let (tfhd_i, _) = filha(&novo, i + CABECALHO, i + tam, b"tfhd").unwrap();
+                let flags = u32_em(&novo, tfhd_i + CABECALHO).unwrap() & 0x00FF_FFFF;
+                assert_eq!(
+                    flags & TFHD_BASE_DATA_OFFSET,
+                    0,
+                    "endereço absoluto tem de sair"
+                );
+                assert_ne!(
+                    flags & TFHD_DEFAULT_BASE_IS_MOOF,
+                    0,
+                    "flag relativa tem de entrar"
+                );
+                let (tfdt_i, _) = filha(&novo, i + CABECALHO, i + tam, b"tfdt")
+                    .expect("cada traf leva o SEU tfdt");
+                vistos.push(u64_em(&novo, tfdt_i + CABECALHO + 4).unwrap());
+
+                // e o data_offset conta a partir do início do moof, com o crescimento todo
+                let (trun_i, _) = filha(&novo, i + CABECALHO, i + tam, b"trun").unwrap();
+                let off = u32_em(&novo, trun_i + CABECALHO + 8).unwrap() as i32 as i64;
+                let faixa = u32_em(&novo, tfhd_i + CABECALHO + 4).unwrap();
+                let (base, antigo) = if faixa == 1 {
+                    (5000i64, 100i64)
+                } else {
+                    (9000, 400)
+                };
+                assert_eq!(off, base + antigo - 4000 + 2 * (20 - 8), "faixa {faixa}");
+            }
+            i += tam;
+        }
+        assert_eq!(trafs, 2, "os dois traf têm de sobreviver");
+        assert_eq!(
+            vistos,
+            vec![70_000, 48_000],
+            "cada faixa parte do SEU relógio"
+        );
     }
 
     /// Um `moof` como o Media Foundation o escreve: `tfhd` com endereço absoluto, `trun`
@@ -368,7 +543,11 @@ mod testes {
         // O moof comeca no byte 1000 e os dados dele estao em 1000 + 120.
         let original = moof_do_windows(1000, 120);
         let tam_antes = original.len();
-        let (novo, duracao) = corrigir_moof(&original, 1000, 9000).expect("devia ter corrigido");
+        let mut tempos = Tempos::default();
+        tempos.somar(1, 9000);
+        let (novo, duracoes) =
+            corrigir_moof(&original, 1000, &tempos).expect("devia ter corrigido");
+        let duracao = duracoes.de(1);
 
         // Perdeu o endereco absoluto (8) e ganhou o tfdt (20).
         assert_eq!(novo.len(), tam_antes - 8 + 20);
@@ -429,7 +608,7 @@ mod testes {
         let base = posicao + tamanho_do_moof + 8;
         let moof = moof_do_windows_com_base(base, 0);
 
-        let (novo, _) = corrigir_moof(&moof, posicao, 0).unwrap();
+        let (novo, _) = corrigir_moof(&moof, posicao, &Tempos::default()).unwrap();
         let (traf_i, traf_tam) = filha(&novo, CABECALHO, novo.len(), b"traf").unwrap();
         let (trun_i, _) = filha(&novo, traf_i + CABECALHO, traf_i + traf_tam, b"trun").unwrap();
         let off = u32_em(&novo, trun_i + CABECALHO + 8).unwrap() as i32 as usize;
@@ -476,14 +655,14 @@ mod testes {
         tfhd.extend_from_slice(&1u32.to_be_bytes());
         let traf = caixa(b"traf", &caixa(b"tfhd", &tfhd));
         let moof = caixa(b"moof", &traf);
-        assert!(corrigir_moof(&moof, 0, 0).is_none());
+        assert!(corrigir_moof(&moof, 0, &Tempos::default()).is_none());
     }
 
     #[test]
     fn caixa_estranha_passa_intacta_em_vez_de_ser_adivinhada() {
         // Um moof que diz ter um traf mas nao o tem inteiro.
         let moof = caixa(b"moof", &[0, 0, 0, 200, b't', b'r', b'a', b'f']);
-        assert!(corrigir_moof(&moof, 0, 0).is_none());
+        assert!(corrigir_moof(&moof, 0, &Tempos::default()).is_none());
     }
 
     #[test]

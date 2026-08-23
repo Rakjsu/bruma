@@ -82,8 +82,15 @@ mod win {
 
     use crate::fmp4::Codificador;
 
+    /// O que o codificador tem para fazer. Vem do vídeo E do som, por um canal só.
+    pub enum Trabalho {
+        Video(Vec<u8>),
+        Som(Vec<u8>, i64, i64),
+    }
+
     struct Sessao {
-        codificador: Option<Codificador>,
+        /// Para onde vão os frames. O codificador vive noutra thread — ver `arrancar`.
+        canal: std::sync::mpsc::SyncSender<Trabalho>,
         parar: Arc<AtomicBool>,
         /// Buffer reutilizado para tirar o enchimento do fim das linhas. Sem isto era uma
         /// alocação de 20 MB por frame, sessenta vezes por segundo.
@@ -94,38 +101,39 @@ mod win {
         alt: u32,
         /// Tela persistente para onde se copiam frames de tamanho diferente do inicial.
         tela: Vec<u8>,
-        /// Medição: quantos frames o Windows entregou e quantos foram codificados.
+        /// Medição: entregues pelo Windows, enviados ao codificador, e largados por o
+        /// codificador estar atrasado.
         recebidos: u64,
-        codificados: u64,
+        enviados: u64,
+        largados: u64,
         inicio: std::time::Instant,
         fps: u32,
     }
 
-    // SAFETY: o `Sessao` guarda ponteiros COM, que em geral não atravessam threads. Aqui
-    // não atravessam: o `start` cria a fila de despacho na thread que o chama, chama o
-    // `new` nessa thread e entrega os frames nessa mesma thread. A exigência de `Send` vem
-    // da assinatura do trait, não de haver travessia real. Se algum dia se passar ao
-    // `start_free_threaded`, esta garantia cai.
-    unsafe impl Send for Sessao {}
-
-    type Flags = (u32, u32, u32, u32, u32, u32, Arc<AtomicBool>, Entrega);
+    type Flags = (
+        std::sync::mpsc::SyncSender<Trabalho>,
+        u32,
+        u32,
+        Arc<AtomicBool>,
+        u32,
+    );
 
     impl GraphicsCaptureApiHandler for Sessao {
         type Flags = Flags;
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (lar, alt, ls, aa, fps, bitrate, parar, entrega) = ctx.flags;
-            let codificador = Codificador::novo(lar, alt, ls, aa, fps, bitrate, entrega)?;
+            let (canal, lar, alt, parar, fps) = ctx.flags;
             Ok(Self {
-                codificador: Some(codificador),
+                canal,
                 parar,
                 scratch: Vec::new(),
                 lar,
                 alt,
                 tela: Vec::new(),
                 recebidos: 0,
-                codificados: 0,
+                enviados: 0,
+                largados: 0,
                 inicio: std::time::Instant::now(),
                 fps,
             })
@@ -137,29 +145,18 @@ mod win {
             controlo: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
             if self.parar.load(Ordering::Relaxed) {
-                // O relógio da média LIDO ao codificador, não recalculado aqui. A primeira
-                // versão desta medição refazia a conta antiga (frames ÷ ips) e por isso
-                // continuou a dar números errados depois de a correcção já estar feita:
-                // um instrumento que repete a suposição do bug não consegue vê-lo curado.
-                let media = self.codificador.as_ref().map_or(0.0, |c| c.relogio_media());
-                if let Some(c) = self.codificador.take() {
-                    c.terminar()?;
-                }
-                // O veredicto da captura, em números: o ritmo pedido tem de bater com o
-                // ritmo entregue, e o relógio da média com o relógio da parede. Quando
-                // não bate, o vídeo do outro lado corre devagar e o buffer cresce sem fim.
+                // O veredicto da CAPTURA. O relógio da média fica do lado do codificador,
+                // que o imprime quando fecha — aqui já não se lhe pode perguntar nada.
                 let s = self.inicio.elapsed().as_secs_f64().max(0.001);
                 eprintln!(
-                    "[ecrã] {:.1}s: {} entregues ({:.1}/s), {} codificados ({:.1}/s),                      pedido {} ips; média {:.1}s para {:.1}s de parede (x{:.2})",
+                    "[ecrã] {:.1}s: {} entregues ({:.1}/s), {} enviados, {} largados, \
+                     pedido {} ips",
                     s,
                     self.recebidos,
                     self.recebidos as f64 / s,
-                    self.codificados,
-                    self.codificados as f64 / s,
+                    self.enviados,
+                    self.largados,
                     self.fps,
-                    media,
-                    s,
-                    media / s,
                 );
                 controlo.stop();
                 return Ok(());
@@ -169,10 +166,9 @@ mod win {
             let buf = frame.buffer()?;
             let bytes = buf.as_nopadding_buffer(&mut self.scratch);
 
-            if let Some(c) = self.codificador.as_mut() {
-                self.codificados += 1;
-                if f_lar == self.lar && f_alt == self.alt {
-                    c.frame(bytes)?;
+            {
+                let pronto: Vec<u8> = if f_lar == self.lar && f_alt == self.alt {
+                    bytes.to_vec()
                 } else {
                     // A janela mudou de tamanho e o codificador não muda com ela — o MP4
                     // declara as dimensões no cabeçalho, uma vez. Copia-se o que couber
@@ -190,9 +186,15 @@ mod win {
                         let para = y * (self.lar * 4) as usize;
                         self.tela[para..para + largura].copy_from_slice(&bytes[de..de + largura]);
                     }
-                    let tela = std::mem::take(&mut self.tela);
-                    c.frame(&tela)?;
-                    self.tela = tela;
+                    self.tela.clone()
+                };
+                // `try_send` e não `send`: se o codificador está atrasado, LARGA-SE o frame
+                // em vez de segurar a captura à espera dele. Numa transmissão ao vivo,
+                // chegar tarde é pior do que faltar — e segurar aqui atrasaria também o
+                // som, que vai pelo mesmo canal.
+                match self.canal.try_send(Trabalho::Video(pronto)) {
+                    Ok(()) => self.enviados += 1,
+                    Err(_) => self.largados += 1,
                 }
             }
             Ok(())
@@ -264,10 +266,86 @@ mod win {
             debito(ls, aa, fps)
         };
 
+        // O formato do som LÊ-SE antes de o codificador nascer, porque ele precisa do ritmo
+        // e dos canais para declarar a faixa. Sem dispositivo, a partilha segue muda — e
+        // di-lo, em vez de morrer.
+        let formato_som = if qualidade.com_som {
+            match crate::som::formato() {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("[som] sem dispositivo de saída; a partilha vai muda: {e:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Uma fila curta de propósito: com quatro lugares, o atraso máximo que o codificador
+        // pode acumular é de quatro frames. Mais fundo seria guardar imagens que, quando
+        // saíssem, já não interessavam a ninguém.
+        let (envia, recebe) = std::sync::mpsc::sync_channel::<Trabalho>(4);
+        let origem = std::time::Instant::now();
+
+        // A thread do codificador. É a ÚNICA que fala com o Media Foundation: o vídeo e o
+        // som chegam-lhe pelo canal, e assim nunca há dois lados a escrever no mesmo sink —
+        // que é precisamente onde este tipo de código costuma partir-se de forma aleatória.
+        std::thread::spawn(move || {
+            let mut c = match Codificador::novo(
+                lar,
+                alt,
+                ls,
+                aa,
+                fps,
+                bitrate,
+                formato_som,
+                origem,
+                entrega,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[ecrã] o codificador não abriu: {e:?}");
+                    return;
+                }
+            };
+            let mut sons = 0u64;
+            while let Ok(t) = recebe.recv() {
+                let r = match t {
+                    Trabalho::Video(v) => c.frame(&v),
+                    Trabalho::Som(pcm, i, d) => {
+                        sons += 1;
+                        c.som(&pcm, i, d)
+                    }
+                };
+                if let Err(e) = r {
+                    eprintln!("[ecrã] o codificador queixou-se: {e:?}");
+                    break;
+                }
+            }
+            let media = c.relogio_media();
+            let s = origem.elapsed().as_secs_f64().max(0.001);
+            eprintln!(
+                "[ecrã] fim: média {media:.1}s para {s:.1}s de parede (x{:.2}), \
+                 {sons} bocados de som",
+                media / s
+            );
+            if let Err(e) = c.terminar() {
+                eprintln!("[ecrã] ao fechar: {e:?}");
+            }
+        });
+
+        // E o som, se houver. Vai pelo mesmo canal, ancorado ao mesmo relógio.
+        if formato_som.is_some() {
+            let envia_som = envia.clone();
+            crate::som::arrancar(parar.clone(), origem, move |b| {
+                let _ = envia_som.try_send(Trabalho::Som(b.pcm, b.instante, b.duracao));
+            });
+        }
+
         std::thread::spawn(move || {
             // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
             // ponteiros COM que não atravessam threads; o Alvo é só números e atravessa.
-            let flags = (lar, alt, ls, aa, fps, bitrate, parar, entrega);
+            let flags = (envia, lar, alt, parar, fps);
             // Função e não closure: os dois ramos passam tipos diferentes (Monitor e
             // Window) e uma closure fixa-se no primeiro que vê.
             fn definicoes<T: TryInto<windows_capture::settings::GraphicsCaptureItemType>>(
@@ -341,6 +419,8 @@ pub struct Qualidade {
     /// Altura máxima em pixels; 0 = nativa.
     pub max_altura: u32,
     pub fps: u32,
+    /// Se o som que sai das colunas segue com a imagem.
+    pub com_som: bool,
     /// Débito em bits por segundo; 0 = calcular a partir da resolução e do ritmo.
     /// Existe porque o upload de casa manda mais do que qualquer fórmula: quem tem
     /// 5 Mbps de subida quer poder dizer "gasta 4 e nem mais um".
