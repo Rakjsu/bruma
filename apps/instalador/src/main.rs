@@ -47,6 +47,13 @@ struct Opcoes {
     silencioso: bool,
     teste: bool,
     dir: Option<PathBuf>,
+    /// `/R` do updater: relançar a app no fim.
+    relancar: bool,
+    /// `/UPDATE`: é uma atualização, não uma primeira instalação — os atalhos que a
+    /// pessoa tenha apagado não voltam a aparecer-lhe na área de trabalho.
+    atualizacao: bool,
+    /// O que vier depois de `/ARGS`: os argumentos com que a app deve renascer.
+    args_da_app: Vec<String>,
 }
 
 fn opcoes() -> Opcoes {
@@ -65,18 +72,31 @@ fn opcoes() -> Opcoes {
         silencioso: false,
         teste: false,
         dir: None,
+        relancar: false,
+        atualizacao: false,
+        args_da_app: Vec::new(),
     };
-    for a in std::env::args().skip(1) {
+    let mut resto = std::env::args().skip(1);
+    while let Some(a) = resto.next() {
         match a.as_str() {
             "--uninstall" => o.modo = Modo::Desinstalar,
-            "/S" | "--silencioso" => o.silencioso = true,
+            // O dialeto do updater do Tauri: /P (passivo) e /S (silencioso) são, para
+            // nós, a mesma coisa — instala sem interface. /R relança a app no fim.
+            "/S" | "/P" | "--silencioso" => o.silencioso = true,
+            "/R" => o.relancar = true,
+            "/UPDATE" => o.atualizacao = true,
+            // Tudo depois de /ARGS pertence à app, não a nós. É o último a aparecer.
+            "/ARGS" => {
+                o.args_da_app = resto.collect();
+                break;
+            }
             "--teste" => o.teste = true,
             _ => {
                 if let Some(d) = a.strip_prefix("--dir=") {
                     o.dir = Some(PathBuf::from(d));
                 } else if let Some(d) = a.strip_prefix("_?=") {
-                    // Compatibilidade com quem fala NSIS: o canal de atualização pode
-                    // invocar o desinstalador antigo com esta forma.
+                    // Compatibilidade com quem fala NSIS: instalações antigas invocam o
+                    // desinstalador com esta forma.
                     o.dir = Some(PathBuf::from(d));
                 }
             }
@@ -142,30 +162,56 @@ fn sou_administrador() -> bool {
     }
 }
 
+/// Relança este exe como administrador e, se `esperar`, aguarda que ele termine.
+///
+/// A espera importa no caminho do auto-update: quem relança a app no fim tem de ser o
+/// processo NÃO elevado — uma app de conversas não tem nada que herdar privilégios de
+/// administrador. O pai fica à espera do filho elevado acabar de instalar, e é ele que
+/// abre o Bruma novo, já sem poderes nenhuns.
 #[cfg(windows)]
-fn relancar_como_administrador() -> Result<()> {
+fn relancar_como_administrador(esperar: bool) -> Result<i32> {
     use windows::core::{w, PCWSTR};
-    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
     let exe = std::env::current_exe()?;
     let exe_w: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let args_w: Vec<u16> = args.join(" ").encode_utf16().chain([0]).collect();
-    let r = unsafe {
-        ShellExecuteW(
-            None,
-            w!("runas"),
-            PCWSTR(exe_w.as_ptr()),
-            PCWSTR(args_w.as_ptr()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
+    // Argumentos com espaços voltam entre aspas, senão chegam partidos ao filho.
+    let juntos = args
+        .iter()
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let args_w: Vec<u16> = juntos.encode_utf16().chain([0]).collect();
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(exe_w.as_ptr()),
+        lpParameters: PCWSTR(args_w.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
     };
-    // ShellExecute devolve >32 em sucesso; 5 é a pessoa a recusar o UAC.
-    if r.0 as isize <= 32 {
-        return Err(anyhow!("a elevação foi recusada"));
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|_| anyhow!("a elevação foi recusada"))?;
+        if !esperar || info.hProcess.is_invalid() {
+            return Ok(0);
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut codigo = 0u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut codigo);
+        let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+        Ok(codigo as i32)
     }
-    Ok(())
 }
 
 /* ========================================================================== passos */
@@ -320,6 +366,7 @@ fn atalhos(
 fn instalar(
     destino: &Path,
     area_de_trabalho: bool,
+    atualizacao: bool,
     teste: bool,
     janela: Option<&tauri::WebviewWindow>,
 ) -> Result<()> {
@@ -330,7 +377,9 @@ fn instalar(
     }
     extrair_a_app(destino, janela)?;
     copiar_me_como_desinstalador(destino)?;
-    atalhos(destino, area_de_trabalho, teste, janela)?;
+    // Numa atualização não se recria o atalho da área de trabalho: se a pessoa o apagou,
+    // apagado fica — reaparecer a cada versão é dos hábitos mais irritantes que há.
+    atalhos(destino, area_de_trabalho && !atualizacao, teste, janela)?;
     if !teste {
         avisar(janela, "a registar a instalação");
         escrever_registo(destino)?;
@@ -402,6 +451,26 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
     Ok(())
 }
 
+/// Abre o Bruma tal como estamos: usado pelo processo NÃO elevado depois da instalação.
+fn abrir_a_app(destino: &Path, args: &[String]) {
+    let _ = std::process::Command::new(destino.join("bruma.exe"))
+        .args(args)
+        // cwd fixo na pasta da instalação: herdar o de quem invocou o updater faria a
+        // app procurar a pasta `dados` em sítios diferentes conforme o dia.
+        .current_dir(destino)
+        .spawn();
+}
+
+/// Abre o Bruma a partir de um processo elevado, largando os privilégios pelo caminho.
+/// O explorer não passa argumentos — é o preço deste atalho, e a app não usa nenhuns.
+fn abrir_a_app_sem_privilegios(destino: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(destino.join("bruma.exe"))
+        .creation_flags(0x0800_0000)
+        .spawn();
+}
+
 /* ========================================================================== comandos */
 
 struct Estado {
@@ -459,6 +528,7 @@ fn correr_instalacao(
     instalar(
         &PathBuf::from(dir),
         atalho,
+        estado.opcoes.atualizacao,
         estado.opcoes.teste,
         Some(&janela),
     )
@@ -511,28 +581,41 @@ fn main() {
     if o.silencioso {
         let destino = o.dir.clone().unwrap_or_else(|| destino_por_omissao(o.modo));
         if !o.teste && !sou_administrador() {
-            match relancar_como_administrador() {
-                Ok(()) => return,
+            // O pai (não elevado) espera pelo filho elevado e é ELE que relança a app —
+            // de propósito, para o Bruma novo nascer sem privilégios de administrador.
+            match relancar_como_administrador(true) {
+                Ok(0) => {
+                    if o.relancar {
+                        abrir_a_app(&destino, &o.args_da_app);
+                    }
+                    return;
+                }
+                Ok(codigo) => std::process::exit(codigo),
                 Err(_) => std::process::exit(1),
             }
         }
         let r = match o.modo {
-            Modo::Instalar => instalar(&destino, true, o.teste, None),
+            Modo::Instalar => instalar(&destino, true, o.atualizacao, o.teste, None),
             Modo::Desinstalar => desinstalar(&destino, false, o.teste),
         };
         if let Err(e) = r {
             eprintln!("[instalador] falhou: {e:#}");
             std::process::exit(1);
         }
+        // Já elevados e sem pai à espera (--teste, ou alguém correu-nos já como admin):
+        // relança-se daqui na mesma, que é melhor do que não relançar de todo.
+        if o.relancar && o.teste {
+            abrir_a_app(&destino, &o.args_da_app);
+        } else if o.relancar && sou_administrador() && o.dir.is_none() {
+            abrir_a_app_sem_privilegios(&destino);
+        }
         return;
     }
 
     // Com interface: eleva primeiro, para os botões poderem cumprir o que prometem.
     if !o.teste && !sou_administrador() {
-        match relancar_como_administrador() {
-            Ok(()) => return,
-            Err(_) => return, // a pessoa recusou o UAC; não há nada a fazer sem ele
-        }
+        let _ = relancar_como_administrador(false);
+        return; // elevado ou recusado, este processo já não tem papel
     }
 
     tauri::Builder::default()

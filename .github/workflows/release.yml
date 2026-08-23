@@ -33,15 +33,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Bruma ${{ github.ref_name }}"
           releaseBody: |
-            **Descarrega o `Instalar-Bruma.exe`** — e o instalador do Bruma, com a cara
-            do Bruma. Instala em Arquivos de Programas e pede administrador uma vez.
+            **Descarrega o `Instalar-Bruma.exe`** — e o unico instalador: o mesmo que
+            instala e o mesmo que o auto-update usa. Arquivos de Programas, com pedido
+            de administrador.
 
             > O Windows vai avisar que o editor e desconhecido — o instalador nao tem
             > assinatura de codigo comercial. *Mais informacoes* → *Executar mesmo assim*.
             > A assinatura que existe e a do auto-update, que garante que uma atualizacao
             > veio mesmo daqui e nao de outro sitio.
-
-            O `Bruma_x.y.z_x64-setup.exe` e o veiculo do auto-update; nao precisas dele.
           releaseDraft: false
           # NAO pode ser prerelease. O endpoint do updater aponta para
           # /releases/latest/download/latest.json, e o "latest" do GitHub IGNORA
@@ -53,11 +52,45 @@ jobs:
       # O instalador proprio, construido DEPOIS da app: o build.rs dele embute o
       # bruma.exe de release que o passo acima acabou de compilar. Se trocarem a ordem,
       # ou o payload sai vazio (e o instalador recusa-se a instalar), ou sai velho.
-      - name: Instalador proprio
+      #
+      # E e tambem o VEICULO DO AUTO-UPDATE: assina-se com a mesma chave minisign,
+      # reescreve-se o latest.json para apontar para ele, e os artefactos NSIS saem da
+      # release -- o updater das versoes antigas le o latest.json novo e corre o nosso
+      # exe com /P /R /UPDATE /ARGS, o dialeto que ele implementa. Um instalador so,
+      # para descarregar e para atualizar.
+      - name: Instalador proprio (download e auto-update)
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
           cargo build -p instalador --release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item target/release/instalador.exe Instalar-Bruma.exe
-          gh release upload ${{ github.ref_name }} Instalar-Bruma.exe --clobber
+
+          # A assinatura le a chave das MESMAS variaveis de ambiente que o tauri-action.
+          npx --yes "@tauri-apps/cli@^2" signer sign Instalar-Bruma.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $tag = '${{ github.ref_name }}'
+          $ver = $tag.TrimStart('v')
+          $sig = (Get-Content Instalar-Bruma.exe.sig -Raw).Trim()
+          $data = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          @{
+            version = $ver
+            notes = "Bruma $ver"
+            pub_date = $data
+            platforms = @{ 'windows-x86_64' = @{
+              signature = $sig
+              url = "https://github.com/Rakjsu/bruma/releases/download/$tag/Instalar-Bruma.exe"
+            } }
+          } | ConvertTo-Json -Depth 5 | Out-File latest.json -Encoding ascii
+
+          gh release upload $tag Instalar-Bruma.exe Instalar-Bruma.exe.sig latest.json --clobber
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          # O NSIS reformou-se: sai da pagina para ninguem o descarregar por engano.
+          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe" --yes
+          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe.sig" --yes
