@@ -219,6 +219,64 @@ mod win {
         }
     }
 
+    /// Quem está a tocar, agora, e com que volume. Diagnóstico: quando sai som das
+    /// colunas e ninguém sabe de onde, é isto que responde — o Windows guarda uma sessão
+    /// de áudio por processo, com o pico de cada uma.
+    pub fn quem_toca() -> Result<()> {
+        use windows::core::Interface;
+        use windows::Win32::Media::Audio::{IAudioSessionControl2, IAudioSessionManager2};
+        use windows::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let enumerador: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let dispositivo = enumerador.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            let gestor: IAudioSessionManager2 = dispositivo.Activate(CLSCTX_ALL, None)?;
+            let sessoes = gestor.GetSessionEnumerator()?;
+            let n = sessoes.GetCount()?;
+            println!("[som] {n} sessões de áudio no dispositivo de saída:");
+            for i in 0..n {
+                let Ok(s) = sessoes.GetSession(i) else {
+                    continue;
+                };
+                let Ok(s2) = s.cast::<IAudioSessionControl2>() else {
+                    continue;
+                };
+                let pid = s2.GetProcessId().unwrap_or(0);
+                let activa = s.GetState().map(|e| e.0).unwrap_or(0);
+                let mut nome = String::from("?");
+                if pid != 0 {
+                    if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                        let mut buf = [0u16; 260];
+                        let mut tam = buf.len() as u32;
+                        if QueryFullProcessImageNameW(
+                            h,
+                            PROCESS_NAME_FORMAT(0),
+                            windows::core::PWSTR(buf.as_mut_ptr()),
+                            &mut tam,
+                        )
+                        .is_ok()
+                        {
+                            nome = String::from_utf16_lossy(&buf[..tam as usize]);
+                        }
+                        let _ = windows::Win32::Foundation::CloseHandle(h);
+                    }
+                }
+                // estado 1 = a tocar agora; 0 = inactiva; 2 = terminada
+                let estado = match activa {
+                    1 => "A TOCAR",
+                    0 => "parada ",
+                    _ => "morta  ",
+                };
+                println!("  {estado} pid {pid:<7} {nome}");
+            }
+            Ok(())
+        }
+    }
+
     /// Só para medir: capta durante `segundos` e diz o que ouviu.
     pub fn medir(segundos: u64) -> Result<()> {
         let parar = Arc::new(AtomicBool::new(false));
@@ -302,7 +360,7 @@ mod win {
     }
 }
 
-pub use win::{captar, formato, medir};
+pub use win::{captar, formato, medir, quem_toca};
 
 /// Lança a captura numa thread própria, ancorada em `origem`.
 pub fn arrancar(

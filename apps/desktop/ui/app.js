@@ -470,6 +470,274 @@ function pararDeEnviarVoz() {
   envio = null;
 }
 
+/* ==========================================================================
+   A câmara.
+
+   Vai pelo caminho da voz — codificada aqui, com WebCodecs — e não pelo do ecrã, que é
+   captado em Rust. A razão é a barra: o `getDisplayMedia` faz o WebView2 desenhar "está a
+   partilhar", e foi por isso que o ecrã teve de sair do navegador. O `getUserMedia` de uma
+   CÂMARA não faz isso — é só para captura de ecrã. Portanto a câmara pode ficar aqui, onde
+   já existe tudo o que ela precisa: abrir dispositivos, codificar e desenhar.
+
+   E há uma segunda razão, mais forte: o ecrã é UM de cada vez e enche o painel; as câmaras
+   são VÁRIAS ao mesmo tempo. Descodificar N fluxos em paralelo é coisa que o navegador faz
+   sozinho e que teria de ser reescrita à mão do outro lado.
+   ========================================================================== */
+
+const CAM_LARGURA = 640;
+const CAM_ALTURA = 360;
+const CAM_IPS = 24;
+const CAM_DEBITO = 400_000;      // 400 kbps chega para uma cara a 360p
+/** De quanto em quanto tempo se manda um frame COMPLETO.
+ *
+ *  Os outros frames só descrevem o que mudou desde o anterior, portanto quem chega a meio
+ *  não consegue descodificar nada até vir um completo. Dois segundos é o compromisso: mais
+ *  curto gasta upload à toa, mais longo deixa quem entra a olhar para um quadrado preto.
+ */
+const CAM_CHAVE_MS = 2000;
+
+let camaraEnvio = null;
+
+/** Uma câmara desenhada por nós, para o teste de par.
+ *
+ *  Existe porque a máquina onde isto se desenvolve não tem câmara nenhuma — só uma virtual
+ *  do OBS, que não arranca sem o OBS aberto. Sem uma fonte destas, o caminho da câmara
+ *  entre duas instâncias ficava por provar à espera de hardware, que é a pior razão para
+ *  deixar código por verificar.
+ *
+ *  O quadrado ANDA de propósito: uma imagem parada comprime para quase nada e provaria
+ *  pouco — o que interessa é que saiam bytes a sério e cheguem inteiros ao outro lado.
+ */
+function camaraDesenhada() {
+  const tela = document.createElement('canvas');
+  tela.width = CAM_LARGURA;
+  tela.height = CAM_ALTURA;
+  const pincel = tela.getContext('2d');
+  let x = 0;
+  const pintar = () => {
+    pincel.fillStyle = '#101418';
+    pincel.fillRect(0, 0, tela.width, tela.height);
+    pincel.fillStyle = '#7fd4c1';
+    pincel.fillRect(x % (tela.width - 60), 40 + (x % 200), 60, 60);
+    x += 11;
+  };
+  const relogio = setInterval(pintar, 1000 / CAM_IPS);
+  pintar();
+  const stream = tela.captureStream(CAM_IPS);
+  stream.__parar = () => clearInterval(relogio);
+  return stream;
+}
+
+/** Quem está na sala, para lhe mandar a imagem. Vazia significa que nada sai da máquina. */
+function gentePresente() {
+  return [...voz.presentes.entries()].filter(([, c]) => c === voz.canal).map(([p]) => p);
+}
+
+async function comecarAEnviarCamara(fonte = null) {
+  pararDeEnviarCamara();
+  if (typeof VideoEncoder === 'undefined' || typeof MediaStreamTrackProcessor === 'undefined') {
+    throw new Error('esta versão do WebView2 não traz o codificador de vídeo');
+  }
+  const stream = fonte || await navigator.mediaDevices.getUserMedia({
+    video: { width: CAM_LARGURA, height: CAM_ALTURA, frameRate: CAM_IPS },
+    audio: false,
+  });
+  const faixa = stream.getVideoTracks()[0];
+  if (!faixa) { stream.getTracks().forEach(t => t.stop()); throw new Error('sem câmara'); }
+
+  let ultimaChave = 0;
+  const codificador = new VideoEncoder({
+    output: pedaco => {
+      const gente = gentePresente();
+      if (!gente.length) return;
+      const bytes = new Uint8Array(pedaco.byteLength);
+      pedaco.copyTo(bytes);
+      invoke('enviar_camara', {
+        para: gente, servidor: voz.servidor, canal: voz.canal, dados: [...bytes],
+      }).catch(() => {});
+    },
+    error: e => console.warn('o codificador da câmara parou:', e),
+  });
+  codificador.configure({
+    codec: 'avc1.42001f',            // Baseline 3.1 — o que qualquer máquina descodifica
+    width: CAM_LARGURA,
+    height: CAM_ALTURA,
+    framerate: CAM_IPS,
+    bitrate: CAM_DEBITO,
+    latencyMode: 'realtime',
+    // `annexb` e não `avc`: em annexb cada pedaço traz os seus próprios parâmetros e
+    // descodifica-se sozinho. Em `avc` os parâmetros vão UMA vez, fora da banda, e quem
+    // entrasse a meio da chamada nunca mais os via — o mesmo problema que o `tfdt`
+    // resolveu no ecrã, e a mesma lição: numa transmissão, cada pedaço tem de se bastar.
+    avc: { format: 'annexb' },
+  });
+
+  const leitor = new MediaStreamTrackProcessor({ track: faixa }).readable.getReader();
+  camaraEnvio = { codificador, leitor, faixa, stream, vivo: true };
+
+  (async () => {
+    while (camaraEnvio && camaraEnvio.vivo) {
+      const { value, done } = await leitor.read().catch(() => ({ done: true }));
+      if (done) break;
+      if (codificador.state === 'configured') {
+        const agora = performance.now();
+        const chave = agora - ultimaChave >= CAM_CHAVE_MS;
+        if (chave) ultimaChave = agora;
+        // Se a fila cresce, o codificador não está a acompanhar. Largar o frame é melhor
+        // do que o acumular: numa chamada ao vivo o que interessa é o presente.
+        if (codificador.encodeQueueSize < 3) {
+          try { codificador.encode(value, { keyFrame: chave }); } catch (e) { /* o próximo vai */ }
+        }
+      }
+      value.close();
+    }
+  })();
+
+  voz.camara = stream;
+  return stream;
+}
+
+function pararDeEnviarCamara() {
+  if (!camaraEnvio) return;
+  camaraEnvio.vivo = false;
+  try { camaraEnvio.leitor.cancel(); } catch (e) { /* já fechado */ }
+  try {
+    if (camaraEnvio.codificador.state !== 'closed') camaraEnvio.codificador.close();
+  } catch (e) { /* idem */ }
+  // A luz da câmara só se apaga quando a faixa PARA. Deixar o stream vivo com o
+  // codificador fechado seria a pior das combinações: não sai nada e a luz fica acesa.
+  try { camaraEnvio.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* idem */ }
+  try { if (camaraEnvio.stream.__parar) camaraEnvio.stream.__parar(); } catch (e) { /* idem */ }
+  camaraEnvio = null;
+  voz.camara = null;
+}
+
+/* --- receber a câmara dos outros ------------------------------------------- */
+
+/** Um descodificador por pessoa, e um <video> que se reaproveita entre redesenhos. */
+const camarasRecebidas = new Map();
+
+function camaraDe(chave) {
+  let c = camarasRecebidas.get(chave);
+  if (c) return c;
+
+  const tela = document.createElement('canvas');
+  tela.className = 'tile__video';
+  tela.width = CAM_LARGURA;
+  tela.height = CAM_ALTURA;
+  const pincel = tela.getContext('2d');
+
+  c = { tela, pincel, descodificador: null, frames: 0, esperaChave: true };
+  c.descodificador = new VideoDecoder({
+    output: quadro => {
+      c.frames += 1;
+      if (tela.width !== quadro.displayWidth || tela.height !== quadro.displayHeight) {
+        tela.width = quadro.displayWidth;
+        tela.height = quadro.displayHeight;
+      }
+      try { pincel.drawImage(quadro, 0, 0, tela.width, tela.height); } catch (e) { /* segue */ }
+      quadro.close();
+    },
+    error: e => {
+      console.warn('descodificador da câmara de', chave, e);
+      // Um erro deixa o descodificador inutilizável: exige-se um frame completo antes de
+      // se lhe voltar a dar seja o que for, senão entra num ciclo de queixas.
+      c.esperaChave = true;
+    },
+  });
+  c.descodificador.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+  camarasRecebidas.set(chave, c);
+  return c;
+}
+
+(function ligarEntradaDeCamara() {
+  if (!window.__TAURI__) return;
+  const canal = new window.__TAURI__.core.Channel();
+  canal.onmessage = pedaco => {
+    const bytes = new Uint8Array(pedaco);
+    if (!bytes.length) return;
+    const n = bytes[0];
+    if (bytes.length < 1 + n) return;
+    const chave = new TextDecoder().decode(bytes.subarray(1, 1 + n));
+    const corpo = bytes.subarray(1 + n);
+    const c = camaraDe(chave);
+    if (c.descodificador.state !== 'configured') return;
+
+    // Em annexb, um frame completo traz o SPS (nal 7) à frente. Quem chega a meio tem de
+    // esperar por um; dar-lhe um frame de diferenças é pedir imagem partida.
+    const completo = temSPS(corpo);
+    if (c.esperaChave) {
+      if (!completo) return;
+      c.esperaChave = false;
+    }
+    const primeiro = c.frames === 0;
+    try {
+      c.descodificador.decode(new EncodedVideoChunk({
+        type: completo ? 'key' : 'delta',
+        timestamp: performance.now() * 1000,
+        data: corpo,
+      }));
+    } catch (e) {
+      c.esperaChave = true;
+      return;
+    }
+    if (primeiro) desenharVoz();   // o painel só sabe que há imagem depois do primeiro
+  };
+  invoke('receber_camara', { canal }).catch(() => {});
+})();
+
+/** Se este pedaço traz um SPS — ou seja, se é um frame que se descodifica sozinho.
+ *
+ *  Procura-se o código de início (00 00 01) e olha-se para os 5 bits baixos do byte
+ *  seguinte: 7 é SPS. É mais barato e mais fiável do que confiar no que o codificador
+ *  disse, porque o que chega ao outro lado são só bytes.
+ */
+function temSPS(bytes) {
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+      const tipo = bytes[i + 3] & 0x1f;
+      if (tipo === 7) return true;
+      if (tipo === 1 || tipo === 5) return tipo === 5;
+    }
+  }
+  return false;
+}
+
+/** Quem desligou a câmara deixa de ter descodificador. Não é só arrumação: um
+ *  descodificador aberto continua a segurar memória de vídeo, e numa sala onde as pessoas
+ *  vão ligando e desligando isso só cresce. */
+/** A própria imagem, sem passar pela rede.
+ *
+ *  Espelhada, como em toda a gente: a pessoa está a ver-se a si, e ver-se ao contrário do
+ *  espelho do quarto é desconcertante. Quem recebe vê a imagem na posição certa — a
+ *  inversão é só local, no CSS.
+ */
+let espelho = null;
+function meuEspelho() {
+  if (!voz.camara) {
+    if (espelho) { espelho.srcObject = null; espelho = null; }
+    return null;
+  }
+  if (!espelho) {
+    espelho = document.createElement('video');
+    espelho.className = 'tile__video tile__video--espelho';
+    espelho.autoplay = true;
+    espelho.muted = true;      // é a nossa própria câmara; não tem som e não se ouve
+    espelho.playsInline = true;
+  }
+  if (espelho.srcObject !== voz.camara) espelho.srcObject = voz.camara;
+  return espelho;
+}
+
+function fecharCamaraRecebida(chave) {
+  const c = camarasRecebidas.get(chave);
+  if (!c) return;
+  try {
+    if (c.descodificador.state !== 'closed') c.descodificador.close();
+  } catch (e) { /* já fechado */ }
+  camarasRecebidas.delete(chave);
+}
+
 /* --- receber --------------------------------------------------------------- */
 
 function vozDe(chave) {
@@ -794,6 +1062,7 @@ const voz = {
   falando: new Set(),    // quem está a emitir som agora
   silenciados: new Set(),// pessoas silenciadas uma a uma
   aPartilhar: new Set(), // quem está a transmitir o ecrã
+  comCamara: new Set(),  // quem tem a câmara ligada
   aVer: null,            // de quem estou a ver a transmissão
   aSerVistoPor: new Set(), // quem pediu para ver o MEU ecrã — só a esses se envia
   vejoMeuEcra: null,       // o <video> da minha própria transmissão, só enquanto olho
@@ -887,6 +1156,10 @@ async function entrarEmVoz(servidor, canal) {
 }
 
 async function sairDeVoz(anunciar = true) {
+  // A câmara desliga-se ao sair, sempre. Deixar a luz acesa depois de sair da chamada era
+  // a pior falha de confiança que esta app podia ter.
+  pararDeEnviarCamara();
+  for (const chave of [...camarasRecebidas.keys()]) fecharCamaraRecebida(chave);
   if (anunciar && voz.canal) {
     await invoke('presenca_de_voz', { servidor: voz.servidor, canal: null }).catch(() => {});
   }
@@ -899,6 +1172,7 @@ async function sairDeVoz(anunciar = true) {
   for (const chave of [...voz.analisadores.keys()]) pararDeVigiar(chave);
   voz.falando.clear();
   voz.aPartilhar.clear();
+  voz.comCamara.clear();
   voz.aVer = null;
   voz.micro = null; voz.ecra = null;
   voz.canal = null;
@@ -930,6 +1204,12 @@ async function receberSinal(de, dados) {
     } else {
       voz.aPartilhar.delete(de);
       fecharFluxoRecebido(de);
+    }
+    if (dados.camara) {
+      voz.comCamara.add(de);
+    } else {
+      voz.comCamara.delete(de);
+      fecharCamaraRecebida(de);
     }
     if (voz.aVer === de && !dados.ecra) voz.aVer = null;
     desenharVoz();
@@ -1344,7 +1624,7 @@ function painelDeVoz(chave, opcoes = {}) {
 
   const transmite = voz.aPartilhar.has(chave) || (chave === voz.eu && !!voz.ecra);
   const aVer = opcoes.aVer;
-  const temVideo = false;   // a câmara ainda não voltou — ver a nota no botão
+  const temVideo = voz.comCamara.has(chave) || (chave === voz.eu && !!voz.camara);
 
   if (transmite && !aVer) {
     // Enquanto não se carrega em Assistir, não se descodifica nada: poupa CPU de quem
@@ -1368,6 +1648,11 @@ function painelDeVoz(chave, opcoes = {}) {
     const el = ecraDe(chave);
     if (el) t.append(el);
     else t.append(elemento('div', 'tile__sem-video', 'à espera da imagem…'));
+  } else if (temVideo) {
+    // A câmara ganha ao avatar mas perde para a transmissão: quem está a mostrar o ecrã
+    // está a mostrá-lo por alguma razão, e a cara cabe no painel de quem não está.
+    const el = chave === voz.eu ? meuEspelho() : camaraDe(chave).tela;
+    if (el) t.append(el);
   } else {
     const sem = elemento('div', 'tile__sem-video');
     const av = elemento('span', 'ident');
@@ -1711,8 +1996,9 @@ async function desenharRodape() {
     $('#ligacao-sinal').classList.toggle('is-fraco', !q.ok);
 
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
-    $('#btn-camara').disabled = true;
-    $('#btn-camara').title = 'A câmara volta quando passar pelo mesmo caminho do ecrã';
+    $('#btn-camara').disabled = false;
+    $('#btn-camara').classList.toggle('is-on', !!voz.camara);
+    $('#btn-camara').title = voz.camara ? 'Desligar a câmara' : 'Ligar a câmara';
     $('#btn-ruido').classList.toggle('is-cortado', !ruidoSuprimido);
     $('#btn-ruido').title = ruidoSuprimido
       ? 'Supressão de ruído ligada'
@@ -1767,11 +2053,30 @@ $('#btn-ruido').onclick = async () => {
 $('#btn-desligar').onclick = () => sairDeVoz();
 $('#btn-partilhar').onclick = () => alternarEcra();
 
-/* A câmara está de fora por agora, e prefere-se dizê-lo a deixá-la meia a funcionar.
-   Ela era a única coisa que ainda usava WebRTC, e o WebRTC precisa de servidores de
-   ligação configurados à mão — exatamente o que se acabou de eliminar da voz e do ecrã.
-   Mantê-lo vivo por causa de um botão era carregar o problema todo de volta. Volta pelo
-   mesmo caminho dos outros: codificada aqui e enviada pelo iroh. */
+$('#btn-camara').onclick = async () => {
+  if (voz.camara) {
+    pararDeEnviarCamara();
+    anunciarEstado();
+    desenharVoz();
+    desenharRodape();
+    return;
+  }
+  try {
+    await comecarAEnviarCamara();
+  } catch (e) {
+    // Recusar a permissão é uma resposta, não uma avaria. Mas tem de SE VER: um aviso só
+    // na consola é o mesmo que não haver aviso nenhum para quem carregou no botão.
+    console.warn('a câmara não abriu:', e);
+    const b = $('#btn-camara');
+    b.classList.add('is-cortado');
+    b.title = `A câmara não abriu: ${e && e.message ? e.message : e}`;
+    return;
+  }
+  $('#btn-camara').classList.remove('is-cortado');
+  anunciarEstado();
+  desenharVoz();
+  desenharRodape();
+};
 
 // A ligação muda de qualidade sozinha; o rodapé acompanha.
 setInterval(() => { if (voz.canal) desenharRodape(); }, 3000);
@@ -1879,7 +2184,7 @@ addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
 function anunciarEstado() {
   for (const [peer, c] of voz.presentes) {
     if (c !== voz.canal) continue;
-    sinalizar(peer, { tipo: 'estado', ecra: !!voz.ecra, camara: false });
+    sinalizar(peer, { tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara });
   }
 }
 
@@ -1977,6 +2282,150 @@ function pararDeAssistir() {
     + ` AudioDecoder=${await pergunta(window.AudioDecoder)}`
     + ` MediaStreamTrackProcessor=${typeof window.MediaStreamTrackProcessor === 'undefined' ? 'não existe' : 'existe'}`
     + ` AudioWorklet=${typeof AudioWorkletNode === 'undefined' ? 'não existe' : 'existe'}`);
+})();
+
+/* ---------- autoteste da câmara -------------------------------------------- */
+
+/* Prova o caminho da câmara SEM rede e SEM segunda máquina: abre a câmara (ou, se não
+   houver nenhuma, uma tela desenhada por nós), codifica, e mete os pedaços num
+   descodificador de verdade. É a mesma ideia do teste de par — verificar cada metade não
+   verifica o meio — aplicada ao codec: o que interessa não é "o codificador aceitou a
+   configuração", é "saíram bytes que um descodificador conseguiu transformar em imagem".
+
+   O caso sem câmara não é um atalho: prova a codificação e a descodificação em qualquer
+   máquina, incluindo as do CI, onde câmara não há nenhuma. */
+(async () => {
+  if (!window.__TAURI__) return;
+  if (!(await invoke('autoteste_pedido').catch(() => 0))) return;
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+
+  diz('autoteste câmara: a começar');
+  if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined') {
+    return diz('autoteste câmara: esta webview não traz VideoEncoder/VideoDecoder');
+  }
+
+  /** Um pedido que DESISTE. Sem isto, uma permissão que nunca é respondida deixa o teste
+   *  pendurado para sempre — e um teste pendurado parece-se com um teste que não corre. */
+  const comPrazo = (promessa, ms, oque) => Promise.race([
+    promessa,
+    new Promise((_, mal) => setTimeout(() => mal(new Error(`${oque} não respondeu em ${ms} ms`)), ms)),
+  ]);
+
+  let fonte = 'câmara';
+  let faixa = null;
+  let parar = () => {};
+  try {
+    const dispositivos = await comPrazo(
+      navigator.mediaDevices.enumerateDevices(), 4000, 'enumerateDevices');
+    const camaras = dispositivos.filter(d => d.kind === 'videoinput');
+    diz(`autoteste câmara: ${camaras.length} dispositivo(s): `
+      + camaras.map(c => `"${c.label || 'sem nome'}"`).join(', '));
+    if (!camaras.length) throw new Error('nenhuma');
+    // Duas tentativas, e a diferença entre elas é diagnóstico: se a apertada falha e a
+    // solta passa, o problema é a resolução pedida; se falham as duas, é o dispositivo.
+    let stream;
+    try {
+      stream = await comPrazo(navigator.mediaDevices.getUserMedia({
+        video: { width: CAM_LARGURA, height: CAM_ALTURA, frameRate: CAM_IPS }, audio: false,
+      }), 6000, 'getUserMedia');
+    } catch (apertado) {
+      diz(`autoteste câmara: com 640x360 falhou (${apertado.message}); a tentar sem exigências`);
+      stream = await comPrazo(
+        navigator.mediaDevices.getUserMedia({ video: true, audio: false }), 6000, 'getUserMedia');
+    }
+    faixa = stream.getVideoTracks()[0];
+    parar = () => stream.getTracks().forEach(t => t.stop());
+    diz(`autoteste câmara: ${camaras.length} dispositivo(s); a usar "${camaras[0].label || 'sem nome'}"`);
+  } catch (e) {
+    // Sem câmara desenha-se uma: um quadrado que ANDA, porque uma imagem parada
+    // comprimiria para quase nada e não provaria que o codificador está a trabalhar.
+    fonte = 'tela desenhada';
+    const tela = document.createElement('canvas');
+    tela.width = CAM_LARGURA; tela.height = CAM_ALTURA;
+    const pincel = tela.getContext('2d');
+    let x = 0;
+    const pintar = () => {
+      pincel.fillStyle = '#101418';
+      pincel.fillRect(0, 0, tela.width, tela.height);
+      pincel.fillStyle = '#7fd4c1';
+      pincel.fillRect(x % (tela.width - 60), 40 + (x % 200), 60, 60);
+      x += 11;
+    };
+    const relogio = setInterval(pintar, 1000 / CAM_IPS);
+    pintar();
+    const stream = tela.captureStream(CAM_IPS);
+    faixa = stream.getVideoTracks()[0];
+    parar = () => { clearInterval(relogio); stream.getTracks().forEach(t => t.stop()); };
+    diz(`autoteste câmara: sem dispositivo (${e.message}); a usar uma tela desenhada`);
+  }
+
+  let codificados = 0, bytes = 0, chaves = 0, desenhados = 0, erros = 0;
+  let larguraVista = 0, alturaVista = 0;
+
+  const descodificador = new VideoDecoder({
+    output: q => {
+      desenhados += 1;
+      larguraVista = q.displayWidth; alturaVista = q.displayHeight;
+      q.close();
+    },
+    error: e => { erros += 1; console.warn('autoteste câmara, descodificador:', e); },
+  });
+  descodificador.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+
+  let esperaChave = true;
+  const codificador = new VideoEncoder({
+    output: pedaco => {
+      codificados += 1;
+      const b = new Uint8Array(pedaco.byteLength);
+      pedaco.copyTo(b);
+      bytes += b.length;
+      // O MESMO teste que o caminho real usa, e de propósito: se o `temSPS` estiver
+      // errado, este autoteste tem de falhar aqui e não deixar o erro para a chamada.
+      const completo = temSPS(b);
+      if (completo) chaves += 1;
+      if (esperaChave) {
+        if (!completo) return;
+        esperaChave = false;
+      }
+      try {
+        descodificador.decode(new EncodedVideoChunk({
+          type: completo ? 'key' : 'delta',
+          timestamp: codificados * 1000,
+          data: b,
+        }));
+      } catch (e) { erros += 1; }
+    },
+    error: e => { erros += 1; console.warn('autoteste câmara, codificador:', e); },
+  });
+  codificador.configure({
+    codec: 'avc1.42001f', width: CAM_LARGURA, height: CAM_ALTURA,
+    framerate: CAM_IPS, bitrate: CAM_DEBITO, latencyMode: 'realtime',
+    avc: { format: 'annexb' },
+  });
+
+  const leitor = new MediaStreamTrackProcessor({ track: faixa }).readable.getReader();
+  const ate = performance.now() + 4000;
+  let lidos = 0, ultimaChave = 0;
+  while (performance.now() < ate) {
+    const { value, done } = await leitor.read().catch(() => ({ done: true }));
+    if (done) break;
+    lidos += 1;
+    const agora = performance.now();
+    const chave = agora - ultimaChave >= CAM_CHAVE_MS;
+    if (chave) ultimaChave = agora;
+    try { codificador.encode(value, { keyFrame: chave }); } catch (e) { erros += 1; }
+    value.close();
+  }
+  try { await codificador.flush(); } catch (e) { /* segue */ }
+  await new Promise(r => setTimeout(r, 400));
+  try { leitor.cancel(); } catch (e) { /* idem */ }
+  parar();
+  try { codificador.close(); } catch (e) { /* idem */ }
+  try { descodificador.close(); } catch (e) { /* idem */ }
+
+  diz(`autoteste câmara (${fonte}): ${lidos} lidos, ${codificados} codificados`
+    + ` (${(bytes / 1024).toFixed(0)} KB, ${chaves} completos),`
+    + ` ${desenhados} DESCODIFICADOS a ${larguraVista}x${alturaVista}, ${erros} erros`);
 })();
 
 /* ---------- autoteste da partilha de ecrã ---------------------------------- */
@@ -2195,6 +2644,17 @@ function pararDeAssistir() {
     await entrarEmVoz(servidorId, canal.id);
     diz(`par entrou na sala (microfone=${voz.micro ? 'sim' : 'não'})`);
 
+    // As DUAS instâncias ligam a câmara. Ao contrário do ecrã, que é um de cada vez, as
+    // câmaras são simultâneas — e é precisamente aí que mora o bug que uma instância
+    // sozinha nunca mostra: cada lado tem de descodificar o outro enquanto codifica o seu.
+    try {
+      await comecarAEnviarCamara(camaraDesenhada());
+      anunciarEstado();
+      diz(`par câmara ligada=${!!voz.camara}`);
+    } catch (e) {
+      diz(`par câmara NÃO ligou: ${e && e.message ? e.message : e}`);
+    }
+
     // O anfitrião parte o ecrã; o convidado vai assistir. É o caminho que dá sentido ao
     // projeto e o único que nunca tinha sido visto entre dois pares.
     if (modo === '') {
@@ -2215,8 +2675,13 @@ function pararDeAssistir() {
         `${e.peer.slice(0, 6)} ${e.relay ? 'relay' : 'direta'} ↑${e.enviados} ↓${e.recebidos}`
       ).join(' | ');
       const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
+      // O que interessa na câmara é o mesmo que interessa no ecrã: não "chegaram bytes",
+      // mas "saiu imagem". `frames` conta o que o descodificador DESENHOU.
+      const cams = [...camarasRecebidas.entries()]
+        .map(([k, c]) => `${k.slice(0, 6)} ${c.frames} frames`).join(' | ');
       diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
-        + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`);
+        + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`
+        + ` | câmaras: ${cams || 'nenhuma'} (anunciadas: ${voz.comCamara.size})`);
 
       // O anfitrião olha para o próprio ecrã A MEIO da transmissão — o cenário exato do
       // bug do ecrã preto: quem começa a ver tarde precisa do cabeçalho reenviado.

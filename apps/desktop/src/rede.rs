@@ -68,6 +68,10 @@ pub enum Saida {
     /// varios a ver, isto passa por todas as sessoes e so uma o quer -- copiar cem
     /// kilobytes em cada uma delas seria pagar a difusao que estamos a evitar.
     Video {
+        /// `"ecra"` ou `"camara"`. Vão pelo mesmo caminho porque são a mesma coisa —
+        /// bytes de vídeo com um destino — e separá-los em dois transportes seria manter
+        /// duas versões do mesmo código para ganhar nada.
+        tipo: &'static str,
         para: String,
         servidor: String,
         canal: String,
@@ -221,6 +225,26 @@ impl Rede {
     pub fn enviar_video(&self, para: &[String], servidor: &str, canal: &str, dados: Arc<Vec<u8>>) {
         for p in para {
             let _ = self.tx.send(Saida::Video {
+                tipo: "ecra",
+                para: p.clone(),
+                servidor: servidor.to_string(),
+                canal: canal.to_string(),
+                dados: dados.clone(),
+            });
+        }
+    }
+
+    /// A câmara, pelo mesmo caminho do ecrã.
+    ///
+    /// Podia ir em datagramas, como a voz, mas não vai — e a razão é o tamanho. Um pedaço
+    /// de voz tem umas dezenas de bytes e cabe num datagrama; um frame-chave de câmara tem
+    /// dezenas de KILObytes e teria de ser partido em vinte, com reconstrução do outro
+    /// lado e um frame inteiro perdido por cada pedaço que faltasse. Num stream fiável isso
+    /// não existe. O preço é o bloqueio de cabeça de linha, que a este débito não se nota.
+    pub fn enviar_camara(&self, para: &[String], servidor: &str, canal: &str, dados: Arc<Vec<u8>>) {
+        for p in para {
+            let _ = self.tx.send(Saida::Video {
+                tipo: "camara",
                 para: p.clone(),
                 servidor: servidor.to_string(),
                 canal: canal.to_string(),
@@ -350,6 +374,7 @@ async fn sessao(
                 // JSON de numeros, que para cem kilobytes de ecra e absurdo. Vai por um
                 // canal proprio, em bruto.
                 Ok(Quadro::Video {
+                    tipo,
                     servidor,
                     canal,
                     dados,
@@ -357,7 +382,11 @@ async fn sessao(
                     if let Ok(mut n) = rede_leitura.contagem.lock() {
                         n.entry(peer_leitura.clone()).or_default().ecra_rec += 1;
                     }
-                    crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
+                    if tipo == "camara" {
+                        crate::comandos::camara_recebida(&peer_leitura, dados);
+                    } else {
+                        crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
+                    }
                 }
                 Ok(Quadro::Controlo(Msg::Ola { nome })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
@@ -422,11 +451,16 @@ async fn sessao(
                             Some(Quadro::Controlo(Msg::Sinal { servidor, canal, dados }))
                         }
                         Saida::Sinal { .. } => None,
-                        Saida::Video { para, servidor, canal, dados } if para == peer => {
+                        Saida::Video { tipo, para, servidor, canal, dados } if para == peer => {
                             if let Ok(mut n) = rede.contagem.lock() {
                                 n.entry(peer.clone()).or_default().ecra_env += 1;
                             }
-                            Some(Quadro::Video { servidor, canal, dados: dados.as_ref().clone() })
+                            Some(Quadro::Video {
+                                tipo: tipo.to_string(),
+                                servidor,
+                                canal,
+                                dados: dados.as_ref().clone(),
+                            })
                         }
                         Saida::Video { .. } => None,
                     };
@@ -493,6 +527,7 @@ fn aplicar(
 pub enum Quadro {
     Controlo(Msg),
     Video {
+        tipo: String,
         servidor: String,
         canal: String,
         dados: Vec<u8>,
@@ -503,6 +538,15 @@ pub enum Quadro {
 struct CabecalhoVideo {
     servidor: String,
     canal: String,
+    /// `serde(default)` de propósito: uma versão anterior não escreve este campo, e sem o
+    /// `default` a mensagem dela deixaria de ser entendida. Quem envia sem dizer o que é,
+    /// está a enviar ecrã — era a única coisa que existia.
+    #[serde(default = "ecra")]
+    tipo: String,
+}
+
+fn ecra() -> String {
+    "ecra".into()
 }
 
 const TIPO_CONTROLO: u8 = 0;
@@ -520,6 +564,7 @@ async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
             v
         }
         Quadro::Video {
+            tipo,
             servidor,
             canal,
             dados,
@@ -527,6 +572,7 @@ async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
             let cab = serde_json::to_vec(&CabecalhoVideo {
                 servidor: servidor.clone(),
                 canal: canal.clone(),
+                tipo: tipo.clone(),
             })?;
             let mut v = Vec::with_capacity(3 + cab.len() + dados.len());
             v.push(TIPO_VIDEO);
@@ -579,6 +625,7 @@ async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
             }
             let cab: CabecalhoVideo = serde_json::from_slice(&corpo[3..fim])?;
             Ok(Quadro::Video {
+                tipo: cab.tipo,
                 servidor: cab.servidor,
                 canal: cab.canal,
                 dados: corpo[fim..].to_vec(),

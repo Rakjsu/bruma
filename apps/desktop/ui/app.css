@@ -881,6 +881,13 @@ body.ghost .app { transition: filter .8s var(--ease); }
 }
 .tile.is-speaking { border-color: var(--mint); box-shadow: 0 0 0 1px var(--mint); }
 .tile video { width: 100%; height: 100%; object-fit: contain; background: #05070a; }
+/* A câmara dos outros vem para uma tela, não para um <video>: os pedaços chegam soltos e
+   são desenhados um a um. `cover` e não `contain` porque uma cara centrada fica melhor a
+   preencher o painel do que com duas barras pretas aos lados. */
+.tile canvas.tile__video { width: 100%; height: 100%; object-fit: cover; background: #05070a; }
+/* A própria imagem vai espelhada — é o que toda a gente espera de se ver a si. Quem
+   recebe vê-a na posição certa; a inversão fica só aqui. */
+.tile__video--espelho { transform: scaleX(-1); object-fit: cover !important; }
 .tile__nome {
   position: absolute; left: 10px; bottom: 8px;
   background: rgba(6, 9, 12, .78);

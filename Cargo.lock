@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bruma"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -582,6 +582,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tokio",
+ "webview2-com",
  "windows 0.62.2",
  "windows-capture",
  "windows-core 0.62.2",

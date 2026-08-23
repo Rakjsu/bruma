@@ -417,6 +417,63 @@ pub fn receber_ecra(canal: Channel<InvokeResponseBody>, ecra: State<Arc<Ecra>>) 
     *ecra.entrada.lock().unwrap() = Some(canal);
 }
 
+/* ==========================================================================
+A câmara.
+
+Vai pelo mesmo transporte do ecrã e é codificada onde a voz é codificada — na interface,
+com WebCodecs. A escolha tem uma razão: ao contrário do ecrã, que é um de cada vez, as
+câmaras são VÁRIAS ao mesmo tempo, e é o navegador que já sabe abrir dispositivos,
+descodificar em paralelo e desenhar. Trazer isso para Rust era reescrever o que já existe.
+
+E há uma diferença que importa para a privacidade: o `getUserMedia` de uma câmara não faz
+o WebView2 desenhar a barra "está a partilhar" — essa é só para captura de ECRÃ. Foi por
+causa dela que o ecrã teve de sair do navegador; a câmara pode ficar.
+========================================================================== */
+
+/// Onde a câmara dos outros entra. Separado do ecrã porque são coisas diferentes na
+/// interface: o ecrã é um só e enche o painel; as câmaras são muitas e são pequenas.
+#[tauri::command]
+pub fn receber_camara(canal: Channel<InvokeResponseBody>, camara: State<Arc<Camara>>) {
+    *camara.entrada.lock().unwrap() = Some(canal);
+}
+
+#[derive(Default)]
+pub struct Camara {
+    pub entrada: SyncMutex<Option<Channel<InvokeResponseBody>>>,
+}
+
+pub static CAMARA: std::sync::OnceLock<Arc<Camara>> = std::sync::OnceLock::new();
+
+/// Manda um pedaço de câmara a quem está na sala.
+///
+/// Como na voz, é a interface que diz a quem — é ela que sabe quem está na chamada, e
+/// duplicar essa lista no Rust seria ter duas versões da mesma verdade.
+#[tauri::command]
+pub fn enviar_camara(
+    para: Vec<String>,
+    servidor: String,
+    canal: String,
+    dados: Vec<u8>,
+    rede: State<Arc<Rede>>,
+) {
+    rede.enviar_camara(&para, &servidor, &canal, Arc::new(dados));
+}
+
+/// Chamado pela camada de rede a cada pedaço de câmara que chega.
+pub fn camara_recebida(peer: &str, dados: Vec<u8>) {
+    let Some(camara) = CAMARA.get() else { return };
+    let Some(canal) = camara.entrada.lock().unwrap().clone() else {
+        return;
+    };
+    let chave = peer.as_bytes();
+    let n = chave.len().min(255);
+    let mut corpo = Vec::with_capacity(1 + n + dados.len());
+    corpo.push(n as u8);
+    corpo.extend_from_slice(&chave[..n]);
+    corpo.extend_from_slice(&dados);
+    let _ = canal.send(InvokeResponseBody::Raw(corpo));
+}
+
 #[tauri::command]
 // Oito argumentos porque um comando Tauri recebe os campos do invoke um a um; agrupar
 // em struct só empurrava a contagem para outro sítio sem tornar nada mais claro.

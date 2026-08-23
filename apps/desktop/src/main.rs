@@ -19,6 +19,67 @@ mod som;
 use std::sync::Arc;
 use tauri::Manager;
 
+/// Responde aos pedidos de permissão do WebView2 para a câmara e o microfone.
+///
+/// # Porque é que isto tem de existir
+///
+/// O `wry` regista um tratador de permissões — mas só para a área de transferência. Para a
+/// câmara e o microfone não regista nenhum, e um pedido sem quem lhe responda **fica
+/// pendurado para sempre**: o `getUserMedia` nunca resolve nem rejeita. Medido: com uma
+/// câmara presente e a funcionar, o pedido não respondeu em 6 segundos, e não ia responder
+/// aos 6 minutos.
+///
+/// O microfone parecia estar bem, e não estava — estava só a aproveitar uma autorização
+/// que este WebView2 tinha guardada de uma sessão antiga. Numa máquina onde ninguém tenha
+/// autorizado nada, a voz teria falhado exactamente da mesma maneira, em silêncio, e o
+/// sintoma seria "o Bruma não tem som" numa casa e não na outra. É por isso que os DOIS
+/// entram aqui, e não só a câmara que deu o erro.
+///
+/// Autorizar sem perguntar é o certo neste sítio: a pergunta já foi feita — a pessoa
+/// carregou no botão da câmara ou entrou numa chamada. Uma segunda caixa a perguntar o
+/// mesmo não acrescenta escolha nenhuma, e o Windows já mostra o indicador de câmara e
+/// microfone em uso na barra de tarefas, que é onde uma garantia dessas se deve ver.
+#[cfg(windows)]
+fn responder_a_permissoes(janela: &tauri::WebviewWindow) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+        COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+    };
+    use webview2_com::PermissionRequestedEventHandler;
+
+    let r = janela.with_webview(|w| unsafe {
+        let controlador = w.controller();
+        let Ok(nucleo) = controlador.CoreWebView2() else {
+            eprintln!("[permissões] sem acesso ao WebView2; a câmara pode não abrir");
+            return;
+        };
+        let mut token = 0i64;
+        let resultado = nucleo.add_PermissionRequested(
+            &PermissionRequestedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut tipo = COREWEBVIEW2_PERMISSION_KIND::default();
+                args.PermissionKind(&mut tipo)?;
+                if tipo == COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                    || tipo == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                {
+                    args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+                }
+                Ok(())
+            })),
+            &mut token,
+        );
+        if let Err(e) = resultado {
+            eprintln!("[permissões] não consegui responder aos pedidos: {e:?}");
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("[permissões] a janela não deixou chegar ao WebView2: {e:?}");
+    }
+}
+
+#[cfg(not(windows))]
+fn responder_a_permissoes(_janela: &tauri::WebviewWindow) {}
+
 fn main() {
     // `bruma --que-jogo` responde o que o detetor vê neste momento e sai. A deteção é um
     // palpite sobre as janelas abertas, portanto quando alguém disser "apareceu-me a coisa
@@ -34,9 +95,10 @@ fn main() {
         return;
     }
 
-    // `bruma --fontes` despeja o que o seletor de partilha mostraria, com as miniaturas,
-    // para %TEMP%ruma-fontes.json. Serve para inspecionar o menu sem abrir a app —
-    // e foi como se provou que os BMP desenhados à mão renderizam mesmo num <img>.
+    // `bruma --ouvir=5` capta o som que sai das colunas durante cinco segundos e diz o que
+    // ouviu: ritmo, canais, pico e volume médio. Foi assim que se provou que o silêncio tem
+    // de ser fabricado — em loopback, quando nada toca o Windows não entrega silêncio,
+    // não entrega NADA.
     if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--ouvir=").map(str::to_owned)) {
         let s: u64 = n.parse().unwrap_or(6);
         if let Err(e) = som::medir(s) {
@@ -44,6 +106,17 @@ fn main() {
         }
         return;
     }
+    // `bruma --quem-toca` diz que processos estão a produzir som agora. Nasceu de uma
+    // pergunta prática — "de onde vem este som?" — e responde-a em duas linhas.
+    if std::env::args().any(|a| a == "--quem-toca") {
+        if let Err(e) = som::quem_toca() {
+            eprintln!("[som] {e:?}");
+        }
+        return;
+    }
+    // `bruma --fontes` despeja o que o seletor de partilha mostraria, com as miniaturas,
+    // para %TEMP%ruma-fontes.json. Serve para inspecionar o menu sem abrir a app —
+    // e foi como se provou que os BMP desenhados à mão renderizam mesmo num <img>.
     if std::env::args().any(|a| a == "--fontes") {
         let fontes = fontes::fontes_de_partilha();
         let destino = std::env::temp_dir().join("bruma-fontes.json");
@@ -67,7 +140,13 @@ fn main() {
             let voz = Arc::new(comandos::Voz::default());
             let _ = comandos::VOZ.set(voz.clone());
             app.manage(voz);
+            let camara = Arc::new(comandos::Camara::default());
+            let _ = comandos::CAMARA.set(camara.clone());
+            app.manage(camara);
             let janela = app.handle().clone();
+            if let Some(j) = app.get_webview_window("main") {
+                responder_a_permissoes(&j);
+            }
 
             // A rede precisa de um runtime async; o Tauri já traz um.
             let rede = tauri::async_runtime::block_on(rede::Rede::arrancar(
@@ -103,6 +182,8 @@ fn main() {
             comandos::autoteste_fps,
             comandos::autoteste_altura,
             comandos::receber_ecra,
+            comandos::receber_camara,
+            comandos::enviar_camara,
             comandos::receber_voz,
             comandos::enviar_voz,
             comandos::qualidade,
