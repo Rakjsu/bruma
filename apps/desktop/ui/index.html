@@ -299,26 +299,50 @@
     </div>
     <div class="fontes" id="lista-fontes"><p class="fontes__espera">a olhar para as janelas…</p></div>
 
-    <!-- as escolhas de qualidade, escondidas atrás da engrenagem -->
-    <div class="qualidade" id="painel-qualidade" hidden>
-      <div class="qualidade__grupo">
-        <span class="qualidade__rotulo">Resolução</span>
-        <div class="abas abas--mini" id="opcoes-altura">
-          <button class="aba" data-altura="720">720p</button>
-          <button class="aba" data-altura="1080">1080p</button>
-          <button class="aba" data-altura="1440">1440p</button>
-          <button class="aba" data-altura="0">Nativa</button>
-        </div>
+    <!-- o menu do modo de transmissão, ancorado à engrenagem -->
+    <div class="menu-trans" id="menu-transmissao" hidden>
+      <div class="menu-trans__titulo">Modo de transmissão</div>
+
+      <button class="menu-trans__linha" data-modo="jogos">
+        <span class="menu-trans__texto"><b>Jogos</b><i>vídeo mais fluido — 1440p, 60 ips</i></span>
+        <span class="radio"></span>
+      </button>
+      <button class="menu-trans__linha" data-modo="texto">
+        <span class="menu-trans__texto"><b>Partilha de texto</b><i>texto mais nítido — nativa, 15 ips</i></span>
+        <span class="radio"></span>
+      </button>
+      <button class="menu-trans__linha" data-modo="pers">
+        <span class="menu-trans__texto"><b>Personalizada</b><i id="desc-pers">1080p, 60 ips</i></span>
+        <span class="radio"></span>
+      </button>
+
+      <div class="menu-trans__sep"></div>
+
+      <button class="menu-trans__linha" data-abre="altura">
+        <span class="menu-trans__texto"><b>Resolução</b></span>
+        <span class="menu-trans__valor" id="valor-altura">1080p</span><span class="seta">›</span>
+      </button>
+      <div class="menu-trans__sub" id="sub-altura" hidden></div>
+
+      <button class="menu-trans__linha" data-abre="fps">
+        <span class="menu-trans__texto"><b>Imagens por segundo</b></span>
+        <span class="menu-trans__valor" id="valor-fps">60</span><span class="seta">›</span>
+      </button>
+      <div class="menu-trans__sub" id="sub-fps" hidden></div>
+
+      <div class="menu-trans__sep"></div>
+
+      <div class="menu-trans__linha menu-trans__linha--inerte"
+           title="O áudio do sistema ainda não segue na transmissão — quando seguir, silencia-se aqui.">
+        <span class="menu-trans__texto"><b>Silenciar áudio da transmissão</b><i>o áudio ainda não segue — em breve</i></span>
+        <input type="checkbox" disabled>
       </div>
-      <div class="qualidade__grupo">
-        <span class="qualidade__rotulo">Imagens por segundo</span>
-        <div class="abas abas--mini" id="opcoes-fps">
-          <button class="aba" data-fps="30">30</button>
-          <button class="aba" data-fps="60">60</button>
-        </div>
-      </div>
-      <p class="qualidade__nota">Mais resolução e mais imagens gastam mais do teu upload —
-        quem vê nota primeiro a fluidez, só depois a nitidez.</p>
+
+      <button class="menu-trans__linha" data-abre="debito">
+        <span class="menu-trans__texto"><b>Avançado</b><i>quanto upload gastar</i></span>
+        <span class="menu-trans__valor" id="valor-debito">auto</span><span class="seta">›</span>
+      </button>
+      <div class="menu-trans__sub" id="sub-debito" hidden></div>
     </div>
 
     <div class="caixa__acoes caixa__acoes--fontes">

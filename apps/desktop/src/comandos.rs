@@ -427,6 +427,7 @@ pub fn comecar_a_partilhar(
     fonte: String,
     altura: u32,
     fps: u32,
+    debito: u32,
     saida: Channel<InvokeResponseBody>,
     ecra: State<Arc<Ecra>>,
     rede: State<Arc<Rede>>,
@@ -475,6 +476,7 @@ pub fn comecar_a_partilhar(
     let qualidade = crate::ecra::Qualidade {
         max_altura: altura,
         fps,
+        debito,
     };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;

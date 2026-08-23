@@ -1087,54 +1087,117 @@ document.querySelectorAll('#abas-fontes .aba').forEach(a => {
 });
 $('#fechar-fontes').onclick = () => fechar('veu-fontes');
 
-/* --- a qualidade da transmissão, atrás da engrenagem ----------------------- */
+/* --- o modo de transmissão, no menu da engrenagem -------------------------- */
 
-/** O que a pessoa escolheu; sobrevive a reinícios. 1080p60 é o mesmo padrão de sempre —
- *  mudar a escolha só muda transmissões novas, nunca uma a decorrer. */
+/** A escolha guardada. Um MODO é um atalho: "jogos" e "texto" trazem os números feitos;
+ *  "pers" usa os que a pessoa afinou. Mexer num número à mão muda para "pers" sozinho,
+ *  como no Discord — escolher um valor É personalizar. */
+const MODOS = {
+  jogos: { altura: 1440, fps: 60 },
+  texto: { altura: 0, fps: 15 },
+};
+
 function qualidadeDePartilha() {
+  let q = {};
   try {
-    const q = JSON.parse(localStorage.getItem('bruma.qualidade') || '{}');
-    return { altura: Number.isFinite(q.altura) ? q.altura : 1080, fps: q.fps === 30 ? 30 : 60 };
-  } catch (e) {
-    return { altura: 1080, fps: 60 };
+    q = JSON.parse(localStorage.getItem('bruma.qualidade') || '{}');
+  } catch (e) { /* estraga-se, recomeça-se */ }
+  return {
+    modo: ['jogos', 'texto', 'pers'].includes(q.modo) ? q.modo : 'pers',
+    altura: Number.isFinite(q.altura) ? q.altura : 1080,
+    fps: [15, 30, 60].includes(q.fps) ? q.fps : 60,
+    debito: Number.isFinite(q.debito) ? q.debito : 0,
+  };
+}
+
+/** Os números que valem MESMO, resolvido o modo. O débito manual vale em qualquer modo. */
+function qualidadeEfetiva() {
+  const q = qualidadeDePartilha();
+  const base = MODOS[q.modo] || { altura: q.altura, fps: q.fps };
+  return { altura: base.altura, fps: base.fps, debito: q.debito };
+}
+
+function guardarQualidade(mudanca) {
+  const q = { ...qualidadeDePartilha(), ...mudanca };
+  localStorage.setItem('bruma.qualidade', JSON.stringify(q));
+  desenharMenuTransmissao();
+}
+
+const OPCOES_ALTURA = [[720, '720p'], [1080, '1080p'], [1440, '1440p'], [0, 'Nativa']];
+const OPCOES_FPS = [[15, '15'], [30, '30'], [60, '60']];
+const OPCOES_DEBITO = [[0, 'automático'], [3_000_000, '3 Mbps'], [6_000_000, '6 Mbps'],
+                       [10_000_000, '10 Mbps'], [16_000_000, '16 Mbps']];
+
+function rotuloDe(opcoes, valor) {
+  const par = opcoes.find(([v]) => v === valor);
+  return par ? par[1] : String(valor);
+}
+
+function desenharMenuTransmissao() {
+  const q = qualidadeDePartilha();
+  const efetiva = qualidadeEfetiva();
+
+  document.querySelectorAll('[data-modo]').forEach(l => {
+    l.classList.toggle('is-activa', l.dataset.modo === q.modo);
+  });
+  $('#desc-pers').textContent =
+    `${q.altura === 0 ? 'nativa' : q.altura + 'p'}, ${q.fps} ips`;
+  $('#valor-altura').textContent = rotuloDe(OPCOES_ALTURA, efetiva.altura);
+  $('#valor-fps').textContent = rotuloDe(OPCOES_FPS, efetiva.fps);
+  $('#valor-debito').textContent = rotuloDe(OPCOES_DEBITO, q.debito);
+
+  const nome = q.modo === 'jogos' ? 'Jogos' : q.modo === 'texto' ? 'Texto' : null;
+  $('#resumo-qualidade').textContent =
+    `${nome ? nome + ' · ' : ''}${efetiva.altura === 0 ? 'Nativa' : efetiva.altura + 'p'}`
+    + ` · ${efetiva.fps} ips${q.debito ? ' · ' + rotuloDe(OPCOES_DEBITO, q.debito) : ''}`;
+
+  const subs = [
+    ['#sub-altura', OPCOES_ALTURA, q.altura, v => guardarQualidade({ altura: v, modo: 'pers' })],
+    ['#sub-fps', OPCOES_FPS, q.fps, v => guardarQualidade({ fps: v, modo: 'pers' })],
+    ['#sub-debito', OPCOES_DEBITO, q.debito, v => guardarQualidade({ debito: v })],
+  ];
+  for (const [sel, opcoes, atual, aoEscolher] of subs) {
+    const sub = $(sel);
+    if (sub.hidden) continue;
+    sub.textContent = '';
+    for (const [valor, rotulo] of opcoes) {
+      const b = elemento('button', 'menu-trans__opcao', rotulo);
+      if (valor === atual) b.classList.add('is-activa');
+      b.onclick = () => aoEscolher(valor);
+      sub.append(b);
+    }
   }
 }
 
-function desenharQualidade() {
-  const q = qualidadeDePartilha();
-  document.querySelectorAll('#opcoes-altura .aba').forEach(b => {
-    b.classList.toggle('is-activa', Number(b.dataset.altura) === q.altura);
-  });
-  document.querySelectorAll('#opcoes-fps .aba').forEach(b => {
-    b.classList.toggle('is-activa', Number(b.dataset.fps) === q.fps);
-  });
-  $('#resumo-qualidade').textContent =
-    `${q.altura === 0 ? 'Nativa' : q.altura + 'p'} · ${q.fps} ips`;
-}
-
-$('#btn-qualidade').onclick = () => {
-  const p = $('#painel-qualidade');
-  p.hidden = !p.hidden;
-  $('#btn-qualidade').classList.toggle('is-on', !p.hidden);
-  desenharQualidade();
+$('#btn-qualidade').onclick = ev => {
+  ev.stopPropagation();
+  const m = $('#menu-transmissao');
+  m.hidden = !m.hidden;
+  $('#btn-qualidade').classList.toggle('is-on', !m.hidden);
+  if (m.hidden) document.querySelectorAll('.menu-trans__sub').forEach(s => { s.hidden = true; });
+  desenharMenuTransmissao();
 };
-document.querySelectorAll('#opcoes-altura .aba').forEach(b => {
-  b.onclick = () => {
-    const q = qualidadeDePartilha();
-    q.altura = Number(b.dataset.altura);
-    localStorage.setItem('bruma.qualidade', JSON.stringify(q));
-    desenharQualidade();
+
+document.querySelectorAll('[data-modo]').forEach(l => {
+  l.onclick = () => guardarQualidade({ modo: l.dataset.modo });
+});
+document.querySelectorAll('[data-abre]').forEach(l => {
+  l.onclick = () => {
+    const sub = $('#sub-' + l.dataset.abre);
+    sub.hidden = !sub.hidden;
+    desenharMenuTransmissao();
   };
 });
-document.querySelectorAll('#opcoes-fps .aba').forEach(b => {
-  b.onclick = () => {
-    const q = qualidadeDePartilha();
-    q.fps = Number(b.dataset.fps);
-    localStorage.setItem('bruma.qualidade', JSON.stringify(q));
-    desenharQualidade();
-  };
+// Clicar fora fecha o menu, como qualquer menu decente.
+document.addEventListener('mousedown', ev => {
+  const m = $('#menu-transmissao');
+  if (m.hidden) return;
+  if (ev.target.closest('#menu-transmissao, #btn-qualidade')) return;
+  m.hidden = true;
+  $('#btn-qualidade').classList.remove('is-on');
+  document.querySelectorAll('.menu-trans__sub').forEach(s => { s.hidden = true; });
 });
-desenharQualidade();
+desenharMenuTransmissao();
 
 async function alternarEcra() {
   if (voz.ecra) {
@@ -1163,7 +1226,7 @@ async function iniciarPartilha(fonte) {
       pedaco instanceof ArrayBuffer ? new Uint8Array(pedaco) : new Uint8Array(pedaco));
   };
 
-  const q = qualidadeDePartilha();
+  const q = qualidadeEfetiva();
   try {
     await invoke('comecar_a_partilhar', {
       servidor: voz.servidor,
@@ -1171,6 +1234,7 @@ async function iniciarPartilha(fonte) {
       fonte,
       altura: q.altura,
       fps: q.fps,
+      debito: q.debito,
       saida: canal,
     });
   } catch (e) {
@@ -1929,7 +1993,7 @@ function pararDeAssistir() {
   try {
     const r = await invoke('comecar_a_partilhar',
       { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1',
-        altura: 720, fps: 30, saida: canal });
+        altura: 720, fps: 30, debito: 0, saida: canal });
     await invoke('ver_meu_ecra');   // a pré-visualização é gated: sem isto nada chega
     const fontes = await invoke('fontes_de_partilha').catch(() => []);
     const comImagem = fontes.filter(f => f.miniatura && f.miniatura.length > 2000).length;
@@ -2246,13 +2310,24 @@ function pararDeAssistir() {
       const n = document.querySelectorAll('.fonte').length;
       diz(`ui aba ${aba.dataset.aba}: ${n} cartoes`);
     }
-    // A engrenagem abre o painel de qualidade, e as opções estão todas lá.
+    // A engrenagem abre o MENU do modo de transmissão; percorre-se tudo.
+    // Estado conhecido primeiro: uma pessoa a mexer na janela durante a medição (já
+    // aconteceu) abre e fecha o menu debaixo dos números. Mede-se do fechado.
+    const menu = $('#menu-transmissao');
+    menu.hidden = true;
     $('#btn-qualidade').click();
-    const painel = $('#painel-qualidade');
-    diz(`ui qualidade: aberto=${!painel.hidden}`
-      + ` alturas=${document.querySelectorAll('#opcoes-altura .aba').length}`
-      + ` fps=${document.querySelectorAll('#opcoes-fps .aba').length}`
+    const r = menu.getBoundingClientRect();
+    diz(`ui menu: aberto=${!menu.hidden} ${Math.round(r.width)}x${Math.round(r.height)}`
+      + ` modos=${document.querySelectorAll('[data-modo]').length}`
       + ` resumo="${$('#resumo-qualidade').textContent}"`);
+    for (const nome of ['altura', 'fps', 'debito']) {
+      document.querySelector(`[data-abre="${nome}"]`).click();
+      diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`);
+      document.querySelector(`[data-abre="${nome}"]`).click();
+    }
+    document.querySelector('[data-modo="jogos"]').click();
+    diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+    document.querySelector('[data-modo="pers"]').click();
     $('#btn-qualidade').click();
   } else {
     diz('ui seletor: NAO ABRIU');

@@ -226,7 +226,11 @@ mod win {
         let (lar, alt) = tamanho_do_alvo(alvo)?;
         let (ls, aa) = caber(lar, alt, qualidade.max_altura);
         let fps = qualidade.fps.clamp(15, 60);
-        let bitrate = debito(ls, aa, fps);
+        let bitrate = if qualidade.debito > 0 {
+            qualidade.debito.clamp(1_000_000, 25_000_000)
+        } else {
+            debito(ls, aa, fps)
+        };
 
         std::thread::spawn(move || {
             // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
@@ -299,6 +303,10 @@ pub struct Qualidade {
     /// Altura máxima em pixels; 0 = nativa.
     pub max_altura: u32,
     pub fps: u32,
+    /// Débito em bits por segundo; 0 = calcular a partir da resolução e do ritmo.
+    /// Existe porque o upload de casa manda mais do que qualquer fórmula: quem tem
+    /// 5 Mbps de subida quer poder dizer "gasta 4 e nem mais um".
+    pub debito: u32,
 }
 
 pub fn comecar(
