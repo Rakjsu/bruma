@@ -418,6 +418,9 @@ pub fn receber_ecra(canal: Channel<InvokeResponseBody>, ecra: State<Arc<Ecra>>) 
 }
 
 #[tauri::command]
+// Oito argumentos porque um comando Tauri recebe os campos do invoke um a um; agrupar
+// em struct só empurrava a contagem para outro sítio sem tornar nada mais claro.
+#[allow(clippy::too_many_arguments)]
 pub fn comecar_a_partilhar(
     servidor: String,
     canal_voz: String,
