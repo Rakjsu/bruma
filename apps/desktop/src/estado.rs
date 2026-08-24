@@ -151,8 +151,42 @@ impl App {
         let indice = ler_indice(&raiz)?;
         let mut servidores = BTreeMap::new();
         for s in &indice.servidores {
-            let chave = hex32(&s.chave)?;
-            let log = blog::Log::load(raiz.join("servidores").join(format!("{}.json", s.id)))?;
+            // UM SERVIDOR MAU NÃO LEVA A APP COM ELE.
+            //
+            // Antes, qualquer um destes erros subia até ao `.expect()` do `main` e a app
+            // morria — e como o binário de release não tem consola, morria em SILÊNCIO: a
+            // janela abria, piscava e desaparecia. Um byte trocado num ficheiro de
+            // servidor transformava o Bruma numa app que não abre e não diz porquê, sem
+            // forma de recuperar sem ir apagar ficheiros à mão.
+            //
+            // Agora o servidor estragado fica de fora, os outros abrem, e a razão fica
+            // escrita no registo. Perder uma conversa é mau; perder a app inteira, e a
+            // possibilidade de perceber porquê, é muito pior.
+            let chave = match hex32(&s.chave) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[dados] o servidor {} tem a chave estragada ({e}); fica de fora",
+                        s.id
+                    );
+                    continue;
+                }
+            };
+            let caminho = raiz.join("servidores").join(format!("{}.json", s.id));
+            let log = match blog::Log::load(caminho.clone()) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "[dados] não consegui ler o servidor {} ({e}); fica de fora",
+                        s.id
+                    );
+                    // O ficheiro mau é posto de lado, e não apagado: pode ser a única cópia
+                    // de uma conversa, e quem souber ler JSON ainda a tira de lá. Apagá-lo
+                    // seria a app decidir sozinha deitar fora o que não conseguiu abrir.
+                    pos_de_lado(&caminho);
+                    continue;
+                }
+            };
             servidores.insert(
                 s.id.clone(),
                 Servidor {
@@ -197,12 +231,33 @@ impl App {
     }
 }
 
+/// Renomeia um ficheiro que não se conseguiu ler, para não voltar a matar o arranque.
+///
+/// Guarda-se em vez de se apagar: pode ser a única cópia de uma conversa.
+fn pos_de_lado(p: &std::path::Path) {
+    let destino = p.with_extension("json.estragado");
+    match std::fs::rename(p, &destino) {
+        Ok(()) => eprintln!("[dados] guardado como {}", destino.display()),
+        Err(e) => eprintln!("[dados] não consegui pôr de lado o ficheiro: {e}"),
+    }
+}
+
 fn ler_indice(raiz: &std::path::Path) -> Result<Indice> {
     let p = raiz.join("indice.json");
     if !p.exists() {
         return Ok(Indice::default());
     }
-    Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?)
+    match serde_json::from_str(&std::fs::read_to_string(&p)?) {
+        Ok(i) => Ok(i),
+        Err(e) => {
+            // O índice guarda o NOME e as chaves dos servidores. Sem ele não há nada para
+            // abrir — mas há uma diferença enorme entre "a app não abre" e "a app abre
+            // vazia e diz o que aconteceu". Escolhe-se a segunda.
+            eprintln!("[dados] o índice está estragado ({e}); a começar vazio");
+            pos_de_lado(&p);
+            Ok(Indice::default())
+        }
+    }
 }
 
 fn semente_ou_cria(p: &std::path::Path) -> Result<[u8; 32]> {

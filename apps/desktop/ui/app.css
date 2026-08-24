@@ -938,6 +938,10 @@ body.ghost .app { transition: filter .8s var(--ease); }
   backdrop-filter: blur(10px);
 }
 .palco__selo--vivo { color: #fff; background: #c0392b; letter-spacing: .1em; }
+/* Quando o número não é o que a pessoa escolheu, o selo diz-o com uma marca discreta —
+   e a razão inteira está no title. Âmbar porque não é um erro: é uma explicação. */
+.palco__selo--nota { color: var(--amber); cursor: help; }
+.palco__selo--nota::after { content: "?"; font-size: 9px; opacity: .8; }
 .palco__selo--vivo .ponto {
   width: 6px; height: 6px; border-radius: 50%; background: #fff;
   animation: pulsar 2s infinite;

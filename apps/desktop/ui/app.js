@@ -1105,6 +1105,12 @@ const voz = {
   infoDaTransmissao: new Map(),
   /** O tamanho com que a MINHA captura ficou mesmo, devolvido pelo Rust. */
   ecraTamanho: null,
+  /** A qualidade que está MESMO a correr, congelada quando a partilha começou.
+   *
+   *  Sem isto, o rótulo lia o menu no momento de desenhar — e quem mexesse na engrenagem a
+   *  meio via a barra a anunciar números que ninguém estava a usar. Mudar a qualidade só
+   *  vale para transmissões novas, e a barra tem de contar a mesma história. */
+  qualidadeEmUso: null,
   // Quem, do outro lado, percebe o que esta versão envia. Ver PROTOCOLO.
   entendeCamara: new Set(),
   entendeSom: new Set(),
@@ -1226,7 +1232,7 @@ async function sairDeVoz(anunciar = true) {
   voz.entendeSom.clear();
   voz.jaFalou.clear();
   voz.aVer = null;
-  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null;
+  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.qualidadeEmUso = null;
   voz.canal = null;
   desenharVoz();
   desenharRodape();
@@ -1647,7 +1653,7 @@ async function alternarEcra() {
     await invoke('parar_de_partilhar').catch(() => {});
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
-    voz.ecra = null; voz.ecraTamanho = null;
+    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
     anunciarEstado();
     desenharVoz();
     desenharRodape();
@@ -1691,6 +1697,7 @@ async function iniciarPartilha(fonte) {
   // O tamanho REAL com que a captura ficou. Com "Nativa" é a única forma de dizer a quem
   // assiste que resolução está a receber — só o Rust o soube calcular.
   voz.ecraTamanho = medido && Number.isFinite(medido.altura) ? medido : null;
+  voz.qualidadeEmUso = { altura: q.altura, fps: q.fps, debito: q.debito, som: q.som };
   voz.ecra = { fechar() {} };
   // O tamanho REAL com que a captura ficou. Com "Nativa" é a única forma de dizer a quem
   // assiste que resolução está a receber, porque só o Rust o soube calcular.
@@ -1907,7 +1914,18 @@ function palcoDeTransmissao(quem, canal, outros) {
   // --- cima à direita: qualidade, quantos veem, e o AO VIVO
   const camadaDir = elemento('div', 'palco__camada palco__cima-dir');
   const qual = qualidadeDe(quem);
-  if (qual) camadaDir.append(elemento('span', 'palco__selo', qual));
+  if (qual) {
+    const selo = elemento('span', 'palco__selo', qual);
+    // A explicação vive AQUI e não numa nota à parte: é neste número que a pessoa repara
+    // quando ele não é o que ela escolheu, e é aqui que a pergunta nasce.
+    const porque = souEu ? porqueEstaResolucao() : null;
+    selo.title = porque || 'a resolução e o ritmo desta transmissão';
+    if (porque && voz.qualidadeEmUso && voz.ecraTamanho
+        && voz.qualidadeEmUso.altura && voz.ecraTamanho.altura < voz.qualidadeEmUso.altura) {
+      selo.classList.add('palco__selo--nota');
+    }
+    camadaDir.append(selo);
+  }
   const olhos = elemento('span', 'palco__selo');
   olhos.innerHTML =
     '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor"'
@@ -2270,7 +2288,7 @@ listen('partilha-falhou', ev => {
   console.warn('a partilha falhou:', razao);
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null; voz.ecraTamanho = null;
+  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
   invoke('parar_de_partilhar').catch(() => {});
@@ -2619,13 +2637,37 @@ addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
  */
 const PROTOCOLO = 2;
 
-/** "1440p 60FPS" — como o Discord o escreve, e a partir dos números que valem mesmo. */
+/** "1440p 60FPS" — como o Discord o escreve, e a partir dos números que valem mesmo.
+ *
+ *  Mostra-se sempre o MEDIDO e não o pedido, porque é o medido que a outra pessoa recebe.
+ *  Com "Nativa" o pedido é zero, e mesmo com um número o Rust arredonda para blocos pares.
+ */
 function rotuloDaQualidade() {
-  const q = qualidadeEfetiva();
-  // Prefere-se sempre o MEDIDO ao pedido: com "Nativa" o pedido é 0, e mesmo com um número
-  // o Rust pode ter arredondado para caber em blocos pares.
+  const q = voz.qualidadeEmUso || qualidadeEfetiva();
   const alt = (voz.ecraTamanho && voz.ecraTamanho.altura) || q.altura;
   return `${alt ? alt + 'p' : 'Nativa'} ${q.fps}FPS`;
+}
+
+/** Porque é que o número não é o que a pessoa escolheu, quando não é.
+ *
+ *  A resolução do menu é um TETO, não um alvo: nunca amplia. Quem partilha uma janela de
+ *  1050 de altura e escolheu 1440p vê "1050p" e fica sem perceber se a escolha funcionou.
+ *  Devolve `null` quando não há nada a explicar.
+ */
+function porqueEstaResolucao() {
+  const q = voz.qualidadeEmUso;
+  if (!q || !voz.ecraTamanho) return null;
+  const real = voz.ecraTamanho.altura;
+  if (!q.altura) return `a fonte tem ${real} de altura e vai como está (escolheste Nativa)`;
+  if (real < q.altura) {
+    return `escolheste ${q.altura}p, mas a fonte só tem ${real} de altura — a escolha é um`
+      + ` limite, não aumenta o que não existe`;
+  }
+  // Aqui só se sabe o tamanho de SAÍDA, não o da fonte — portanto não se pode afirmar que
+  // houve redução. Dizer "foi reduzida" quando a fonte já era desse tamanho seria inventar.
+  // Uma frase vaga e sempre verdadeira vale mais do que uma precisa e às vezes falsa.
+  return `vai a ${voz.ecraTamanho.largura}x${real}, dentro do limite de ${q.altura}p que`
+    + ` escolheste`;
 }
 
 function anunciarEstado() {
@@ -3365,6 +3407,7 @@ function pararDeAssistir() {
       const antes = {
         eu: voz.eu, canal: voz.canal, servidor: voz.servidor, ecra: voz.ecra,
         aVer: voz.aVer, tam: voz.ecraTamanho, srv: servidorAtual, cnl: canalAtual,
+        qual: voz.qualidadeEmUso,
       };
       // Uma sala de voz de verdade, criada para a medição — a vista olha para o canal
       // SELECIONADO, e sem um canal de voz escolhido ela nem chega a desenhar.
@@ -3387,6 +3430,16 @@ function pararDeAssistir() {
       voz.aPartilhar.add('outro1');
       voz.infoDaTransmissao.set('outro1', { qualidade: '1080p 30FPS', espectadores: 3 });
       voz.aVer = voz.eu;
+      // Os três casos do rótulo, com estado fabricado: a fonte mais pequena que o pedido
+      // (o caso do dono), do tamanho certo, e "Nativa".
+      for (const [pedida, real, nome] of [[1440, 1050, 'fonte menor'],
+                                          [1440, 1440, 'igual'],
+                                          [0, 1200, 'nativa']]) {
+        voz.qualidadeEmUso = { altura: pedida, fps: 60, debito: 0, som: true };
+        voz.ecraTamanho = { largura: Math.round(real * 16 / 9), altura: real };
+        diz(`ui rotulo (${nome}): "${rotuloDaQualidade()}" | ${porqueEstaResolucao()}`);
+      }
+      voz.qualidadeEmUso = { altura: 1440, fps: 60, debito: 0, som: true };
       gentePorBaixoOculta = false;
       janelaComFoco = true;
       desenharVoz();
@@ -3434,7 +3487,8 @@ function pararDeAssistir() {
       voz.aPartilhar.delete('outro1');
       voz.infoDaTransmissao.delete('outro1');
       Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor,
-        ecra: antes.ecra, aVer: antes.aVer, ecraTamanho: antes.tam });
+        ecra: antes.ecra, aVer: antes.aVer, ecraTamanho: antes.tam,
+        qualidadeEmUso: antes.qual });
       servidorAtual = antes.srv; canalAtual = antes.cnl;
       desenharVoz();
     }
