@@ -125,6 +125,11 @@ mod win {
         largados: u64,
         inicio: std::time::Instant,
         fps: u32,
+        /// Diagnóstico dos intervalos entre frames: numa captura ao vivo, um intervalo
+        /// longo é uma imagem congelada do lado de quem vê.
+        ultimo_frame: Option<std::time::Instant>,
+        maior_intervalo: u64,
+        longos: u64,
     }
 
     /// O que a captura precisa de saber. Struct e não tuplo: quando isto era
@@ -166,6 +171,9 @@ mod win {
                 largados: 0,
                 inicio: std::time::Instant::now(),
                 fps,
+                ultimo_frame: None,
+                maior_intervalo: 0,
+                longos: 0,
             })
         }
 
@@ -191,10 +199,25 @@ mod win {
                     self.largados,
                     self.fps,
                 );
+                eprintln!(
+                    "[ecrã] intervalos: maior {} ms, {} acima de 400 ms",
+                    self.maior_intervalo, self.longos
+                );
                 controlo.stop();
                 return Ok(());
             }
             self.recebidos += 1;
+            {
+                let agora = std::time::Instant::now();
+                if let Some(ant) = self.ultimo_frame {
+                    let ms = agora.duration_since(ant).as_millis() as u64;
+                    self.maior_intervalo = self.maior_intervalo.max(ms);
+                    if ms > 400 {
+                        self.longos += 1;
+                    }
+                }
+                self.ultimo_frame = Some(agora);
+            }
             let (f_lar, f_alt) = (frame.width(), frame.height());
             let buf = frame.buffer()?;
             let bytes = buf.as_nopadding_buffer(&mut self.scratch);

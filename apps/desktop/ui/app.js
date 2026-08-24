@@ -1316,6 +1316,7 @@ function fluxoDePedacos() {
   const abrir = () => {
     if (buffer || !aberto || !codec) return;
     const tipo = `video/mp4; codecs="${codec}"`;
+    el.__codec = codec;
     if (!window.MediaSource || !MediaSource.isTypeSupported(tipo)) {
       console.warn('esta webview não sabe descodificar', tipo);
       return;
@@ -1345,6 +1346,49 @@ function fluxoDePedacos() {
     }
   };
 
+  /** Mantém quem vê colado ao PRESENTE.
+   *
+   *  # A avaria que isto corrige
+   *
+   *  Um `<video>` reproduz a 1× e não sabe que isto é ao vivo. Quem carrega em "Assistir"
+   *  entra pelo princípio do que já foi enviado, e a partir daí só perde terreno: chega
+   *  mais um segundo de imagem por cada segundo que passa, e o atraso NUNCA encolhe. Foi
+   *  medido: buffer com 25 segundos e o leitor em 6,62 — dezoito segundos atrás. Quem
+   *  partilha mexe o rato e o outro só vê isso vinte segundos depois; do lado de lá parece
+   *  que a partilha não está a funcionar, e no fundo está — só que no passado.
+   *
+   *  Nota-se mais num ecrã largo, porque gera mais dados e o descodificador perde terreno
+   *  mais depressa. Foi por isso que apareceu ao partilhar o ultrawide e não o 16:9.
+   *
+   *  A cura é a de qualquer leitor ao vivo: quando o atraso passa de um limite, SALTA-SE
+   *  para a frente. Salta-se em vez de acelerar porque um salto é honesto — perde-se o que
+   *  se perdeu — e acelerar a imagem e o som soa mal e nunca chega a apanhar.
+   */
+  const FOLGA = 0.6;      // o quanto se fica atrás da ponta, para não secar a cada soluço
+  const LIMITE = 2.0;     // acima disto salta-se; abaixo, deixa-se estar
+  const perseguirOVivo = () => {
+    if (!buffer || !el.buffered.length) return;
+    const ponta = el.buffered.end(el.buffered.length - 1);
+    const atraso = ponta - el.currentTime;
+    if (atraso > LIMITE) {
+      const destino = Math.max(0, ponta - FOLGA);
+      // `fastSeek` não existe em todo o lado e é aproximado; a atribuição direta é exata.
+      try { el.currentTime = destino; } catch (e) { /* o próximo tick tenta */ }
+    }
+    // E deita-se fora o passado, que ninguém vai rebobinar. Sem isto a memória do buffer
+    // cresce durante toda a chamada, e é o mesmo que a levar a rebentar devagar.
+    if (!buffer.updating && el.buffered.length) {
+      const inicio = el.buffered.start(0);
+      const corte = el.currentTime - 4;
+      if (corte > inicio + 2) {
+        try { buffer.remove(inicio, corte); } catch (e) { /* logo se vê */ }
+      }
+    }
+    // Um `<video>` que ficou sem dados a meio fica em pausa e não volta sozinho.
+    if (el.paused && el.readyState >= 2) el.play().catch(() => {});
+  };
+  const relogioDoVivo = setInterval(perseguirOVivo, 500);
+
   media.addEventListener('sourceopen', () => {
     aberto = true;
     abrir();
@@ -1369,6 +1413,7 @@ function fluxoDePedacos() {
       escoar();
     },
     fechar() {
+      clearInterval(relogioDoVivo);
       try { el.pause(); } catch (e) { /* já parado */ }
       try { URL.revokeObjectURL(el.src); } catch (e) { /* já libertado */ }
       el.removeAttribute('src');
@@ -2809,7 +2854,16 @@ function pararDeAssistir() {
     if (modo === '') {
       await esperar(3000);
       // Diretamente, sem o seletor: num teste automatico nao ha quem clique no menu.
-      await iniciarPartilha('ecra:1');
+      // O teste de par usa a qualidade REAL (a que sai do menu), para exercitar o mesmo
+      // caminho do dono. As bandeiras escrevem-na antes, para se poder variar.
+      localStorage.setItem('bruma.qualidade', JSON.stringify({
+        modo: 'pers',
+        altura: await invoke('autoteste_altura').catch(() => 1080),
+        fps: await invoke('autoteste_fps').catch(() => 30),
+        debito: 0,
+        som: true,
+      }));
+      await iniciarPartilha(await invoke('autoteste_fonte').catch(() => 'ecra:1'));
       anunciarEstado();
       diz(`par ANFITRIAO a partilhar=${!!voz.ecra}`);
     }
@@ -2846,9 +2900,23 @@ function pararDeAssistir() {
       if (voz.aVer) {
         const el = ecraDe(voz.aVer);
         const q = el && el.getVideoPlaybackQuality ? el.getVideoPlaybackQuality() : null;
+        // O buffer distingue as duas avarias que dao o mesmo readyState=2: FOME (o buffer
+        // acaba logo a seguir ao instante actual) e BURACO (ha dados a frente, mas com um
+        // vazio pelo meio que o leitor nao salta). Sem isto, ficava-se a adivinhar.
+        let faixas = '—';
+        if (el && el.buffered) {
+          faixas = [];
+          for (let i = 0; i < el.buffered.length; i++) {
+            faixas.push(`${el.buffered.start(i).toFixed(2)}-${el.buffered.end(i).toFixed(2)}`);
+          }
+          faixas = faixas.join(' , ') || 'vazio';
+        }
         diz(`par imagem: ${el ? `${el.videoWidth}x${el.videoHeight}` : 'sem <video>'}`
           + ` readyState=${el ? el.readyState : '-'}`
           + ` frames=${q ? q.totalVideoFrames : '?'}`
+          + ` t=${el ? el.currentTime.toFixed(2) : '-'}`
+          + ` buffer=[${faixas}]`
+          + ` codec=${el && el.__codec ? el.__codec : '?'}`
           + ` erro=${el && el.error ? el.error.code : 'nenhum'}`);
       }
     }
