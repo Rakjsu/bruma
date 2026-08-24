@@ -461,7 +461,22 @@ mod win {
                 }
             };
             let mut sons = 0u64;
+            // `BRUMA_CODIFICADOR_MORRE=20` faz o codificador desistir ao vigésimo frame.
+            // É a única forma de correr aqui o caminho da morte a meio — o mesmo motivo das
+            // outras bandeiras: um ramo que nunca corre é um ramo por verificar.
+            let morre_ao: u64 = std::env::var("BRUMA_CODIFICADOR_MORRE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let mut feitos = 0u64;
             while let Ok(t) = recebe.recv() {
+                feitos += 1;
+                if morre_ao > 0 && feitos >= morre_ao {
+                    queixa_codificador(
+                        "o codificador de vídeo parou a meio: morte pedida para o teste".into(),
+                    );
+                    break;
+                }
                 let r = match t {
                     Trabalho::Video(v) => {
                         na_fila_codificador.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -474,6 +489,17 @@ mod win {
                 };
                 if let Err(e) = r {
                     eprintln!("[ecrã] o codificador queixou-se: {e:?}");
+                    // A queixa TEM de subir. Quando esta thread morre, o emissor cai e o
+                    // `send` do tratador passa a falhar em silêncio, a somar `largados`
+                    // para sempre: a interface continuava a dizer "estás a partilhar" e
+                    // quem assistia via a imagem congelada, sem um único sinal.
+                    //
+                    // Os outros dois caminhos de falha desta função já chamavam `queixa` —
+                    // foi este que ficou de fora quando o tipo foi criado. A lição fica
+                    // escrita porque se repetiu: quando se inventa um mecanismo para tornar
+                    // uma falha visível, é preciso aplicá-lo a TODOS os sítios que falham
+                    // dessa maneira, e não só ao que motivou a invenção.
+                    queixa_codificador(format!("o codificador de vídeo parou a meio: {e}"));
                     break;
                 }
             }

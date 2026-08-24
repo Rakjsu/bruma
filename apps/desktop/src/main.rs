@@ -14,6 +14,7 @@ mod jogo;
 mod modelo;
 mod mse;
 mod rede;
+mod registo;
 mod som;
 
 use std::sync::Arc;
@@ -81,6 +82,11 @@ fn responder_a_permissoes(janela: &tauri::WebviewWindow) {
 fn responder_a_permissoes(_janela: &tauri::WebviewWindow) {}
 
 fn main() {
+    // A PRIMEIRA coisa: o `std` guarda o descritor de saída na primeira utilização e não
+    // volta a perguntar, portanto isto tem de acontecer antes de alguém escrever seja o
+    // que for. Ver `registo.rs`.
+    registo::arrancar();
+
     // `bruma --que-jogo` responde o que o detetor vê neste momento e sai. A deteção é um
     // palpite sobre as janelas abertas, portanto quando alguém disser "apareceu-me a coisa
     // errada na barra" isto responde sem ser preciso montar nada.
