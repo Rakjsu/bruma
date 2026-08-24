@@ -20,11 +20,20 @@ explicado.
 | Mensagens, e receber o que se perdeu | deve funcionar | vai pelo iroh |
 | **Partilha de ecrã** | deve funcionar | desde a v0.5.0 vai pelo iroh |
 | **Voz** | deve funcionar | desde a v0.6.0 vai pelo iroh |
-| Câmara | de fora por agora | era a última coisa em WebRTC; volta pelo mesmo caminho |
+| **Câmara** | deve funcionar | desde a v0.9.6 vai pelo iroh, e várias ao mesmo tempo |
+| **Som na partilha de ecrã** | deve funcionar | desde a v0.9.5; em Windows anterior ao 10 2004 vai com eco, e a app avisa |
+| Reatar depois de a rede cair | deve funcionar | desde a v0.10.3 religa sozinho, com recuo |
 
 **Não há nada para configurar.** Até à v0.5.2 a voz ia por WebRTC e precisava de um
 servidor STUN ou TURN colado à mão nas duas máquinas, ou não ligava fora da rede local.
 Deixou de precisar.
+
+**Actualizem os dois para a mesma versão antes de começar.** Desde a v0.9.8 cada lado
+anuncia o que sabe falar, e uma versão anterior a essa não percebe a câmara nem o ecrã com
+som — dá imagem partida ou ecrã preto, sem dizer porquê.
+
+**Se alguma coisa correr mal, o rasto está em `%APPDATA%\Bruma\bruma.log`**, nas duas
+máquinas. É a primeira coisa a olhar, e desde a v0.10.1 ele existe mesmo em release.
 
 Se o router não se deixar furar, a ligação passa por um relay em vez de falhar — fica mais
 lenta, e a barra da chamada diz **"por relay"** para não ser um mistério.

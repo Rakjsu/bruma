@@ -1,102 +1,117 @@
 # Bruma
 
-Um Discord P2P, anónimo e cifrado ponta a ponta — **sem servidor**.
+Um Discord P2P, cifrado ponta a ponta — **sem servidor**.
 
 Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves gerado no teu
-PC, e 12 palavras recuperam-na noutro lado. Não há máquina central a guardar as tuas
-mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
+PC. Não há máquina central a guardar as tuas mensagens, nem sequer cifradas: quem tem o
+histórico é quem está online.
 
-> **Estado: v0.2.0 — texto, voz e partilha de ecrã.** Entrar, criar servidor, criar canais,
-> convidar amigos, conversar, e entrar em salas de voz com partilha de ecrã.
+> **Estado: v0.10.4 — texto, voz, partilha de ecrã com som, e câmara.**
 >
-> ⚠️ **A voz e o ecrã só ligam na mesma rede local sem configuração extra.** Para funcionar
-> entre casas é preciso um servidor TURN — configura-o em *botão direito → Servidores de
-> ligação*. O chat funciona em qualquer caso, porque usa o iroh e não o WebRTC.
+> Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
+> a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
+> precisar. Se o router não se deixar furar, a ligação passa por um relay em vez de falhar —
+> mais lenta, e a barra da chamada di-lo.
+>
+> É software novo, escrito para duas pessoas o usarem. Funciona, mas não teve os anos de
+> uso que apanham os casos raros.
 
 ## Instalar
 
 Descarrega o instalador da [última versão](https://github.com/Rakjsu/bruma/releases/latest).
+O ficheiro é o **`Instalar-Bruma.exe`** — o mesmo que instala à mão e que a app usa para se
+actualizar.
 
-O Windows vai avisar que o editor é desconhecido — o instalador não tem assinatura de código
-comercial. *Mais informações* → *Executar mesmo assim*. A assinatura que existe garante que uma
-**atualização** veio mesmo daqui, e é verificada pela app antes de instalar seja o que for.
+O Windows vai avisar que o editor é desconhecido: o instalador não tem assinatura de código
+comercial. *Mais informações* → *Executar mesmo assim*. A assinatura que existe garante que
+uma **actualização** veio mesmo daqui, e é verificada antes de instalar seja o que for.
 
-A partir da v0.1.1 a app avisa sozinha quando há versão nova, e nunca instala sem perguntar.
+A app avisa sozinha quando há versão nova, e nunca instala sem perguntar.
+
+**Windows 10 ou 11.** Duas coisas dependem da versão, e as duas degradam com aviso em vez
+de falhar:
+
+- **o som da partilha excluir a voz da própria chamada** precisa do Windows 10 2004 ou mais
+  recente. Sem isso, quem estiver a ouvir-te ouve-se a si próprio, e a app di-lo no botão;
+- **travar o ritmo da captura na origem** (poupa a placa gráfica) precisa do Windows 11
+  24H2. Sem isso a partilha funciona à mesma; só gasta um pouco mais.
+
+Em Windows 10, a moldura amarela à volta do que se partilha também não se consegue tirar.
 
 ## Porquê
 
 O Discord funciona muito bem e não se pretende copiá-lo por desporto. O que muda aqui é o
-modelo de confiança: ninguém precisa de dar dados para entrar, e não existe um sítio onde
-o histórico de toda a gente fique acumulado à espera de ser pedido, vendido ou roubado.
+modelo de confiança: ninguém precisa de dar dados para entrar, e não existe um sítio onde o
+histórico de toda a gente fique acumulado à espera de ser pedido, vendido ou roubado.
 
-## Como funciona, em cinco linhas
+## Como funciona
 
 - **Rede**: [`iroh`](https://github.com/n0-computer/iroh) — QUIC peer-to-peer onde se marca
-  por chave pública, não por IP. Hole-punch direto quando dá, relay quando não dá.
-- **Identidade**: uma chave Ed25519 é ao mesmo tempo o teu ID e o teu endereço de rede.
-- **Mensagens**: log append-only, assinado e encadeado por hash. O conteúdo é opaco.
-- **Estado mutável** (canais, cargos, membros, reações): CRDT, desencriptado só localmente.
-- **Voz e ecrã**: WebRTC mesh, com SFU opcional para grupos maiores.
+  por chave pública, não por IP. Hole-punch directo quando dá, relay quando não dá.
+- **Identidade**: uma semente de 32 bytes dá a chave Ed25519 que é ao mesmo tempo o teu ID e
+  o teu endereço de rede.
+- **Mensagens**: log append-only, assinado e encadeado por hash, com relógio lógico híbrido
+  para não depender de os relógios das máquinas estarem certos. O conteúdo é opaco.
+- **Cifra**: XChaCha20-Poly1305 com nonce por mensagem; assinatura Ed25519 sobre o BLAKE3 de
+  cada entrada, verificada ao receber **e** ao ler do disco.
+- **Voz**: Opus codificado na interface, em datagramas pelo iroh — um pacote perdido não
+  atrasa os seguintes.
+- **Ecrã**: captado e codificado em H.264 pelo Windows (Media Foundation + a placa gráfica),
+  com o som do sistema em AAC na mesma faixa, e traduzido para o dialecto que o navegador
+  aceita. Só se envia a quem carregou em «Assistir».
+- **Câmara**: H.264 pela interface, várias ao mesmo tempo, pelo mesmo transporte do ecrã.
 
-O plano completo, com as decisões e — mais importante — as limitações que assume, está em
-[`docs/PLANO.md`](docs/PLANO.md).
+## O que o Bruma **não** faz
+
+Isto está aqui à frente de propósito, porque prometer demais em privacidade é como estes
+projectos morrem.
+
+- **Não há cópia de segurança da identidade.** A tua chave são 32 bytes em
+  `%APPDATA%\Bruma\identidade.key`. Se apagares essa pasta, **ninguém — nem tu — recupera a
+  identidade**. Copiar o ficheiro à mão funciona; um botão para o fazer ainda não existe.
+- **O convite é um segredo, e é eterno.** Ele carrega a chave que decifra o servidor.
+  Trata-o como uma password: quem o tiver entra e lê o histórico todo. **Não expira e não se
+  revoga** — e por isso não há forma de expulsar ninguém.
+- **Não há cargos nem permissões.** Qualquer membro pode criar e apagar canais.
+- **A chave do servidor nunca roda.** Sem isso não há *forward secrecy*: quem obtiver a
+  chave lê o passado e o futuro.
+- **O `indice.json`, ao lado do histórico cifrado, guarda as chaves em texto simples.** Quem
+  tiver acesso à tua pasta de dados lê tudo. A cifra protege o que sai pela rede, não o que
+  está no teu disco.
+- **Numa chamada, quem está do outro lado pode ver o teu IP** quando a ligação é directa —
+  que é o caso normal e o desejável, porque é o mais rápido. Por relay não vê.
+- **O relay vê metadados**: que chaves falam entre si, quando e quanto. Nunca vê conteúdo.
+- **Se ninguém do canal estiver online, não há sincronização.** É o preço de não haver
+  servidor.
+- **Não é anonimato de rede.** Para isso precisas de VPN ou Tor por baixo.
+- **Não há anexos, imagens, editar, apagar, reacções, respostas, markdown, notificações nem
+  não-lidas.** Só texto simples, uma linha de cada vez.
+
+## Espreitar por dentro
+
+A app deixa rasto em `%APPDATA%\Bruma\bruma.log` — é por aí que se começa quando alguma
+coisa corre mal. Há também bandeiras de diagnóstico:
+
+```bash
+bruma --ouvir=5      # que som sai das colunas, e se a captura exclui a própria app
+bruma --quem-toca    # que processos estão a produzir som agora
+bruma --fontes       # o que o seletor de partilha mostraria, com as miniaturas
+bruma --que-jogo     # o que o detector de jogos vê neste momento
+```
 
 ## Spikes
 
-| Spike | Pergunta que responde | Estado |
+O projecto começou por responder às perguntas que podiam matá-lo, antes de escrever produto.
+O código vive em [`spikes/`](spikes/) e as respostas em [`docs/PLANO.md`](docs/PLANO.md).
+
+| Spike | Pergunta | Resposta |
 |---|---|---|
-| [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | código pronto, [à espera do teste real](docs/TESTE-COM-AMIGO.md) |
-| [2 · ecrã](spikes/spike2-screen/) | Dá para partilhar ecrã com áudio dentro do Tauri, e a que custo? | **passa** — com picker, 4K@60; mas AV1 por software e sem ganho do contentHint |
-| [3 · fantasma](spikes/spike3-ghost/) | Dá para sincronizar chat por `.onion` sem tor externo? | **bloqueado** — o arranque do Tor não conclui |
+| [1 · rede](spikes/spike1-net/) | Dois PCs em casas diferentes falam sem servidor? | é a base de tudo o que existe hoje — mas **entre duas casas a sério ainda não foi provado** |
+| [2 · ecrã](spikes/spike2-screen/) | Dá para partilhar ecrã dentro do Tauri, e a que custo? | dá, mas o navegador desenha uma barra que não sai e codifica por software — por isso a captura passou a ser nativa |
+| [3 · fantasma](spikes/spike3-ghost/) | Dá para sincronizar chat por `.onion` sem tor externo? | **bloqueado** — o arranque do Tor não conclui. Não existe na app |
 
-O Spike 1 vem primeiro de propósito: se a resposta for não, a arquitetura inteira muda e
-tudo o resto seria trabalho deitado fora.
-
-## Correr o Spike 1
-
-Precisas de **duas máquinas em redes diferentes** — duas VMs em tua casa dão falso positivo.
-
-```bash
-cargo run -p spike1-net -- --name ana
-```
-
-Instruções completas e como ler o resultado: [`spikes/spike1-net/README.md`](spikes/spike1-net/README.md).
-Para o teste que interessa mesmo — duas casas, duas redes — segue
-[`docs/TESTE-COM-AMIGO.md`](docs/TESTE-COM-AMIGO.md); do outro lado basta um executável, sem
-instalar nada.
-
-## Correr o Spike 2
-
-```bash
-cargo run -p spike2-screen
-```
-
-Abre a aplicação. O diagnóstico da partilha de ecrã vive no canal `#diagnóstico`, e mede o bitrate
-real do encoder por codec e por `contentHint`.
-Detalhes em [`spikes/spike2-screen/README.md`](spikes/spike2-screen/README.md).
-
-## Correr o Spike 3
-
-```bash
-cargo run -p spike3-ghost -- --name ana
-```
-
-Arranca um cliente Tor embutido e publica um onion service — sem daemon externo e sem abrir portas
-no router. Detalhes em [`spikes/spike3-ghost/README.md`](spikes/spike3-ghost/README.md).
-
-## O que o Bruma não faz
-
-Isto está aqui à frente de propósito, porque prometer demais em privacidade é como estes
-projetos morrem:
-
-- **Numa chamada de voz em mesh, os participantes veem o teu IP.** O WebRTC faz o seu
-  próprio NAT traversal. Esconder isso exige um relay TURN ou o SFU opcional.
-- **O relay vê metadados** — que chaves falam entre si, quando e quanto. Nunca vê conteúdo.
-- **Se ninguém do canal estiver online, não há sincronização.** É o preço de não haver servidor.
-- **Um "ban" é criptográfico, não imposto.** Quem sai deixa de conseguir decifrar o que vier
-  a seguir, mas continua a ter o que já tinha.
-- **Não é anonimato de rede.** Para isso precisas de VPN ou Tor por baixo. O Modo Fantasma
-  cobre o chat, mas desliga voz e ecrã — o Tor só transporta TCP.
+O [teste entre duas casas](docs/TESTE-COM-AMIGO.md) é o que decide o projecto, e duas
+máquinas na mesma casa não o substituem.
 
 ## Licença
 
