@@ -20,6 +20,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # A ETIQUETA TEM DE BATER CERTO COM A VERSAO DA APP.
+      #
+      # O latest.json e escrito a partir da etiqueta; a versao que a app diz de si vem do
+      # tauri.conf.json. Se divergirem, o updater anuncia uma versao, instala, a app arranca
+      # a dizer outra, e o updater volta a ver a nova disponivel: CICLO DE ATUALIZACAO
+      # INFINITO em todas as maquinas instaladas -- e nada, ate agora, o apanhava.
+      - name: A etiqueta bate certo com a versao?
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $app = (Get-Content apps/desktop/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne $app) {
+            Write-Error "a etiqueta diz $tag e o tauri.conf.json diz $app; corrige um dos dois antes de publicar"
+            exit 1
+          }
+          "etiqueta e versao batem certo: $app"
+
+      # OS TESTES CORREM ANTES DE PUBLICAR.
+      #
+      # Ate aqui o release nao consultava o CI: uma etiqueta num commit que falhasse os
+      # testes ou o clippy publicava a mesma, porque so o `cargo build` era exercitado.
+      - name: Portoes
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
       - name: Compilar, assinar e publicar
         uses: tauri-apps/tauri-action@v0
         env:

@@ -3201,7 +3201,24 @@ function pararDeAssistir() {
       // de "vê-se imagem".
       if (modo !== '' && !voz.aVer) {
         const quem = [...voz.aPartilhar][0];
-        if (quem) { assistir(quem); diz(`par CONVIDADO a assistir a ${quem.slice(0, 6)}`); }
+        if (quem) {
+          const t0 = performance.now();
+          assistir(quem);
+          diz(`par CONVIDADO a assistir a ${quem.slice(0, 6)}`);
+          // Quanto tempo até APARECER imagem. É o número que o frame-chave fixo melhora:
+          // sem ele, dependia da placa gráfica de quem partilha e não era determinável.
+          (async () => {
+            for (let i = 0; i < 300; i++) {
+              const el = ecraDe(quem);
+              const q = el && el.getVideoPlaybackQuality ? el.getVideoPlaybackQuality() : null;
+              if (q && q.totalVideoFrames > 0) {
+                return diz(`par PRIMEIRA IMAGEM em ${Math.round(performance.now() - t0)} ms`);
+              }
+              await esperar(100);
+            }
+            diz('par PRIMEIRA IMAGEM: nunca chegou em 30 s');
+          })();
+        }
       }
       if (voz.aVer) {
         const el = ecraDe(voz.aVer);

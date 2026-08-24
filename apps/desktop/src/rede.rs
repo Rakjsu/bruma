@@ -153,23 +153,13 @@ impl Rede {
             });
         }
 
-        // Reatar com os peers já conhecidos, sem precisar do convite outra vez.
+        // Reatar com os peers já conhecidos, sem precisar do convite outra vez — e
+        // continuar a tentar enquanto a app viver. Ver `vigiar_ligacoes`.
         {
             let rede = rede.clone();
             let app = app.clone();
             let janela = janela.clone();
-            tokio::spawn(async move {
-                let conhecidos: Vec<String> = {
-                    let s = app.servidores.lock().unwrap();
-                    let mut v: Vec<String> = s.values().flat_map(|x| x.peers.clone()).collect();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
-                for p in conhecidos {
-                    let _ = ligar(&rede, &app, &janela, &p).await;
-                }
-            });
+            tokio::spawn(async move { vigiar_ligacoes(rede, app, janela).await });
         }
 
         Ok(rede)
@@ -263,6 +253,79 @@ impl Rede {
     }
 }
 
+/// Mantém as ligações de pé, para sempre.
+///
+/// # A avaria que isto corrige
+///
+/// Antes, ligava-se aos peers conhecidos **uma vez, no arranque** — e o erro era deitado
+/// fora sem sequer um registo. Quando a ligação caía, abortavam-se as tarefas, removia-se
+/// o peer, emitia-se `peer-desligado`, e acabava. **Nunca mais se tentava.**
+///
+/// As mensagens recuperavam-se sozinhas (o log converge no próximo sync), mas a voz e o
+/// ecrã morriam de vez até alguém reiniciar a app. Numa ligação entre o Brasil e os EUA,
+/// dois segundos de Wi-Fi a falhar não são hipótese — são terça-feira.
+///
+/// # Porquê um vigia só, e não uma tentativa por queda
+///
+/// Um vigia único é simples de raciocinar e cura sozinho casos que uma tentativa por queda
+/// não cobre: a app arrancou sem rede nenhuma, o peer só apareceu mais tarde, ou a queda
+/// aconteceu antes de haver sessão. Se um dia falhar, falha de uma maneira só.
+///
+/// O recuo é exponencial por peer — de 2 até 60 segundos — e volta ao princípio assim que
+/// a ligação pega. Sem recuo, um peer desligado durante a noite dava milhares de tentativas
+/// e enchia o registo de ruído.
+async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
+    use std::collections::HashMap;
+    let mut espera: HashMap<String, u64> = HashMap::new();
+    let mut proxima: HashMap<String, std::time::Instant> = HashMap::new();
+    loop {
+        let conhecidos: Vec<String> = {
+            let Ok(s) = app.servidores.lock() else {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            };
+            let mut v: Vec<String> = s.values().flat_map(|x| x.peers.clone()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let agora = std::time::Instant::now();
+        for peer in conhecidos {
+            let ja_ligado = rede
+                .ligacoes
+                .lock()
+                .map(|l| l.contains_key(&peer))
+                .unwrap_or(false);
+            if ja_ligado {
+                // Pegou: o próximo corte volta a tentar depressa, e não daqui a um minuto.
+                espera.remove(&peer);
+                proxima.remove(&peer);
+                continue;
+            }
+            if proxima.get(&peer).is_some_and(|q| agora < *q) {
+                continue;
+            }
+            let s = espera.entry(peer.clone()).or_insert(2);
+            match ligar(&rede, &app, &janela, &peer).await {
+                Ok(()) => {
+                    eprintln!("[rede] religado a {}", &peer[..8.min(peer.len())]);
+                    espera.remove(&peer);
+                    proxima.remove(&peer);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rede] {} não atendeu ({e}); nova tentativa daqui a {s}s",
+                        &peer[..8.min(peer.len())]
+                    );
+                    proxima.insert(peer.clone(), agora + std::time::Duration::from_secs(*s));
+                    *s = (*s * 2).min(60);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &str) -> Result<()> {
     let id: EndpointId = peer
         .trim()
@@ -270,6 +333,17 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
         .map_err(|_| anyhow!("identificador de peer inválido"))?;
     if id == rede.endpoint.id() {
         bail!("esse é o teu próprio identificador");
+    }
+    // Já ligado: não se abre uma segunda. Duas sessões para o mesmo peer davam dois
+    // leitores a competir pelo mesmo `ligacoes`, e o segundo apagava o primeiro do mapa
+    // enquanto ele ainda corria.
+    if rede
+        .ligacoes
+        .lock()
+        .map(|l| l.contains_key(peer))
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
     let conn = rede
         .endpoint

@@ -419,6 +419,24 @@ impl Codificador {
             juntar64(&saida, &MF_MT_FRAME_SIZE, lar_saida, alt_saida)?;
             juntar64(&saida, &MF_MT_FRAME_RATE, fps, 1)?;
             juntar64(&saida, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
+            // Um frame COMPLETO de dois em dois segundos.
+            //
+            // # Porque é que isto tem de ser dito
+            //
+            // Os frames normais só descrevem o que mudou desde o anterior. Quem carrega em
+            // "Assistir" a meio recebe o cabeçalho guardado — mas o cabeçalho é o `ftyp` e
+            // o `moov`, que dizem QUE codec é, não o que está no ecrã. Até chegar um frame
+            // completo, o que ele tem são diferenças em relação a imagens que nunca viu:
+            // ecrã preto, ou macroblocos.
+            //
+            // E o espaçamento nunca era pedido, portanto ficava ao critério do driver — com
+            // `MF_LOW_LATENCY` ligado, pode ser longo. O tempo até a imagem aparecer
+            // dependia da placa gráfica de quem partilha, e não havia como o saber.
+            //
+            // A câmara, codificada em JS, já forçava um a cada dois segundos. O ecrã não
+            // tinha equivalente: é a diferença entre aparecer em dois segundos e aparecer
+            // quando calhar.
+            saida.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.max(1) * 2)?;
 
             // MP4 fragmentado: cabeçalho uma vez, e a seguir fragmentos independentes.
             // É isto que faz a diferença entre um ficheiro e uma transmissão.
