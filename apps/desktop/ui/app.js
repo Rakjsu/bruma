@@ -1101,6 +1101,10 @@ const voz = {
   silenciados: new Set(),// pessoas silenciadas uma a uma
   aPartilhar: new Set(), // quem está a transmitir o ecrã
   comCamara: new Set(),  // quem tem a câmara ligada
+  /** O que cada transmissor diz sobre a transmissão dele: qualidade e quantos o veem. */
+  infoDaTransmissao: new Map(),
+  /** O tamanho com que a MINHA captura ficou mesmo, devolvido pelo Rust. */
+  ecraTamanho: null,
   // Quem, do outro lado, percebe o que esta versão envia. Ver PROTOCOLO.
   entendeCamara: new Set(),
   entendeSom: new Set(),
@@ -1217,11 +1221,12 @@ async function sairDeVoz(anunciar = true) {
   voz.falando.clear();
   voz.aPartilhar.clear();
   voz.comCamara.clear();
+  voz.infoDaTransmissao.clear();
   voz.entendeCamara.clear();
   voz.entendeSom.clear();
   voz.jaFalou.clear();
   voz.aVer = null;
-  voz.micro = null; voz.ecra = null;
+  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null;
   voz.canal = null;
   desenharVoz();
   desenharRodape();
@@ -1260,6 +1265,14 @@ async function receberSinal(de, dados) {
     } else {
       voz.aPartilhar.delete(de);
       fecharFluxoRecebido(de);
+    }
+    if (dados.ecra) {
+      voz.infoDaTransmissao.set(de, {
+        qualidade: typeof dados.qualidade === 'string' ? dados.qualidade : null,
+        espectadores: Number.isFinite(dados.espectadores) ? dados.espectadores : 0,
+      });
+    } else {
+      voz.infoDaTransmissao.delete(de);
     }
     if (dados.camara) {
       voz.comCamara.add(de);
@@ -1385,7 +1398,12 @@ function fluxoDePedacos() {
       }
     }
     // Um `<video>` que ficou sem dados a meio fica em pausa e não volta sozinho.
-    if (el.paused && el.readyState >= 2) el.play().catch(() => {});
+    //
+    // Mas uma pausa PEDIDA é outra coisa. Quem partilha e muda de janela tem a
+    // pré-visualização pausada de propósito, para poupar recursos — e sem esta bandeira
+    // este relógio desfazia-a meio segundo depois. Duas correções minhas a lutar uma com a
+    // outra, e a que corre mais vezes ganhava.
+    if (el.paused && el.readyState >= 2 && !el.__pausaPedida) el.play().catch(() => {});
   };
   const relogioDoVivo = setInterval(perseguirOVivo, 500);
 
@@ -1629,7 +1647,7 @@ async function alternarEcra() {
     await invoke('parar_de_partilhar').catch(() => {});
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
-    voz.ecra = null;
+    voz.ecra = null; voz.ecraTamanho = null;
     anunciarEstado();
     desenharVoz();
     desenharRodape();
@@ -1653,8 +1671,9 @@ async function iniciarPartilha(fonte) {
   };
 
   const q = qualidadeEfetiva();
+  let medido = null;
   try {
-    await invoke('comecar_a_partilhar', {
+    medido = await invoke('comecar_a_partilhar', {
       servidor: voz.servidor,
       canalVoz: voz.canal,
       fonte,
@@ -1668,7 +1687,16 @@ async function iniciarPartilha(fonte) {
     console.warn('não consegui começar a partilhar:', e);
     return;
   }
+  // O tamanho REAL com que a captura ficou. Com "Nativa" é a única forma de dizer a quem
+  // assiste que resolução está a receber — só o Rust o soube calcular.
+  voz.ecraTamanho = medido && Number.isFinite(medido.altura) ? medido : null;
   voz.ecra = { fechar() {} };
+  // O tamanho REAL com que a captura ficou. Com "Nativa" é a única forma de dizer a quem
+  // assiste que resolução está a receber, porque só o Rust o soube calcular.
+  try {
+    const r = await invoke('capacidades', { linha: '' }).catch(() => null);
+    void r;
+  } catch (e) { /* não faz mal */ }
   anunciarEstado();
   desenharVoz();
   desenharRodape();
@@ -1802,6 +1830,217 @@ function painelDeVoz(chave, opcoes = {}) {
   return t;
 }
 
+/** Quantos, ao todo, estão a ver a transmissão de `quem` — incluindo eu. */
+function espectadoresDe(quem) {
+  if (quem === voz.eu) return voz.aSerVistoPor.size + (voz.aVer === voz.eu ? 1 : 0);
+  const i = voz.infoDaTransmissao.get(quem);
+  return i ? i.espectadores : 0;
+}
+
+function qualidadeDe(quem) {
+  if (quem === voz.eu) return rotuloDaQualidade();
+  const i = voz.infoDaTransmissao.get(quem);
+  return i && i.qualidade ? i.qualidade : null;
+}
+
+/** Se as fotinhas por baixo do palco estão escondidas. */
+let gentePorBaixoOculta = false;
+
+/** Se a janela do Bruma tem o foco — ver a pausa da pré-visualização no palco. */
+let janelaComFoco = document.hasFocus();
+window.addEventListener('focus', () => { janelaComFoco = true; if (voz.aVer) desenharVoz(); });
+window.addEventListener('blur', () => { janelaComFoco = false; if (voz.aVer) desenharVoz(); });
+
+const ICO = {
+  mic: '<path d="M10 3.2a2.1 2.1 0 0 1 2.1 2.1v4.4a2.1 2.1 0 0 1-4.2 0V5.3A2.1 2.1 0 0 1 10 3.2Z"/><path d="M5.4 9.3a4.6 4.6 0 0 0 9.2 0M10 13.9v2.9"/>',
+  camara: '<rect x="2.6" y="5.4" width="10" height="9.2" rx="2"/><path d="M12.6 9.2l4.8-2.6v6.8l-4.8-2.6Z"/>',
+  gente: '<circle cx="7.6" cy="7.4" r="2.6"/><path d="M3 16.2c0-2.5 2.1-4 4.6-4s4.6 1.5 4.6 4"/><path d="M13.4 5.2a2.4 2.4 0 0 1 0 4.5M14.4 12.6c1.7.4 2.9 1.6 2.9 3.6"/>',
+  parar: '<rect x="4.6" y="4.6" width="10.8" height="10.8" rx="2.2"/>',
+  desligar: '<path d="M4.2 8.4c3.4-2.2 8.2-2.2 11.6 0l.9 2.3-3 .5-.6-1.9c-1.9-.8-4.3-.8-6.2 0l-.6 1.9-3-.5Z"/>',
+  convidar: '<circle cx="8" cy="7.2" r="2.7"/><path d="M3.3 16c0-2.6 2.2-4.2 4.7-4.2 1 0 1.9.2 2.7.7"/><path d="M14.6 11.4v4.8M12.2 13.8h4.8"/>',
+  olho: '<circle cx="6" cy="5.6" r="2.1"/><path d="M2 13c0-2.1 1.8-3.4 4-3.4s4 1.3 4 3.4"/><path d="M11 4.4a2 2 0 0 1 0 3.8M12 10.2c1.4.3 2.4 1.3 2.4 2.9"/>',
+};
+
+/** Um botão redondo da barra flutuante. */
+function botaoDoPalco(desenho, titulo, aoClicar, opcoes) {
+  opcoes = opcoes || {};
+  const b = elemento('button', 'palco__bt' + (opcoes.classe ? ' ' + opcoes.classe : ''));
+  b.title = titulo;
+  b.setAttribute('aria-label', titulo);
+  b.innerHTML = '<svg viewBox="0 0 20 20" width="17" height="17">' + desenho + '</svg>';
+  if (opcoes.cortado) b.classList.add('is-cortado');
+  b.onclick = aoClicar;
+  return b;
+}
+
+/** O palco: a transmissão a ocupar tudo, com as camadas por cima e as fotinhas por baixo.
+ *
+ *  # Porque é que tudo flutua
+ *
+ *  Uma transmissão de 3440x1440 numa janela já é pequena; roubar-lhe barras fixas em cima
+ *  e em baixo custava mais do que aquilo que essas barras dizem. Aparecem com o rato por
+ *  cima e saem sozinhas, como em qualquer leitor a sério — e o `:focus-within` garante que
+ *  quem anda pelo teclado também lhes chega.
+ */
+function palcoDeTransmissao(quem, canal, outros) {
+  const souEu = quem === voz.eu;
+  const palco = elemento('div', 'palco');
+  const vidro = elemento('div', 'palco__vidro');
+
+  const el = ecraDe(quem);
+  if (el) vidro.append(el);
+  else vidro.append(elemento('div', 'tile__sem-video', 'à espera da imagem…'));
+
+  // --- cima à esquerda: onde estou e de quem é isto
+  const onde = elemento('div', 'palco__onde');
+  onde.append(elemento('b', null, canal ? canal.nome : 'Sala'));
+  onde.append(elemento('i', null, souEu ? 'a tua transmissão' : nomeDoPeer(quem)));
+  const camadaEsq = elemento('div', 'palco__camada palco__cima-esq');
+  // A saída. Não estava no pedido, mas sem ela fica-se preso no palco: as fotinhas de
+  // baixo levam a OUTRAS transmissões, nenhuma leva de volta à sala.
+  camadaEsq.append(botaoDoPalco(
+    '<path d="M12 4.5 6.5 10l5.5 5.5"/>', 'Voltar à sala', pararDeAssistir));
+  camadaEsq.append(onde);
+  vidro.append(camadaEsq);
+
+  // --- cima à direita: qualidade, quantos veem, e o AO VIVO
+  const camadaDir = elemento('div', 'palco__camada palco__cima-dir');
+  const qual = qualidadeDe(quem);
+  if (qual) camadaDir.append(elemento('span', 'palco__selo', qual));
+  const olhos = elemento('span', 'palco__selo');
+  olhos.innerHTML =
+    '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.4">' + ICO.olho + '</svg>';
+  olhos.append(elemento('span', null, String(espectadoresDe(quem))));
+  camadaDir.append(olhos);
+  const vivo = elemento('span', 'palco__selo palco__selo--vivo');
+  vivo.innerHTML = '<i class="ponto"></i>';
+  vivo.append(document.createTextNode('AO VIVO'));
+  camadaDir.append(vivo);
+  vidro.append(camadaDir);
+
+  // --- baixo à esquerda: convidar alguém a ver
+  const camadaConv = elemento('div', 'palco__camada palco__camada--baixo palco__baixo-esq');
+  camadaConv.append(botaoDoPalco(ICO.convidar, 'Convidar para assistir', () => {
+    // O convite é o do servidor: quem entra por ele chega à sala e vê o que está a dar.
+    $('#btn-convite').click();
+  }));
+  vidro.append(camadaConv);
+
+  // --- baixo ao meio: os controlos
+  const barra = elemento('div', 'palco__camada palco__camada--baixo palco__meio');
+  const faixaMic = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  barra.append(botaoDoPalco(
+    ICO.mic,
+    !faixaMic ? 'Sem microfone' : (faixaMic.enabled ? 'Silenciar microfone' : 'Ligar microfone'),
+    () => $('#btn-mic').click(),
+    { cortado: !!faixaMic && !faixaMic.enabled },
+  ));
+  barra.append(botaoDoPalco(
+    ICO.camara,
+    voz.camara ? 'Desligar a câmara' : 'Ligar a câmara',
+    () => $('#btn-camara').click(),
+    { cortado: !voz.camara },
+  ));
+  // O de esconder as fotinhas fica NO MEIO, como pedido: é o que separa os controlos de
+  // quem fala dos que fecham a transmissão e a chamada.
+  barra.append(botaoDoPalco(
+    ICO.gente,
+    gentePorBaixoOculta ? 'Mostrar quem está na chamada' : 'Ocultar quem está na chamada',
+    () => { gentePorBaixoOculta = !gentePorBaixoOculta; desenharVoz(); },
+    { cortado: gentePorBaixoOculta },
+  ));
+  if (souEu) {
+    barra.append(botaoDoPalco(ICO.parar, 'Parar a transmissão',
+      () => alternarEcra(), { classe: 'palco__bt--parar' }));
+  }
+  barra.append(botaoDoPalco(
+    ICO.desligar,
+    souEu ? 'Sair da chamada (fecha a transmissão)' : 'Sair da chamada',
+    () => sairDeVoz(),
+    { classe: 'palco__bt--sair' },
+  ));
+  vidro.append(barra);
+
+  // --- a pausa por falta de foco, só para quem transmite
+  //
+  // A transmissão continua a sair; o que descansa é o DESCODIFICADOR local. Quem partilha
+  // está a codificar o ecrã inteiro e, ao mesmo tempo, a descodificá-lo outra vez só para
+  // se ver — e quando muda de janela nem sequer está a olhar. Pausar aqui devolve esse
+  // trabalho ao jogo, ou ao que quer que ele tenha ido fazer.
+  // A MENSAGEM não depende de haver imagem: ela é verdadeira mal a transmissão comece, e
+  // prendê-la ao <video> deixava quem mudasse de janela nos primeiros segundos sem
+  // explicação nenhuma para o ecrã escuro.
+  if (souEu && !janelaComFoco) {
+    const pausa = elemento('div', 'palco__pausa');
+    pausa.append(elemento('b', null, 'A tua transmissão continua ligada!'));
+    pausa.append(elemento('span', null,
+      'Pausámos esta pré-visualização para poupar os teus recursos.'));
+    vidro.append(pausa);
+  }
+  if (souEu && el) {
+    if (!janelaComFoco) {
+      el.__pausaPedida = true;
+      try { el.pause(); } catch (e) { /* já parado */ }
+    } else if (el.__pausaPedida) {
+      el.__pausaPedida = false;
+      // Ao voltar, salta-se logo para a ponta: o que passou enquanto estava pausado não
+      // interessa a ninguém, e reproduzi-lo seria voltar ao atraso que se acabou de curar.
+      try {
+        if (el.buffered.length) el.currentTime = el.buffered.end(el.buffered.length - 1) - 0.4;
+      } catch (e) { /* o perseguidor do vivo trata */ }
+      el.play().catch(() => {});
+    }
+  }
+
+  palco.append(vidro);
+
+  // --- as fotinhas por baixo
+  const fila = elemento('div', 'palco__gente');
+  fila.hidden = gentePorBaixoOculta;
+  fila.append(fotinha(voz.eu, quem));
+  for (const p of outros) fila.append(fotinha(p, quem));
+  palco.append(fila);
+  return palco;
+}
+
+/** Uma fotinha da fila de baixo. `noPalco` é quem está em grande, para não se repetir. */
+function fotinha(chave, noPalco) {
+  const m = elemento('div', 'mini');
+  m.dataset.chave = chave;
+  if (voz.falando.has(chave)) m.classList.add('is-speaking');
+
+  const transmite = voz.aPartilhar.has(chave) || (chave === voz.eu && !!voz.ecra);
+  const temCamara = voz.comCamara.has(chave) || (chave === voz.eu && !!voz.camara);
+
+  if (temCamara) {
+    const cam = chave === voz.eu ? meuEspelho() : camaraDe(chave).tela;
+    if (cam) m.append(cam);
+  } else {
+    const av = elemento('span', 'ident');
+    pintar(av, chave);
+    m.append(av);
+  }
+
+  if (transmite) {
+    m.append(elemento('span', 'mini__vivo', 'AO VIVO'));
+    // Quem transmite mas NÃO está no palco: diz-se, e o botão de assistir só aparece com o
+    // rato por cima — para a fila não virar uma parede de botões.
+    if (chave !== noPalco) {
+      const tampa = elemento('div', 'mini__tampa');
+      tampa.append(elemento('span', null,
+        chave === voz.eu ? 'estás a transmitir' : nomeDoPeer(chave) + ' está a transmitir'));
+      const b = elemento('button', 'btn btn--primary',
+        chave === voz.eu ? 'Ver a tua' : 'Assistir');
+      b.onclick = ev => { ev.stopPropagation(); assistir(chave); };
+      tampa.append(b);
+      m.append(tampa);
+    }
+  }
+  m.append(elemento('span', 'mini__nome', nomeDoPeer(chave)));
+  return m;
+}
+
 /** Dimensiona a grelha da chamada.
  *
  *  O CSS sozinho não chega: com `auto-fit` uma pessoa sozinha ficava com um painel do
@@ -1891,16 +2130,9 @@ function desenharVoz() {
     return;
   }
 
-  // A ver a transmissão de alguém: o ecrã dessa pessoa ocupa tudo e as fotinhas saem.
+  // A ver a transmissão de alguém: a imagem ocupa tudo e o resto flutua por cima.
   if (voz.aVer) {
-    const barra = elemento('div', 'assistindo');
-    const voltar = elemento('button', 'btn', '← Voltar à sala');
-    voltar.onclick = pararDeAssistir;
-    barra.append(voltar);
-    barra.append(elemento('span', 'assistindo__quem',
-      voz.aVer === voz.eu ? 'a ver o teu próprio ecrã' : `a ver ${nomeDoPeer(voz.aVer)}`));
-    grelha.append(barra);
-    grelha.append(painelDeVoz(voz.aVer, { aVer: true }));
+    grelha.append(palcoDeTransmissao(voz.aVer, canal, outros));
     $('#voz-nota').textContent = '';
     return;
   }
@@ -2025,7 +2257,7 @@ listen('partilha-falhou', ev => {
   console.warn('a partilha falhou:', razao);
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null;
+  voz.ecra = null; voz.ecraTamanho = null;
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
   invoke('parar_de_partilhar').catch(() => {});
@@ -2372,11 +2604,24 @@ addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
  */
 const PROTOCOLO = 2;
 
+/** "1440p 60FPS" — como o Discord o escreve, e a partir dos números que valem mesmo. */
+function rotuloDaQualidade() {
+  const q = qualidadeEfetiva();
+  // Prefere-se sempre o MEDIDO ao pedido: com "Nativa" o pedido é 0, e mesmo com um número
+  // o Rust pode ter arredondado para caber em blocos pares.
+  const alt = (voz.ecraTamanho && voz.ecraTamanho.altura) || q.altura;
+  return `${alt ? alt + 'p' : 'Nativa'} ${q.fps}FPS`;
+}
+
 function anunciarEstado() {
   for (const [peer, c] of voz.presentes) {
     if (c !== voz.canal) continue;
     sinalizar(peer, {
       tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara, v: PROTOCOLO,
+      // Quem transmite é o único que sabe estas duas coisas. Sem as dizer, quem assiste
+      // teria de as adivinhar — e a barra mostraria um palpite em vez de um facto.
+      qualidade: voz.ecra ? rotuloDaQualidade() : null,
+      espectadores: voz.ecra ? voz.aSerVistoPor.size : 0,
     });
   }
 }
@@ -3033,6 +3278,89 @@ function pararDeAssistir() {
       diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`
         + ` abre=${aberto} fecha=${fechado}`);
     }
+    // ---- o palco da transmissão ------------------------------------------------
+    //
+    // Mede-se com estado FABRICADO: finge-se uma sala com duas pessoas, uma a transmitir,
+    // e conta-se o que a vista produz. É a única forma de exercitar aqui um palco que, na
+    // vida real, precisa de duas máquinas ligadas.
+    {
+      const antes = {
+        eu: voz.eu, canal: voz.canal, servidor: voz.servidor, ecra: voz.ecra,
+        aVer: voz.aVer, tam: voz.ecraTamanho, srv: servidorAtual, cnl: canalAtual,
+      };
+      // Uma sala de voz de verdade, criada para a medição — a vista olha para o canal
+      // SELECIONADO, e sem um canal de voz escolhido ela nem chega a desenhar.
+      let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+      if (!srv) {
+        const id = await invoke('criar_servidor', { nome: 'medicao' });
+        await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+        await desenharTudo();
+        srv = vista.servidores.find(x => x.id === id);
+      }
+      const cv = srv.canais.find(c => c.tipo === 'voz');
+      servidorAtual = srv.id; canalAtual = cv.id;
+      voz.eu = 'eueueu';
+      voz.canal = cv.id;
+      voz.servidor = srv.id;
+      voz.presentes.set('outro1', voz.canal);
+      voz.ecra = { fechar() {} };
+      voz.ecraTamanho = { largura: 2560, altura: 1440 };
+      voz.aSerVistoPor.add('outro1');
+      voz.aPartilhar.add('outro1');
+      voz.infoDaTransmissao.set('outro1', { qualidade: '1080p 30FPS', espectadores: 3 });
+      voz.aVer = voz.eu;
+      gentePorBaixoOculta = false;
+      janelaComFoco = true;
+      desenharVoz();
+
+      const palco = document.querySelector('.palco');
+      const selos = [...document.querySelectorAll('.palco__selo')].map(e => e.textContent.trim());
+      const bts = document.querySelectorAll('.palco__meio .palco__bt');
+      diz('ui palco: existe=' + !!palco
+        + ' selos=' + JSON.stringify(selos)
+        + ' botoes=' + bts.length
+        + ' onde="' + ($('.palco__onde') ? $('.palco__onde').textContent.trim() : '') + '"'
+        + ' convidar=' + !!document.querySelector('.palco__baixo-esq .palco__bt')
+        + ' fotinhas=' + document.querySelectorAll('.mini').length
+        + ' aoVivoNasFotinhas=' + document.querySelectorAll('.mini__vivo').length
+        + ' tampasDeAssistir=' + document.querySelectorAll('.mini__tampa').length);
+
+      // O botão do meio esconde as fotinhas, e volta a mostrá-las.
+      const antesOculto = document.querySelector('.palco__gente').hidden;
+      [...bts].find(b => /Ocultar/.test(b.title)).click();
+      const depoisOculto = document.querySelector('.palco__gente').hidden;
+      [...document.querySelectorAll('.palco__meio .palco__bt')]
+        .find(b => /Mostrar/.test(b.title)).click();
+      const reposto = document.querySelector('.palco__gente').hidden;
+      diz('ui palco ocultar: antes=' + antesOculto + ' depois=' + depoisOculto
+        + ' reposto=' + reposto);
+
+      // Sem foco, aparece a mensagem de pausa — e SÓ para quem transmite.
+      janelaComFoco = false;
+      desenharVoz();
+      const pausa = document.querySelector('.palco__pausa');
+      diz('ui palco pausa: aparece=' + !!pausa
+        + ' texto="' + (pausa ? pausa.textContent.replace(/\s+/g, ' ').trim().slice(0, 46) : '') + '"');
+      janelaComFoco = true;
+
+      // E o palco de OUTRA pessoa: sem botão de parar transmissão, com o nome dela.
+      voz.aVer = 'outro1';
+      desenharVoz();
+      const bts2 = [...document.querySelectorAll('.palco__meio .palco__bt')].map(b => b.title);
+      diz('ui palco alheio: botoes=' + JSON.stringify(bts2.map(t => t.split(' ')[0]))
+        + ' qualidade="' + ([...document.querySelectorAll('.palco__selo')][0] || {}).textContent + '"'
+        + ' semPausa=' + !document.querySelector('.palco__pausa'));
+
+      voz.presentes.delete('outro1');
+      voz.aSerVistoPor.delete('outro1');
+      voz.aPartilhar.delete('outro1');
+      voz.infoDaTransmissao.delete('outro1');
+      Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor,
+        ecra: antes.ecra, aVer: antes.aVer, ecraTamanho: antes.tam });
+      servidorAtual = antes.srv; canalAtual = antes.cnl;
+      desenharVoz();
+    }
+
     const rotuloAudio = $('#linha-som').querySelector('b').getBoundingClientRect();
     const antes = $('#mudo-transmissao').checked;
     $('#linha-som').click();
