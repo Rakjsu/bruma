@@ -51,32 +51,138 @@ mod win {
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
         MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK, WAVE_FORMAT_PCM,
+        AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    };
+    // Estas três vivem noutros módulos do mesmo SDK, e é por isso que estão à parte.
+    use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+    use windows::Win32::Media::Multimedia::{
+        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
-    /// Converte o que o dispositivo entrega para PCM 16 bits, que é o que o codificador de
-    /// AAC quer. O formato de mistura do Windows é quase sempre float de 32 bits.
-    fn para_i16(bytes: &[u8], formato_float: bool, bits: u16) -> Vec<u8> {
-        if formato_float && bits == 32 {
-            let mut v = Vec::with_capacity(bytes.len() / 2);
-            for c in bytes.chunks_exact(4) {
-                let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                // O clamp não é zelo a mais: uma mistura de várias apps passa de 1.0 com
-                // facilidade, e sem isto dava a volta ao número — estalo em vez de saturar.
-                let i = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
+    /// Uma amostra do dispositivo, seja qual for o formato dele, como um número entre
+    /// -1 e 1. Devolve `None` para formatos que não se sabem ler — e nesse caso prefere-se
+    /// silêncio a adivinhar, porque adivinhar aqui soa a ruído branco a todo o volume.
+    fn amostra(bytes: &[u8], i: usize, forma: Forma) -> Option<f32> {
+        match forma {
+            Forma::Float32 => {
+                let c = bytes.get(i * 4..i * 4 + 4)?;
+                Some(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            }
+            Forma::Int16 => {
+                let c = bytes.get(i * 2..i * 2 + 2)?;
+                Some(i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            }
+            Forma::Int32 => {
+                let c = bytes.get(i * 4..i * 4 + 4)?;
+                Some(i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0)
+            }
+            Forma::Int24 => {
+                let c = bytes.get(i * 3..i * 3 + 3)?;
+                // 24 bits com sinal, em três bytes little-endian: sobe-se para 32 bits e
+                // desce-se outra vez, que é a forma barata de estender o sinal.
+                let v = ((c[0] as i32) << 8) | ((c[1] as i32) << 16) | ((c[2] as i32) << 24);
+                Some(v as f32 / 2_147_483_648.0)
+            }
+            Forma::Desconhecida => None,
+        }
+    }
+
+    /// Converte o que o dispositivo entrega para PCM de 16 bits **em estéreo**, que é o que
+    /// se declara ao codificador de AAC.
+    ///
+    /// # Porque é que isto tem de misturar
+    ///
+    /// O contentor é informado de DOIS canais. Se o dispositivo for 5.1 e se lhe passassem
+    /// seis, o Media Foundation leria os mesmos bytes como três vezes mais quadros de
+    /// estéreo — o som sairia ao triplo da velocidade e agudo. Não estoirava; soava mal, e
+    /// só em casa de quem tem 5.1. É o tipo de avaria que nunca se reproduz onde se
+    /// desenvolve.
+    ///
+    /// A mistura segue a receita habitual (ITU-R BS.775): a frente vai direta, o centro
+    /// entra nos dois lados a -3 dB — é onde vive a voz, e deixá-lo cair era perder
+    /// exactamente o que interessa — as traseiras entram também a -3 dB, e o LFE fica de
+    /// fora, porque num altifalante de portátil só faria estalar.
+    fn para_estereo(bytes: &[u8], forma: Forma, canais: u16) -> Vec<u8> {
+        let n = canais.max(1) as usize;
+        let bytes_por_amostra = match forma {
+            Forma::Int16 => 2,
+            Forma::Int24 => 3,
+            Forma::Float32 | Forma::Int32 => 4,
+            Forma::Desconhecida => return Vec::new(),
+        };
+        let quadros = bytes.len() / (bytes_por_amostra * n);
+        let mut v = Vec::with_capacity(quadros * 4);
+        // -3 dB, que é o factor com que o centro e as traseiras entram na mistura. É
+        // literalmente 1/raiz(2), e o Rust já o tem escrito com todos os dígitos.
+        const MEIA: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        for q in 0..quadros {
+            let base = q * n;
+            let le = |c: usize| amostra(bytes, base + c, forma).unwrap_or(0.0);
+            let (mut e, mut d) = if n == 1 {
+                let m = le(0);
+                (m, m)
+            } else {
+                (le(0), le(1))
+            };
+            if n >= 3 {
+                let centro = le(2) * MEIA;
+                e += centro;
+                d += centro;
+            }
+            // 5.1 = FL FR FC LFE BL BR — salta-se o 3 (LFE) de propósito.
+            if n >= 6 {
+                e += le(4) * MEIA;
+                d += le(5) * MEIA;
+            }
+            for canal in [e, d] {
+                // O clamp não é zelo a mais: somar canais passa de 1.0 com facilidade, e
+                // sem isto dava a volta ao número — estalo em vez de saturar.
+                let i = (canal.clamp(-1.0, 1.0) * 32767.0) as i16;
                 v.extend_from_slice(&i.to_le_bytes());
             }
-            return v;
         }
-        if bits == 16 {
-            return bytes.to_vec();
+        v
+    }
+
+    /// Como o dispositivo escreve cada amostra.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Forma {
+        Float32,
+        Int32,
+        Int24,
+        Int16,
+        Desconhecida,
+    }
+
+    /// Lê a forma do `WAVEFORMATEX`, descendo ao `WAVEFORMATEXTENSIBLE` quando é preciso.
+    ///
+    /// O teste antigo era `wFormatTag != PCM && bits == 32` — e isso trata um dispositivo
+    /// de 32 bits INTEIROS como se fosse float, o que transforma música em ruído a todo o
+    /// volume. O `wFormatTag` de um formato moderno é quase sempre `EXTENSIBLE`, e quem
+    /// sabe a verdade é o `SubFormat` que vem a seguir.
+    unsafe fn forma_de(mix: *const WAVEFORMATEX) -> Forma {
+        let bits = (*mix).wBitsPerSample;
+        let etiqueta = (*mix).wFormatTag as u32;
+        let float = if etiqueta == WAVE_FORMAT_EXTENSIBLE {
+            let ext = mix as *const WAVEFORMATEXTENSIBLE;
+            // `read_unaligned` e não `(*ext).SubFormat`: a estrutura é *packed*, e tirar uma
+            // referência a um campo dela é comportamento indefinido mesmo que nunca se
+            // desreferencie. O compilador recusa-o, e faz bem.
+            std::ptr::read_unaligned(std::ptr::addr_of!((*ext).SubFormat))
+                == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        } else {
+            etiqueta == WAVE_FORMAT_IEEE_FLOAT
+        };
+        match (float, bits) {
+            (true, 32) => Forma::Float32,
+            (false, 32) => Forma::Int32,
+            (false, 24) => Forma::Int24,
+            (false, 16) => Forma::Int16,
+            _ => Forma::Desconhecida,
         }
-        // Formatos exóticos (24 bits, por exemplo) não se adivinham: silêncio do tamanho
-        // certo é melhor do que ruído.
-        vec![0u8; bytes.len() * 2 / (bits.max(8) as usize / 8)]
     }
 
     /// O formato do dispositivo de saída, sem começar a captar.
@@ -94,7 +200,7 @@ mod win {
             let mix = cliente.GetMixFormat()?;
             let f = Formato {
                 ritmo: (*mix).nSamplesPerSec,
-                canais: (*mix).nChannels,
+                canais: 2,
                 bits: 16,
             };
             CoTaskMemFree(Some(mix as *const _));
@@ -127,9 +233,13 @@ mod win {
                 let f = &*mix;
                 (f.nSamplesPerSec, f.nChannels, f.wBitsPerSample)
             };
-            // O formato de mistura do Windows é float de 32 bits em quase todas as placas,
-            // e vem marcado como EXTENSIBLE — daí o teste ser "não é PCM inteiro".
-            let float = { (*mix).wFormatTag != WAVE_FORMAT_PCM as u16 && bits == 32 };
+            let forma = forma_de(mix);
+            if forma == Forma::Desconhecida {
+                eprintln!(
+                    "[som] formato de {bits} bits que não se sabe ler; a partilha vai muda \
+                     em vez de ir com ruído"
+                );
+            }
 
             // Buffer de 200 ms: folga que chegue para não perder som se a thread se
             // atrasar, sem acrescentar atraso perceptível a quem ouve.
@@ -147,13 +257,17 @@ mod win {
             let captura: IAudioCaptureClient = cliente.GetService()?;
             cliente.Start()?;
 
+            // Dois canais, sempre: é o que sai do `para_estereo` e é o que o contentor
+            // declara. Anunciar os canais do dispositivo aqui era a origem do erro.
             anunciar(Formato {
                 ritmo,
-                canais,
+                canais: 2,
                 bits: 16,
             });
 
-            let bytes_por_frame = canais as usize * 2; // já em i16
+            // JÁ EM ESTÉREO: é o que se declara ao codificador, e tem de ser o que se lhe
+            // entrega. Ver `para_estereo`.
+            let bytes_por_frame = 4;
             let inicio = std::time::Instant::now();
             // O som não começa no instante zero da partilha: o codificador nasceu primeiro
             // e o dispositivo levou o seu tempo a abrir. Esse atraso mede-se UMA vez e
@@ -193,14 +307,14 @@ mod win {
                     captura.GetBuffer(&mut dados, &mut frames, &mut flags, None, None)?;
                     if frames > 0 {
                         let mudo = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-                        let pcm = if mudo || dados.is_null() {
+                        let pcm = if mudo || dados.is_null() || forma == Forma::Desconhecida {
                             vec![0u8; frames as usize * bytes_por_frame]
                         } else {
                             let cru = std::slice::from_raw_parts(
                                 dados,
                                 frames as usize * canais as usize * (bits as usize / 8),
                             );
-                            para_i16(cru, float, bits)
+                            para_estereo(cru, forma, canais)
                         };
                         let instante = atraso + (entregues * 10_000_000 / ritmo as u64) as i64;
                         entregues += frames as u64;
@@ -366,13 +480,51 @@ pub use win::{captar, formato, medir, quem_toca};
 pub fn arrancar(
     parar: Arc<AtomicBool>,
     origem: std::time::Instant,
-    entrega: impl FnMut(Bocado) + Send + 'static,
+    formato: Formato,
+    mut entrega: impl FnMut(Bocado) + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        if let Err(e) = captar(parar, origem, |_| {}, entrega) {
-            eprintln!("[som] a captura do som terminou: {e:?}");
+        match captar(parar.clone(), origem, |_| {}, &mut entrega) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[som] a captura do som falhou: {e:?}; a faixa segue em silêncio");
+                // A faixa de som JÁ FOI DECLARADA no contentor — o `moov` saiu antes disto
+                // poder falhar, e não há como o voltar atrás. Uma faixa declarada e nunca
+                // alimentada é pior do que silêncio: quem recebe fica à espera de amostras
+                // que não vêm, e o leitor pode simplesmente parar.
+                //
+                // Portanto alimenta-se. O silêncio custa quase nada a comprimir e mantém a
+                // promessa que o cabeçalho fez.
+                silencio(parar, origem, formato, entrega);
+            }
         }
     });
+}
+
+/// Enche a faixa de som com silêncio, ao ritmo certo, até mandarem parar.
+fn silencio(
+    parar: Arc<AtomicBool>,
+    origem: std::time::Instant,
+    formato: Formato,
+    mut entrega: impl FnMut(Bocado),
+) {
+    let ritmo = formato.ritmo.max(8000) as u64;
+    let bytes_por_quadro = 4usize; // estéreo, 16 bits
+    let mut entregues: u64 = 0;
+    while !parar.load(Ordering::Relaxed) {
+        let decorrido = origem.elapsed().as_secs_f64();
+        let devidos = (decorrido * ritmo as f64) as u64;
+        if devidos > entregues + ritmo / 50 {
+            let faltam = (devidos - entregues) as usize;
+            entrega(Bocado {
+                pcm: vec![0u8; faltam * bytes_por_quadro],
+                instante: (entregues * 10_000_000 / ritmo) as i64,
+                duracao: (faltam as u64 * 10_000_000 / ritmo) as i64,
+            });
+            entregues = devidos;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[allow(dead_code)]

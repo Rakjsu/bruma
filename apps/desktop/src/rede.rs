@@ -470,8 +470,19 @@ async fn sessao(
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Perdeu-se difusão; o próximo sync recupera. Não vale a pena cair.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // O comentário que aqui estava dizia "o próximo sync recupera", e isso
+                    // era verdade quando por aqui só passavam mensagens de controlo. Já não
+                    // é: passam também frames de ecrã e de câmara, e ESSES não se
+                    // recuperam — não há sync que os vá buscar, porque um frame que se
+                    // perdeu já não interessa a ninguém.
+                    //
+                    // Cair também não serve: derrubar a ligação porque um espectador se
+                    // atrasou é trocar um soluço na imagem por uma chamada perdida. O que
+                    // se faz é o que se pode fazer — seguir, e DIZER, para quem estiver a
+                    // ler os registos saber que a imagem partida daquele momento tem uma
+                    // explicação e não é um mistério.
+                    eprintln!("[rede] {peer} atrasou-se e perdeu {n} pedaços");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },

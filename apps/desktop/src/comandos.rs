@@ -489,6 +489,7 @@ pub fn comecar_a_partilhar(
     saida: Channel<InvokeResponseBody>,
     ecra: State<Arc<Ecra>>,
     rede: State<Arc<Rede>>,
+    app: tauri::AppHandle,
 ) -> R<serde_json::Value> {
     let ecra = ecra.inner().clone();
     let rede = rede.inner().clone();
@@ -537,9 +538,18 @@ pub fn comecar_a_partilhar(
         debito,
         com_som,
     };
+    // A queixa vai por evento, e não pelo valor de retorno: quando ela existir, este
+    // comando já respondeu há muito. Ver `ecra::Queixa`.
+    let queixa: crate::ecra::Queixa = {
+        let app = app.clone();
+        Arc::new(move |razao: String| {
+            use tauri::Emitter;
+            let _ = app.emit("partilha-falhou", razao);
+        })
+    };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        crate::ecra::comecar(&mut e, alvo, qualidade, entrega).map_err(erro)?
+        crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa).map_err(erro)?
     };
     Ok(serde_json::json!({ "largura": largura, "altura": altura }))
 }
@@ -661,6 +671,19 @@ pub fn autoteste_altura() -> u32 {
         }
     }
     720
+}
+
+/// A fonte que o autoteste deve partilhar: `--fonte=ecra:99` aponta para um ecrã que não
+/// existe, e serve para PROVAR o caminho da falha — que é o que nunca se testa e o que
+/// aparece sempre na máquina dos outros.
+#[tauri::command]
+pub fn autoteste_fonte() -> String {
+    for a in std::env::args() {
+        if let Some(n) = a.strip_prefix("--fonte=") {
+            return n.to_string();
+        }
+    }
+    "ecra:1".into()
 }
 
 /// O ritmo que o autoteste deve pedir: `--fps=15`. Existe para se poder PROVAR que o

@@ -529,6 +529,14 @@ html, body {
    ficavam abertos para sempre — o toggle funcionava, o CSS ignorava-o. */
 .menu-trans__sub[hidden] { display: none; }
 
+/* O aviso de quem não vai conseguir ver. Amarelo e não vermelho: não é um erro, é uma
+   consequência de alguém não ter actualizado — e tem conserto num clique. */
+.aviso-versao {
+  margin: 10px 0 0; padding: 9px 12px; border-radius: 10px;
+  background: rgba(224, 176, 74, .10); border: 1px solid rgba(224, 176, 74, .34);
+  color: #e6c17c; font-size: 12.5px; line-height: 1.45;
+}
+
 /* E a checkbox do silenciar: a regra global `.caixa input { width: 100% }` é para os
    campos de texto dos diálogos — numa checkbox incha-a e esmaga o rótulo para três
    linhas. Volta ao tamanho natural. */

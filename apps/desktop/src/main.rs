@@ -181,6 +181,7 @@ fn main() {
             comandos::autoteste_pedido,
             comandos::autoteste_fps,
             comandos::autoteste_altura,
+            comandos::autoteste_fonte,
             comandos::receber_ecra,
             comandos::receber_camara,
             comandos::enviar_camara,

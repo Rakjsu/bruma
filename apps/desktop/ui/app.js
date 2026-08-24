@@ -497,6 +497,14 @@ const CAM_DEBITO = 400_000;      // 400 kbps chega para uma cara a 360p
 const CAM_CHAVE_MS = 2000;
 
 let camaraEnvio = null;
+/** Conta quantas vezes se ligou ou desligou a câmara.
+ *
+ *  Serve para uma corrida real: entre carregar no botão e o `getUserMedia` responder passam
+ *  centenas de milissegundos, e nesse intervalo a pessoa pode sair da chamada. Sem isto, o
+ *  stream chegava depois e ficava ligado — com a luz da câmara acesa e ninguém em sala.
+ *  Uma luz de câmara acesa sem chamada é a pior coisa que esta app podia fazer.
+ */
+let geracaoDaCamara = 0;
 
 /** Uma câmara desenhada por nós, para o teste de par.
  *
@@ -528,9 +536,16 @@ function camaraDesenhada() {
   return stream;
 }
 
-/** Quem está na sala, para lhe mandar a imagem. Vazia significa que nada sai da máquina. */
+/** Quem está na sala E percebe o que vamos mandar.
+ *
+ *  Mandar a câmara a quem não a sabe distinguir do ecrã não é "melhor do que nada": é pior.
+ *  Aquele lado meteria os bytes no descodificador errado e mostraria lixo, sem saber porquê.
+ *  Vazia significa que nada sai da máquina — que é a resposta certa quando ninguém percebe.
+ */
 function gentePresente() {
-  return [...voz.presentes.entries()].filter(([, c]) => c === voz.canal).map(([p]) => p);
+  return [...voz.presentes.entries()]
+    .filter(([p, c]) => c === voz.canal && voz.entendeCamara.has(p))
+    .map(([p]) => p);
 }
 
 async function comecarAEnviarCamara(fonte = null) {
@@ -538,10 +553,18 @@ async function comecarAEnviarCamara(fonte = null) {
   if (typeof VideoEncoder === 'undefined' || typeof MediaStreamTrackProcessor === 'undefined') {
     throw new Error('esta versão do WebView2 não traz o codificador de vídeo');
   }
+  const minhaVez = ++geracaoDaCamara;
   const stream = fonte || await navigator.mediaDevices.getUserMedia({
     video: { width: CAM_LARGURA, height: CAM_ALTURA, frameRate: CAM_IPS },
     audio: false,
   });
+  // Chegou tarde: alguém desligou a câmara ou saiu da chamada enquanto isto esperava.
+  // Apaga-se a luz e desiste-se em silêncio — não é um erro, é uma decisão que mudou.
+  if (minhaVez !== geracaoDaCamara) {
+    stream.getTracks().forEach(t => t.stop());
+    if (stream.__parar) stream.__parar();
+    return null;
+  }
   const faixa = stream.getVideoTracks()[0];
   if (!faixa) { stream.getTracks().forEach(t => t.stop()); throw new Error('sem câmara'); }
 
@@ -579,7 +602,19 @@ async function comecarAEnviarCamara(fonte = null) {
     while (camaraEnvio && camaraEnvio.vivo) {
       const { value, done } = await leitor.read().catch(() => ({ done: true }));
       if (done) break;
-      if (codificador.state === 'configured') {
+      // Um codificador que morreu não volta. Continuar a puxar frames seria gastar CPU e
+      // manter a luz acesa para não enviar nada a ninguém — e em silêncio, que é o pior.
+      if (codificador.state !== 'configured') {
+        value.close();
+        console.warn('o codificador da câmara morreu; a desligar');
+        camaraFalhou = 'A câmara parou sozinha — o codificador de vídeo desistiu.';
+        pararDeEnviarCamara();
+        anunciarEstado();
+        desenharVoz();
+        desenharRodape();
+        break;
+      }
+      {
         const agora = performance.now();
         const chave = agora - ultimaChave >= CAM_CHAVE_MS;
         if (chave) ultimaChave = agora;
@@ -598,6 +633,9 @@ async function comecarAEnviarCamara(fonte = null) {
 }
 
 function pararDeEnviarCamara() {
+  // Sobe SEMPRE, mesmo sem nada a parar: é o que faz um `getUserMedia` ainda a decorrer
+  // perceber que já não é preciso.
+  geracaoDaCamara += 1;
   if (!camaraEnvio) return;
   camaraEnvio.vivo = false;
   try { camaraEnvio.leitor.cancel(); } catch (e) { /* já fechado */ }
@@ -1063,6 +1101,12 @@ const voz = {
   silenciados: new Set(),// pessoas silenciadas uma a uma
   aPartilhar: new Set(), // quem está a transmitir o ecrã
   comCamara: new Set(),  // quem tem a câmara ligada
+  // Quem, do outro lado, percebe o que esta versão envia. Ver PROTOCOLO.
+  entendeCamara: new Set(),
+  entendeSom: new Set(),
+  // De quem já recebemos um anúncio de estado. Sem isto não se distingue "é antigo" de
+  // "ainda não disse nada", e as duas coisas mereciam respostas opostas.
+  jaFalou: new Set(),
   aVer: null,            // de quem estou a ver a transmissão
   aSerVistoPor: new Set(), // quem pediu para ver o MEU ecrã — só a esses se envia
   vejoMeuEcra: null,       // o <video> da minha própria transmissão, só enquanto olho
@@ -1173,6 +1217,9 @@ async function sairDeVoz(anunciar = true) {
   voz.falando.clear();
   voz.aPartilhar.clear();
   voz.comCamara.clear();
+  voz.entendeCamara.clear();
+  voz.entendeSom.clear();
+  voz.jaFalou.clear();
   voz.aVer = null;
   voz.micro = null; voz.ecra = null;
   voz.canal = null;
@@ -1199,6 +1246,15 @@ async function receberSinal(de, dados) {
     return;
   }
   if (dados.tipo === 'estado') {
+    const versao = Number.isFinite(dados.v) ? dados.v : 1;
+    voz.jaFalou.add(de);
+    if (versao >= 2) {
+      voz.entendeCamara.add(de);
+      voz.entendeSom.add(de);
+    } else {
+      voz.entendeCamara.delete(de);
+      voz.entendeSom.delete(de);
+    }
     if (dados.ecra) {
       voz.aPartilhar.add(de);
     } else {
@@ -1353,8 +1409,38 @@ function desenharFontes() {
   }
 }
 
+/** Quem, na sala, ainda não percebe o que esta versão envia.
+ *
+ *  Enquanto o `estado` do outro lado não chegar, ele não está em `entendeSom` — e não se
+ *  avisa por isso: seria acusar toda a gente de estar desactualizada durante o primeiro
+ *  segundo de cada chamada. Só conta quem já falou e disse ser antigo.
+ */
+function quemNaoVaiVer() {
+  return [...voz.presentes.entries()]
+    .filter(([p, c]) => c === voz.canal && voz.jaFalou.has(p) && !voz.entendeSom.has(p))
+    .map(([p]) => p);
+}
+
+function desenharAvisoDeVersao() {
+  const el = $('#aviso-versao');
+  if (!el) return;
+  const antigos = quemNaoVaiVer();
+  const comSom = qualidadeDePartilha().som;
+  if (!antigos.length) { el.hidden = true; return; }
+  const nomes = antigos.map(nomeDoPeer).join(', ');
+  el.hidden = false;
+  // Duas mensagens diferentes porque as consequências são diferentes, e dizer "pode haver
+  // problemas" às duas seria não dizer nada.
+  el.textContent = comSom
+    ? `${nomes} está numa versão antiga e NÃO vai ver esta partilha, porque ela leva o som `
+      + `do sistema — a versão dele só sabe ler a imagem. Desliga o som na engrenagem, ou `
+      + `pede-lhe para actualizar (a app faz isso sozinha ao reabrir).`
+    : `${nomes} está numa versão antiga. A imagem vai ver; a câmara, não.`;
+}
+
 async function escolherFonte() {
   abrir('veu-fontes');
+  desenharAvisoDeVersao();
   const lista = $('#lista-fontes');
   lista.innerHTML = '<p class="fontes__espera">a olhar para as janelas…</p>';
   fontesEmMemoria = await invoke('fontes_de_partilha').catch(() => []);
@@ -1436,6 +1522,7 @@ function desenharMenuTransmissao() {
   $('#desc-som').textContent = q.som
     ? 'o som das colunas segue com a imagem'
     : 'a transmissão vai muda';
+  desenharAvisoDeVersao();
 
   const nome = q.modo === 'jogos' ? 'Jogos' : q.modo === 'texto' ? 'Texto' : null;
   $('#resumo-qualidade').textContent =
@@ -1509,6 +1596,7 @@ async function alternarEcra() {
 
 async function iniciarPartilha(fonte) {
   if (voz.ecra || !voz.canal || !voz.servidor) return;
+  partilhaFalhou = null;
 
   // O canal fica aberto desde já, mas o Rust só manda por ele quando estivermos mesmo
   // a olhar (ver_meu_ecra). Criar o <video> agora e deixá-lo a apanhar pedaços às
@@ -1883,6 +1971,27 @@ function desenharNaChamada() {
   }
 }
 
+/* A captura pode morrer DEPOIS de o comando já ter dito que sim — uma definição que este
+   Windows não tem, o ecrã a desaparecer, o codificador a recusar. Sem isto, a interface
+   ficava a dizer "estás a partilhar" para sempre, sem imagem, sem explicação e sem forma
+   de a pessoa perceber que o problema não era a ligação dela. */
+listen('partilha-falhou', ev => {
+  const razao = String(ev.payload || 'a captura parou');
+  console.warn('a partilha falhou:', razao);
+  if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
+  if (voz.aVer === voz.eu) voz.aVer = null;
+  voz.ecra = null;
+  partilhaFalhou = razao;
+  invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
+  invoke('parar_de_partilhar').catch(() => {});
+  anunciarEstado();
+  desenharVoz();
+  desenharRodape();
+});
+
+/** A última razão por que a partilha morreu, para o botão a poder mostrar. */
+let partilhaFalhou = null;
+
 listen('presenca', ev => {
   const { peer, canal } = ev.payload;
   if (canal) voz.presentes.set(peer, canal); else voz.presentes.delete(peer);
@@ -1892,6 +2001,14 @@ listen('presenca', ev => {
   if (!canal || canal !== voz.canal) {
     if (voz.aSerVistoPor.delete(peer)) actualizarEspectadores();
     fecharFluxoRecebido(peer);
+    // E a câmara também. Quem cai da rede não chega a anunciar que a desligou, e sem isto
+    // o descodificador dele ficava aberto para sempre a segurar memória de vídeo — numa
+    // sala onde as pessoas entram e saem, isso só cresce.
+    fecharCamaraRecebida(peer);
+    voz.comCamara.delete(peer);
+    voz.entendeCamara.delete(peer);
+    voz.entendeSom.delete(peer);
+    voz.jaFalou.delete(peer);
   }
   if (!canal || canal !== voz.canal) calarPeer(peer);
   desenharVoz();
@@ -1996,6 +2113,9 @@ async function desenharRodape() {
     $('#ligacao-sinal').classList.toggle('is-fraco', !q.ok);
 
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
+    $('#btn-partilhar').classList.toggle('is-cortado', !!partilhaFalhou);
+    $('#btn-partilhar').title = partilhaFalhou
+      || (voz.ecra ? 'Parar de partilhar' : 'Partilhar ecrã');
     $('#btn-camara').disabled = false;
     $('#btn-camara').classList.toggle('is-on', !!voz.camara);
     $('#btn-camara').classList.toggle('is-cortado', !!camaraFalhou);
@@ -2188,10 +2308,31 @@ addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
  *  Quem recebe um fluxo de vídeo não consegue saber, do lado de lá, se aquilo é um ecrã ou
  *  uma câmara — os bytes são os mesmos. Portanto quem envia é que tem de contar.
  */
+/** O que esta versão sabe falar.
+ *
+ *  # Porque é que isto teve de existir
+ *
+ *  Duas mudanças de hoje partem o entendimento com quem ainda não actualizou, e as duas
+ *  falham em SILÊNCIO — que é a pior maneira de falhar:
+ *
+ *  1. A **câmara** vai pelo mesmo transporte do ecrã, distinguida por um campo novo no
+ *     cabeçalho. O serde ignora campos que não conhece, portanto uma versão anterior aceita
+ *     o cabeçalho e mete os frames da câmara no caminho do ECRÃ. Não estoira: mostra lixo.
+ *  2. O **som na partilha de ecrã** vem como segunda faixa no contentor, e uma versão
+ *     anterior só sabe traduzir uma. Resultado: ecrã preto, sem nenhuma mensagem de erro.
+ *
+ *  Não havia forma de as duas pontas saberem com quem estavam a falar. Passa a haver: cada
+ *  lado diz um número, e quem não o diz é antigo. `1` é implícito — é o que as versões que
+ *  nunca souberam disto valem.
+ */
+const PROTOCOLO = 2;
+
 function anunciarEstado() {
   for (const [peer, c] of voz.presentes) {
     if (c !== voz.canal) continue;
-    sinalizar(peer, { tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara });
+    sinalizar(peer, {
+      tipo: 'estado', ecra: !!voz.ecra, camara: !!voz.camara, v: PROTOCOLO,
+    });
   }
 }
 
@@ -2462,7 +2603,8 @@ function pararDeAssistir() {
 
   try {
     const r = await invoke('comecar_a_partilhar',
-      { servidor: 'autoteste', canalVoz: 'autoteste', fonte: 'ecra:1',
+      { servidor: 'autoteste', canalVoz: 'autoteste',
+        fonte: await invoke('autoteste_fonte').catch(() => 'ecra:1'),
         altura: await invoke('autoteste_altura').catch(() => 720),
         fps: await invoke('autoteste_fps').catch(() => 30),
         debito: 0, comSom: true, saida: canal });

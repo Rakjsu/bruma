@@ -49,6 +49,20 @@ impl Alvo {
 /// Quem manda os pedaços para fora: um para a webview local, outro para a rede.
 pub type Entrega = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Quem é avisado quando a captura morre depois de ter dito que ia começar.
+///
+/// # Porque é que isto teve de existir
+///
+/// `arrancar` devolve `Ok` assim que sabe o tamanho do alvo — e a captura só arranca
+/// mesmo numa thread, mais tarde. Se ela falhar aí (uma definição que este Windows não
+/// tem, o ecrã a desaparecer, o codificador a recusar), o erro ia parar a um `eprintln!`
+/// numa consola que, em release, NÃO EXISTE: o binário é compilado com
+/// `windows_subsystem = "windows"`. A interface ficava a dizer "estás a partilhar" para
+/// sempre, sem imagem e sem explicação.
+///
+/// Uma falha que ninguém vê é pior do que uma falha ruidosa.
+pub type Queixa = Arc<dyn Fn(String) + Send + Sync>;
+
 /// O que está a acontecer agora. Uma partilha de cada vez, como no Discord.
 #[derive(Default)]
 pub struct Estado {
@@ -90,7 +104,10 @@ mod win {
 
     struct Sessao {
         /// Para onde vão os frames. O codificador vive noutra thread — ver `arrancar`.
-        canal: std::sync::mpsc::SyncSender<Trabalho>,
+        canal: std::sync::mpsc::Sender<Trabalho>,
+        /// Quantos frames de vídeo estão à espera. É este contador — e não a fundura do
+        /// canal — que decide quando se larga um frame; ver `arrancar`.
+        na_fila: Arc<std::sync::atomic::AtomicUsize>,
         parar: Arc<AtomicBool>,
         /// Buffer reutilizado para tirar o enchimento do fim das linhas. Sem isto era uma
         /// alocação de 20 MB por frame, sessenta vezes por segundo.
@@ -110,22 +127,35 @@ mod win {
         fps: u32,
     }
 
-    type Flags = (
-        std::sync::mpsc::SyncSender<Trabalho>,
-        u32,
-        u32,
-        Arc<AtomicBool>,
-        u32,
-    );
+    /// O que a captura precisa de saber. Struct e não tuplo: quando isto era
+    /// `(Sender, u32, u32, Arc, u32)`, acrescentar um campo ao meio calou um `flags.4` que
+    /// passou a apontar para outra coisa — e só o tipo o apanhou. Com nomes, não há índice
+    /// para se deslocar.
+    struct Flags {
+        canal: std::sync::mpsc::Sender<Trabalho>,
+        na_fila: Arc<std::sync::atomic::AtomicUsize>,
+        lar: u32,
+        alt: u32,
+        parar: Arc<AtomicBool>,
+        fps: u32,
+    }
 
     impl GraphicsCaptureApiHandler for Sessao {
         type Flags = Flags;
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (canal, lar, alt, parar, fps) = ctx.flags;
+            let Flags {
+                canal,
+                na_fila,
+                lar,
+                alt,
+                parar,
+                fps,
+            } = ctx.flags;
             Ok(Self {
                 canal,
+                na_fila,
                 parar,
                 scratch: Vec::new(),
                 lar,
@@ -144,7 +174,10 @@ mod win {
             frame: &mut Frame,
             controlo: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            if self.parar.load(Ordering::Relaxed) {
+            // `BRUMA_SO_VIGIA=1` finge um ecrã parado: o tratador deixa de reagir ao sinal
+            // e a paragem passa a depender SÓ do vigia. É a única forma de correr aqui o
+            // caminho que, lá fora, acontece com uma janela minimizada.
+            if self.parar.load(Ordering::Relaxed) && std::env::var("BRUMA_SO_VIGIA").is_err() {
                 // O veredicto da CAPTURA. O relógio da média fica do lado do codificador,
                 // que o imprime quando fecha — aqui já não se lhe pode perguntar nada.
                 let s = self.inicio.elapsed().as_secs_f64().max(0.001);
@@ -188,13 +221,27 @@ mod win {
                     }
                     self.tela.clone()
                 };
-                // `try_send` e não `send`: se o codificador está atrasado, LARGA-SE o frame
-                // em vez de segurar a captura à espera dele. Numa transmissão ao vivo,
-                // chegar tarde é pior do que faltar — e segurar aqui atrasaria também o
-                // som, que vai pelo mesmo canal.
-                match self.canal.try_send(Trabalho::Video(pronto)) {
-                    Ok(()) => self.enviados += 1,
-                    Err(_) => self.largados += 1,
+                // Larga-se o frame quando o codificador está atrasado: numa transmissão ao
+                // vivo, chegar tarde é pior do que faltar.
+                //
+                // Mas o limite conta SÓ os frames de vídeo, e não o que estiver no canal.
+                // Antes o canal era partilhado com o som e tinha quatro lugares para os
+                // dois: um pico de vídeo enchia-o e o `try_send` do som falhava — e um
+                // bocado de som perdido não é como um frame perdido. O vídeo largado
+                // apanha-se no frame seguinte; o som largado é um buraco que fica, e os
+                // buracos SOMAM-SE: ao fim de uns minutos a imagem e o som já não estão
+                // juntos. Agora o som nunca é largado, e o vídeo tem o seu próprio teto.
+                if self.na_fila.load(Ordering::Relaxed) >= 4 {
+                    self.largados += 1;
+                } else {
+                    self.na_fila.fetch_add(1, Ordering::Relaxed);
+                    match self.canal.send(Trabalho::Video(pronto)) {
+                        Ok(()) => self.enviados += 1,
+                        Err(_) => {
+                            self.na_fila.fetch_sub(1, Ordering::Relaxed);
+                            self.largados += 1;
+                        }
+                    }
                 }
             }
             Ok(())
@@ -250,12 +297,89 @@ mod win {
         }
     }
 
+    /// O cursor, se esta versão do Windows deixar escolher.
+    ///
+    /// Como o travão de ritmo e a moldura: pedir uma definição que o sistema não tem não é
+    /// ignorado — é recusado, e leva a captura INTEIRA com ele.
+    fn cursor() -> CursorCaptureSettings {
+        use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+        static HA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HA.get_or_init(|| GraphicsCaptureApi::is_cursor_settings_supported().unwrap_or(false)) {
+            CursorCaptureSettings::WithCursor
+        } else {
+            CursorCaptureSettings::Default
+        }
+    }
+
+    /// A moldura amarela, se esta versão do Windows deixar tirá-la.
+    ///
+    /// # A avaria que estava aqui desde sempre
+    ///
+    /// `SetIsBorderRequired` chegou no contrato 12 (Windows 11 21H2 / Server 2022). Em
+    /// Windows 10 não existe — e o `windows-capture` responde a um pedido impossível com
+    /// `BorderConfigUnsupported`, não com um encolher de ombros. Ou seja: a partilha de
+    /// ecrã do Bruma NUNCA funcionou em Windows 10, e ninguém o podia saber, porque em
+    /// release não há consola onde ler o erro.
+    ///
+    /// Uma moldura amarela à volta do que se partilha é um preço pequeno. Ficar sem
+    /// partilha nenhuma não é.
+    fn moldura() -> DrawBorderSettings {
+        use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+        static HA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HA.get_or_init(|| {
+            let r = GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false);
+            if !r {
+                eprintln!("[ecrã] este Windows não deixa tirar a moldura; vai com ela");
+            }
+            r
+        }) {
+            DrawBorderSettings::WithoutBorder
+        } else {
+            DrawBorderSettings::Default
+        }
+    }
+
+    /// O travão de ritmo, se esta versão do Windows o tiver.
+    ///
+    /// A resposta não muda enquanto a app viver, e a pergunta envolve o `ApiInformation` do
+    /// WinRT — pergunta-se uma vez. Quando não há, devolve-se `Default` e o ritmo passa a
+    /// ser travado onde sempre foi possível travá-lo: no relógio de cada amostra, que já é
+    /// real e não depende disto para o vídeo sair com a duração certa.
+    fn intervalo_minimo(fps: u32) -> MinimumUpdateIntervalSettings {
+        use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+        static HA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ha = *HA.get_or_init(|| {
+            // `BRUMA_SEM_TRAVAO=1` finge um Windows sem esta API. Existe porque o ramo do
+            // Windows antigo NUNCA corre na máquina onde isto se escreve, e um ramo que
+            // nunca corre é um ramo por verificar — foi assim que este bug entrou.
+            if std::env::var("BRUMA_SEM_TRAVAO").is_ok() {
+                eprintln!("[ecrã] a fingir um Windows sem travão de ritmo, a pedido");
+                return false;
+            }
+            let r = GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false);
+            if !r {
+                eprintln!(
+                    "[ecrã] este Windows não trava o ritmo na origem; a captura segue sem                      esse travão (o vídeo sai à mesma com a duração certa)"
+                );
+            }
+            r
+        });
+        if ha {
+            MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(
+                1.0 / fps.max(1) as f64,
+            ))
+        } else {
+            MinimumUpdateIntervalSettings::Default
+        }
+    }
+
     /// Arranca a captura do alvo escolhido numa thread própria.
     pub fn arrancar(
         alvo: super::Alvo,
         qualidade: super::Qualidade,
         parar: Arc<AtomicBool>,
         entrega: Entrega,
+        queixa: super::Queixa,
     ) -> Result<(u32, u32)> {
         let (lar, alt) = tamanho_do_alvo(alvo)?;
         let (ls, aa) = caber(lar, alt, qualidade.max_altura);
@@ -281,15 +405,19 @@ mod win {
             None
         };
 
-        // Uma fila curta de propósito: com quatro lugares, o atraso máximo que o codificador
-        // pode acumular é de quatro frames. Mais fundo seria guardar imagens que, quando
-        // saíssem, já não interessavam a ninguém.
-        let (envia, recebe) = std::sync::mpsc::sync_channel::<Trabalho>(4);
+        // O canal não tem fundo, mas o VÍDEO tem: `na_fila` conta os frames à espera e o
+        // tratador larga-os acima de quatro. Assim o atraso de imagem continua limitado a
+        // quatro frames, e o som — que é pequeno e cuja perda não se recupera — passa
+        // sempre. Ver o comentário no `on_frame_arrived`.
+        let (envia, recebe) = std::sync::mpsc::channel::<Trabalho>();
+        let na_fila = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let origem = std::time::Instant::now();
 
         // A thread do codificador. É a ÚNICA que fala com o Media Foundation: o vídeo e o
         // som chegam-lhe pelo canal, e assim nunca há dois lados a escrever no mesmo sink —
         // que é precisamente onde este tipo de código costuma partir-se de forma aleatória.
+        let na_fila_codificador = na_fila.clone();
+        let queixa_codificador = queixa.clone();
         std::thread::spawn(move || {
             let mut c = match Codificador::novo(
                 lar,
@@ -305,13 +433,17 @@ mod win {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("[ecrã] o codificador não abriu: {e:?}");
+                    queixa_codificador(format!("o codificador de vídeo não abriu: {e}"));
                     return;
                 }
             };
             let mut sons = 0u64;
             while let Ok(t) = recebe.recv() {
                 let r = match t {
-                    Trabalho::Video(v) => c.frame(&v),
+                    Trabalho::Video(v) => {
+                        na_fila_codificador.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        c.frame(&v)
+                    }
                     Trabalho::Som(pcm, i, d) => {
                         sons += 1;
                         c.som(&pcm, i, d)
@@ -335,17 +467,27 @@ mod win {
         });
 
         // E o som, se houver. Vai pelo mesmo canal, ancorado ao mesmo relógio.
-        if formato_som.is_some() {
+        if let Some(f) = formato_som {
             let envia_som = envia.clone();
-            crate::som::arrancar(parar.clone(), origem, move |b| {
-                let _ = envia_som.try_send(Trabalho::Som(b.pcm, b.instante, b.duracao));
+            // `send` e não `try_send`: um bocado de som perdido é um buraco que fica, e os
+            // buracos somam-se. O vídeo tem um teto próprio — ver `na_fila`.
+            crate::som::arrancar(parar.clone(), origem, f, move |b| {
+                let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
             });
         }
 
+        let vigia = parar.clone();
         std::thread::spawn(move || {
             // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
             // ponteiros COM que não atravessam threads; o Alvo é só números e atravessa.
-            let flags = (envia, lar, alt, parar, fps);
+            let flags = Flags {
+                canal: envia,
+                na_fila,
+                lar,
+                alt,
+                parar,
+                fps,
+            };
             // Função e não closure: os dois ramos passam tipos diferentes (Monitor e
             // Window) e uma closure fixa-se no primeiro que vê.
             fn definicoes<T: TryInto<windows_capture::settings::GraphicsCaptureItemType>>(
@@ -354,38 +496,81 @@ mod win {
             ) -> Settings<Flags, T> {
                 Settings::new(
                     item,
-                    CursorCaptureSettings::WithCursor,
+                    cursor(),
                     // A moldura amarela do Windows é o equivalente da barra do WebView2:
-                    // se não sair, trocava-se um aviso por outro.
-                    DrawBorderSettings::WithoutBorder,
+                    // se não sair, trocava-se um aviso por outro. Mas só onde ela SE DEIXA
+                    // tirar — ver `moldura`.
+                    moldura(),
                     SecondaryWindowSettings::Default,
                     // O ritmo pedido travado na ORIGEM: o Windows nem chega a capturar o
                     // frame que viria cedo demais. Travar aqui poupa a captura inteira —
                     // travar no nosso lado só pouparia a codificação, depois de a placa
                     // gráfica já ter feito o trabalho.
-                    MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(
-                        1.0 / flags.4.max(1) as f64,
-                    )),
+                    //
+                    // MAS SÓ ONDE EXISTE. O `SetMinUpdateInterval` é API do Windows 11
+                    // 24H2; onde ela não existe, a biblioteca não ignora o pedido — recusa
+                    // a captura INTEIRA com `MinimumUpdateIntervalUnsupported`. A máquina
+                    // onde isto se escreveu é 26200 e nunca deu sinal; a de quem tem
+                    // Windows 10 ficaria sem partilha de ecrã nenhuma, e o sintoma seria
+                    // "no meu funciona". Perguntar primeiro custa uma chamada e evita
+                    // exactamente a classe de avaria que este projecto não consegue
+                    // reproduzir em casa.
+                    intervalo_minimo(flags.fps),
                     DirtyRegionSettings::Default,
                     ColorFormat::Bgra8,
                     flags,
                 )
             }
-            let resultado = match alvo {
+            // `start_free_threaded` e não `start`, e a razão é uma avaria concreta: o
+            // sinal de parar só era lido dentro do `on_frame_arrived`, e a captura do
+            // Windows só entrega frames quando o ecrã MUDA. Numa janela parada ou
+            // minimizada, parar de partilhar não parava nada — ficavam de pé a thread da
+            // captura, a thread do codificador à espera no canal, e a sessão do codificador
+            // da placa gráfica. Com o controlo na mão, o `stop()` manda um WM_QUIT e a
+            // captura acaba mesmo, tenha havido frames ou não.
+            //
+            // Isto só passou a ser seguro hoje: enquanto o codificador vivia dentro da
+            // `Sessao`, ela guardava ponteiros COM e precisava de um `unsafe impl Send` com
+            // a promessa de nunca atravessar threads. Agora guarda um canal e números.
+            let controlo = match alvo {
                 super::Alvo::Ecra(i) => match Monitor::from_index(i) {
-                    Ok(m) => Sessao::start(definicoes(m, flags)),
+                    Ok(m) => Sessao::start_free_threaded(definicoes(m, flags)),
                     Err(e) => {
                         eprintln!("[ecrã] o ecrã desapareceu: {e:?}");
+                        queixa(format!("esse ecrã já não existe: {e:?}"));
                         return;
                     }
                 },
-                super::Alvo::Janela(h) => Sessao::start(definicoes(
+                super::Alvo::Janela(h) => Sessao::start_free_threaded(definicoes(
                     Window::from_raw_hwnd(h as *mut std::ffi::c_void),
                     flags,
                 )),
             };
-            if let Err(e) = resultado {
-                eprintln!("[ecrã] a captura terminou: {e:?}");
+            // `BRUMA_FALHA_CAPTURA=1` finge uma captura que morre DEPOIS de o comando já
+            // ter respondido `Ok`. É o único caminho de falha que não se consegue provocar
+            // de fora, e era exactamente o que ficava invisível: sem consola em release, a
+            // interface dizia "estás a partilhar" para sempre.
+            let controlo = if std::env::var("BRUMA_FALHA_CAPTURA").is_ok() {
+                Err(windows_capture::capture::GraphicsCaptureApiError::FailedToJoinThread)
+            } else {
+                controlo
+            };
+            let controlo = match controlo {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[ecrã] a captura não arrancou: {e:?}");
+                    queixa(format!(
+                        "a captura de ecrã não arrancou neste Windows: {e:?}"
+                    ));
+                    return;
+                }
+            };
+            // Fica-se aqui a vigiar o sinal, e não a dormir à espera de um frame.
+            while !vigia.load(Ordering::Relaxed) && !controlo.is_finished() {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            if let Err(e) = controlo.stop() {
+                eprintln!("[ecrã] ao parar a captura: {e:?}");
             }
         });
 
@@ -405,6 +590,7 @@ mod win {
         _q: super::Qualidade,
         _parar: Arc<AtomicBool>,
         _entrega: Entrega,
+        _queixa: super::Queixa,
     ) -> Result<(u32, u32)> {
         Err(anyhow!(
             "a captura nativa por enquanto só existe no Windows"
@@ -432,12 +618,13 @@ pub fn comecar(
     alvo: Alvo,
     qualidade: Qualidade,
     entrega: Entrega,
+    queixa: Queixa,
 ) -> Result<(u32, u32)> {
     if estado.a_partilhar() {
         return Err(anyhow!("já estás a partilhar"));
     }
     let parar = Arc::new(AtomicBool::new(false));
-    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega)?;
+    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega, queixa)?;
     estado.parar = Some(parar);
     Ok(tamanho)
 }
