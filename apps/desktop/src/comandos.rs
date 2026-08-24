@@ -547,9 +547,16 @@ pub fn comecar_a_partilhar(
             let _ = app.emit("partilha-falhou", razao);
         })
     };
+    let aviso: crate::ecra::Aviso = {
+        let app = app.clone();
+        Arc::new(move |razao: String| {
+            use tauri::Emitter;
+            let _ = app.emit("partilha-aviso", razao);
+        })
+    };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa).map_err(erro)?
+        crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa, aviso).map_err(erro)?
     };
     Ok(serde_json::json!({ "largura": largura, "altura": altura }))
 }
@@ -671,6 +678,23 @@ pub fn autoteste_altura() -> u32 {
         }
     }
     720
+}
+
+/// Mede o som que sai das colunas durante `ms`, e diz se a captura nos exclui.
+///
+/// Serve o autoteste do eco: mede-se calado e outra vez com a app a tocar um tom. Se o
+/// loopback de processo estiver a funcionar, o tom que a app toca NÃO aparece aqui.
+#[tauri::command]
+pub fn medir_som(ms: u64) -> R<serde_json::Value> {
+    let (rms, pico, sem_eco) = crate::som::medir_curto(ms).map_err(erro)?;
+    let quem: Vec<String> = crate::som::sessoes()
+        .into_iter()
+        .map(|(_, pid, nome)| format!("{nome}#{pid}"))
+        .collect();
+    Ok(
+        serde_json::json!({ "rms": rms, "pico": pico, "semEco": sem_eco, "quem": quem,
+                           "eu": std::process::id() }),
+    )
 }
 
 /// A fonte que o autoteste deve partilhar: `--fonte=ecra:99` aponta para um ecrã que não

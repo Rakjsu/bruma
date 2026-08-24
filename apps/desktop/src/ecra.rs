@@ -63,6 +63,14 @@ pub type Entrega = Arc<dyn Fn(&[u8]) + Send + Sync>;
 /// Uma falha que ninguém vê é pior do que uma falha ruidosa.
 pub type Queixa = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Irmão da `Queixa`, para o que **não** impede a partilha mas a pessoa tem de saber.
+///
+/// A diferença é deliberada: a queixa apaga o estado de "estás a partilhar", o aviso
+/// deixa-o de pé. Usar a queixa para um aviso desligava a transmissão por causa de uma
+/// imperfeição; usar um `eprintln!` deixava a pessoa a mandar a voz de toda a gente de
+/// volta sem nunca o saber.
+pub type Aviso = Arc<dyn Fn(String) + Send + Sync>;
+
 /// O que está a acontecer agora. Uma partilha de cada vez, como no Discord.
 #[derive(Default)]
 pub struct Estado {
@@ -403,6 +411,7 @@ mod win {
         parar: Arc<AtomicBool>,
         entrega: Entrega,
         queixa: super::Queixa,
+        aviso: super::Aviso,
     ) -> Result<(u32, u32)> {
         let (lar, alt) = tamanho_do_alvo(alvo)?;
         let (ls, aa) = caber(lar, alt, qualidade.max_altura);
@@ -517,6 +526,12 @@ mod win {
 
         // E o som, se houver. Vai pelo mesmo canal, ancorado ao mesmo relógio.
         if let Some(f) = formato_som {
+            if !f.sem_eco {
+                aviso(
+                    "Esta versão do Windows não deixa separar o som da app do resto, por                      isso a partilha vai levar de volta a voz de quem está na chamada.                      Podes desligar o som da transmissão na engrenagem."
+                        .into(),
+                );
+            }
             let envia_som = envia.clone();
             // `send` e não `try_send`: um bocado de som perdido é um buraco que fica, e os
             // buracos somam-se. O vídeo tem um teto próprio — ver `na_fila`.
@@ -640,6 +655,7 @@ mod win {
         _parar: Arc<AtomicBool>,
         _entrega: Entrega,
         _queixa: super::Queixa,
+        _aviso: super::Aviso,
     ) -> Result<(u32, u32)> {
         Err(anyhow!(
             "a captura nativa por enquanto só existe no Windows"
@@ -668,12 +684,13 @@ pub fn comecar(
     qualidade: Qualidade,
     entrega: Entrega,
     queixa: Queixa,
+    aviso: Aviso,
 ) -> Result<(u32, u32)> {
     if estado.a_partilhar() {
         return Err(anyhow!("já estás a partilhar"));
     }
     let parar = Arc::new(AtomicBool::new(false));
-    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega, queixa)?;
+    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega, queixa, aviso)?;
     estado.parar = Some(parar);
     Ok(tamanho)
 }

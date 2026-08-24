@@ -1660,6 +1660,7 @@ async function alternarEcra() {
 async function iniciarPartilha(fonte) {
   if (voz.ecra || !voz.canal || !voz.servidor) return;
   partilhaFalhou = null;
+  partilhaAviso = null;
 
   // O canal fica aberto desde já, mas o Rust só manda por ele quando estivermos mesmo
   // a olhar (ver_meu_ecra). Criar o <video> agora e deixá-lo a apanhar pedaços às
@@ -2252,6 +2253,18 @@ function desenharNaChamada() {
    Windows não tem, o ecrã a desaparecer, o codificador a recusar. Sem isto, a interface
    ficava a dizer "estás a partilhar" para sempre, sem imagem, sem explicação e sem forma
    de a pessoa perceber que o problema não era a ligação dela. */
+/* O que não impede a partilha mas a pessoa tem de saber — hoje, um Windows que não deixa
+   separar o som da app do resto e portanto devolve a voz da chamada. Fica no botão, que é
+   onde ela vai olhar, e não numa consola que não existe. */
+listen('partilha-aviso', ev => {
+  partilhaAviso = String(ev.payload || '');
+  console.warn('aviso da partilha:', partilhaAviso);
+  desenharRodape();
+});
+
+/** Um aviso sobre a partilha em curso, que não a impede. */
+let partilhaAviso = null;
+
 listen('partilha-falhou', ev => {
   const razao = String(ev.payload || 'a captura parou');
   console.warn('a partilha falhou:', razao);
@@ -2392,7 +2405,9 @@ async function desenharRodape() {
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
     $('#btn-partilhar').classList.toggle('is-cortado', !!partilhaFalhou);
     $('#btn-partilhar').title = partilhaFalhou
+      || partilhaAviso
       || (voz.ecra ? 'Parar de partilhar' : 'Partilhar ecrã');
+    $('#btn-partilhar').classList.toggle('is-avisado', !partilhaFalhou && !!partilhaAviso);
     $('#btn-camara').disabled = false;
     $('#btn-camara').classList.toggle('is-on', !!voz.camara);
     $('#btn-camara').classList.toggle('is-cortado', !!camaraFalhou);
@@ -2720,6 +2735,52 @@ function pararDeAssistir() {
     + ` AudioDecoder=${await pergunta(window.AudioDecoder)}`
     + ` MediaStreamTrackProcessor=${typeof window.MediaStreamTrackProcessor === 'undefined' ? 'não existe' : 'existe'}`
     + ` AudioWorklet=${typeof AudioWorkletNode === 'undefined' ? 'não existe' : 'existe'}`);
+})();
+
+/* ---------- autoteste do ECO ------------------------------------------------ */
+
+/* A pergunta: quando o Bruma partilha o som do sistema, ele apanha a SUA PRÓPRIA voz?
+
+   Se apanhasse, a voz das outras pessoas na chamada — que sai pelas colunas por ordem do
+   Bruma — voltava a entrar na partilha e era reenviada. Quem estivesse do outro lado
+   ouvia-se a si próprio, com o atraso do caminho todo.
+
+   Mede-se por diferença, que é a única forma honesta: primeiro com a app calada, depois
+   com ela a tocar um tom bem alto por si mesma. Se a captura nos exclui, os dois números
+   são praticamente iguais — e se não exclui, o segundo dispara.
+
+   Mede-se por DIFERENÇA e não em absoluto porque a máquina pode ter outra coisa a tocar,
+   e essa é para ser captada: é justamente o que a partilha de ecrã deve levar. */
+(async () => {
+  if (!window.__TAURI__) return;
+  if (!(await invoke('autoteste_pedido').catch(() => 0))) return;
+  const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+
+  const calado = await invoke('medir_som', { ms: 1200 }).catch(e => ({ erro: String(e) }));
+  if (calado.erro) return diz(`autoteste eco: não consegui medir (${calado.erro})`);
+
+  // Um tom nosso, alto, pelo mesmo caminho por onde sai a voz das outras pessoas.
+  const ctx = contextoDeAudio();
+  const osc = ctx.createOscillator();
+  const vol = ctx.createGain();
+  osc.frequency.value = 440;
+  vol.gain.value = 0.35;
+  osc.connect(vol); vol.connect(ctx.destination);
+  osc.start();
+  const aTocar = await invoke('medir_som', { ms: 1200 }).catch(() => null);
+  osc.stop();
+  try { osc.disconnect(); vol.disconnect(); } catch (e) { /* já solto */ }
+  if (!aTocar) return diz('autoteste eco: a segunda medição falhou');
+
+  // Com o tom a 0.35 de ganho, se ele entrasse na captura o rms subia MUITO. O limiar é
+  // generoso de propósito: o que se quer distinguir é "não entrou" de "entrou todo".
+  const subiu = aTocar.rms - calado.rms;
+  const passou = aTocar.semEco ? subiu < 500 : true;
+  diz(`autoteste eco: eu=${aTocar.eu} a tocar agora: ${(aTocar.quem || []).join(', ') || 'ninguem'}`);
+  diz(`autoteste eco: eu=${aTocar.eu} | a tocar agora: ${(aTocar.quem || []).join(', ') || 'ninguem'}`);
+  diz(`autoteste eco: semEco=${aTocar.semEco}`
+    + ` rms calado=${calado.rms.toFixed(0)} a tocar=${aTocar.rms.toFixed(0)}`
+    + ` (subiu ${subiu.toFixed(0)}) -> ${aTocar.semEco ? (passou ? 'EXCLUIDO' : 'FALHOU: o nosso som entrou') : 'sem exclusao neste Windows'}`);
 })();
 
 /* ---------- autoteste da câmara -------------------------------------------- */

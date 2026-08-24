@@ -557,6 +557,8 @@ html, body {
 .btn--ico svg { fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
 .btn--ico:hover { color: var(--text); }
 .btn--ico.is-on { color: var(--mist); border-color: var(--mist); }
+/* Um aviso não é um erro: âmbar e não vermelho, e o botão continua a funcionar. */
+.ico2.is-avisado, .btn.is-avisado { color: var(--amber); }
 
 /* --- diagnóstico da rede ------------------------------------------------- */
 
