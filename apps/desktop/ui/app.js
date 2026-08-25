@@ -1911,12 +1911,26 @@ const ETIQUETA_CODEC = 1;
  *  `appendBuffer` atira exceção se lho fizerem. Por isso há fila: os pedaços chegam ao
  *  ritmo do codificador, não ao ritmo a que o navegador os quer.
  */
-function fluxoDePedacos() {
+function fluxoDePedacos(comSom = false) {
   const media = new MediaSource();
   const el = document.createElement('video');
   el.autoplay = true;
   el.playsInline = true;
+  // Nasce mudo SEMPRE, porque um <video> que nasce com som pode nem chegar a arrancar: a
+  // política de autoplay só deixa passar o que não faz barulho sem alguém ter mandado.
+  //
+  // E depois, se for o ecrã de outra pessoa, desmuta-se — mas só depois de estar mesmo a
+  // tocar, que é quando desmutar já não o impede de arrancar.
+  //
+  // Isto estava só a primeira metade. O som do sistema era captado (o `som.rs` inteiro,
+  // com o loopback de processo para não haver eco), viajava no mesmo fragmento que a
+  // imagem, chegava ao outro lado, era descodificado -- e ia dar a um elemento mudo.
+  // NINGUÉM o ouviu nunca. Não deu nas vistas porque as duas instâncias do teste correm
+  // na mesma máquina, e aí o som sai das colunas de qualquer maneira.
   el.muted = true;
+  if (comSom) {
+    el.addEventListener('playing', () => { el.muted = false; }, { once: true });
+  }
   el.src = URL.createObjectURL(media);
 
   const fila = [];
@@ -2344,7 +2358,8 @@ const fluxosRecebidos = new Map();
     const corpo = bytes.subarray(1 + n);
     let fluxo = fluxosRecebidos.get(chave);
     if (!fluxo) {
-      fluxo = fluxoDePedacos();
+      // Com som: é o ecrã de outra pessoa, e o que ela partilhou inclui o que se ouvia.
+      fluxo = fluxoDePedacos(true);
       fluxosRecebidos.set(chave, fluxo);
       // O painel só sabe que há imagem depois do primeiro pedaço.
       desenharVoz();
@@ -3932,6 +3947,13 @@ function pararDeAssistir() {
         if (quem) {
           const t0 = performance.now();
           assistir(quem);
+          // Volume a zero SO no teste: duas instancias na mesma maquina realimentam-se, e
+          // o `--par` ja tocou som pelas colunas do dono uma vez. O `muted` fica como em
+          // producao, que e o que se quer medir.
+          setTimeout(() => {
+            const e2 = ecraDe(quem);
+            if (e2) e2.volume = 0;
+          }, 300);
           diz(`par CONVIDADO a assistir a ${quem.slice(0, 6)}`);
           // Quanto tempo até APARECER imagem. É o número que o frame-chave fixo melhora:
           // sem ele, dependia da placa gráfica de quem partilha e não era determinável.
@@ -3977,6 +3999,14 @@ function pararDeAssistir() {
           + ` t=${el ? el.currentTime.toFixed(2) : '-'}`
           + ` buffer=[${faixas}] buracos=${buracos} (${emFalta.toFixed(2)}s)`
           + ` pedacos=${el ? el.__pedacos : '-'} fila-max=${el ? el.__filaMax : '-'} aparados=${el ? el.__aparados : '-'}`
+          // O som da partilha ia dar a um elemento mudo e ninguem o ouvia. Aqui exige-se
+          // que o elemento esteja destapado E que esteja mesmo a descodificar audio --
+          // "tem faixa de audio" ja era verdade antes e nao provava nada.
+          //
+          // O volume vai a zero, e so no teste: duas instancias na mesma maquina fariam
+          // realimentacao (o loopback de uma apanha o que a outra toca). O `muted`, esse,
+          // fica como fica em producao -- e o que estava partido.
+          + ` mudo=${el ? el.muted : '-'} audio-bytes=${el ? (el.webkitAudioDecodedByteCount || 0) : '-'}`
           + ` codec=${el && el.__codec ? el.__codec : '?'}`
           + ` erro=${el && el.error ? el.error.code : 'nenhum'}`);
       }
