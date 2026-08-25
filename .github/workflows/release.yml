@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0   # a mesma do rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
 
       # A ETIQUETA TEM DE BATER CERTO COM A VERSAO DA APP.
