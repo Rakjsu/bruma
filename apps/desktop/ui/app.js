@@ -1823,6 +1823,12 @@ async function sairDeVoz(anunciar = true) {
   for (const chave of [...voz.analisadores.keys()]) pararDeVigiar(chave);
   voz.falando.clear();
   voz.aPartilhar.clear();
+  // Quem estava a assistir deixou de estar: sair da chamada acaba com todos os pedidos.
+  // Sem isto, voltar a entrar no mesmo canal trazia os espectadores antigos de volta —
+  // o olho dizia "1" com ninguém a ver, e à primeira actualização da lista o ecrã
+  // voltava a ser ENVIADO a quem já não tinha pedido nada. Uma cópia inteira de upload
+  // para alguém que nem a ia mostrar.
+  voz.aSerVistoPor.clear();
   voz.comCamara.clear();
   voz.infoDaTransmissao.clear();
   voz.entendeCamara.clear();
@@ -2284,6 +2290,7 @@ async function alternarEcra() {
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
     voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
+    voz.aSerVistoPor.clear();   // parar de transmitir acaba com os pedidos de assistir
     anunciarEstado();
     desenharVoz();
     desenharRodape();
@@ -2948,6 +2955,7 @@ listen('partilha-falhou', ev => {
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
   voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
+  voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
   invoke('parar_de_partilhar').catch(() => {});
@@ -4356,6 +4364,15 @@ function pararDeAssistir() {
       diz(`ui defs restauro: recusado=${!/restaurada/i.test(msg) && msg.length > 0}`
         + ` msg="${msg.slice(0, 46)}"`);
       $('#palavras-entrada').value = '';
+
+      // Sair da chamada tem de acabar com os pedidos de assistir. Sobreviviam, e entao
+      // voltar a entrar no mesmo canal trazia espectadores fantasma -- o olho dizia "1"
+      // com ninguem a ver, e a lista enviada ao Rust voltava a incluir quem nao pediu
+      // nada, com uma copia inteira de upload a sair para ele.
+      voz.aSerVistoPor.add('espectador-de-mentira');
+      const antesDeSair = voz.aSerVistoPor.size;
+      await sairDeVoz(false);
+      diz(`ui espectadores: antes=${antesDeSair} depois-de-sair=${voz.aSerVistoPor.size}`);
 
       // O interruptor da privacidade tem de CALAR a pergunta, não esconder a resposta.
       await mostrarPainel('dados');
