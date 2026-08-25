@@ -814,8 +814,11 @@ mod win {
             std::time::Instant::now(),
             |f| sem_eco = f.sem_eco,
             |b| {
-                for c in b.pcm.chunks_exact(2) {
-                    let v = i16::from_le_bytes([c[0], c[1]]) as i32;
+                // `as_chunks` e nao `chunks_exact`: com um tamanho constante o compilador
+                // sabe que cada pedaco tem mesmo 2 bytes, e o `from_le_bytes` deixa de
+                // precisar de os copiar para um array novo. O clippy do CI exige-o.
+                for c in b.pcm.as_chunks::<2>().0 {
+                    let v = i16::from_le_bytes(*c) as i32;
                     pico = pico.max(v.abs());
                     soma += (v as f64) * (v as f64);
                     n += 1;
@@ -850,8 +853,11 @@ mod win {
             |f| formato = Some(f),
             |b| {
                 bocados += 1;
-                for c in b.pcm.chunks_exact(2) {
-                    let v = i16::from_le_bytes([c[0], c[1]]) as i32;
+                // `as_chunks` e nao `chunks_exact`: com um tamanho constante o compilador
+                // sabe que cada pedaco tem mesmo 2 bytes, e o `from_le_bytes` deixa de
+                // precisar de os copiar para um array novo. O clippy do CI exige-o.
+                for c in b.pcm.as_chunks::<2>().0 {
+                    let v = i16::from_le_bytes(*c) as i32;
                     pico = pico.max(v.abs());
                     soma += (v as f64) * (v as f64);
                     amostras += 1;
