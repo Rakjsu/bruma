@@ -407,6 +407,64 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     Ok(())
 }
 
+/// O que tem de acontecer quando uma sessão acaba — aconteça ela acabar como for.
+///
+/// # A avaria que isto corrige
+///
+/// A limpeza estava escrita no FIM da `sessao`, e entre o registo no mapa `ligacoes` e esse
+/// fim há cinco `?`: abrir o stream, o `Ola`, cada `Sync` e a `Presenca`. O `Sync` manda o
+/// histórico inteiro de cada servidor — com uns milhares de mensagens demora, e é
+/// exactamente a janela em que um soluço de Wi-Fi é provável.
+///
+/// Se algum desses `?` saísse, a entrada ficava no mapa a apontar para uma ligação MORTA. E
+/// aí o par ficava inalcançável **para sempre**: o vigia da religação vê `contains_key` e
+/// conclui «já está ligado», o `reservar` recusa, e até colar o convite outra vez deixa de
+/// fazer nada. As mensagens não chegam, a voz sai para uma ligação fechada e o ecrã nunca
+/// vai — até alguém reiniciar a app. É o sintoma que a religação automática existe para
+/// curar, ressuscitado por outra porta.
+///
+/// Um `Drop` corre em todas as saídas. Uma limpeza escrita à mão no fim só corre numa.
+struct SessaoViva {
+    rede: Arc<Rede>,
+    janela: AppHandle,
+    peer: String,
+    serie: u64,
+    tarefas: Vec<tokio::task::JoinHandle<()>>,
+    /// Se já dissemos à interface que este par ligou.
+    ///
+    /// O `peer-ligado` sai depois de haver stream; se a sessão morrer antes disso, ninguém
+    /// contou este par e um `peer-desligado` faria o contador da barra descer a menos do
+    /// que deve — a interface soma e subtrai eventos, não olha para o mapa.
+    anunciado: bool,
+}
+
+impl Drop for SessaoViva {
+    fn drop(&mut self) {
+        for t in &self.tarefas {
+            t.abort();
+        }
+        // Só se apaga do mapa se a ligação que lá está for ESTA. Ver e apagar têm de ser o
+        // mesmo gesto: se entretanto entrou outra sessão, apagá-la deixava o par a parecer
+        // desligado com uma ligação viva por baixo.
+        let era_a_nossa = self
+            .rede
+            .ligacoes
+            .lock()
+            .map(|mut l| {
+                if l.get(&self.peer).map(|(_, s)| *s) == Some(self.serie) {
+                    l.remove(&self.peer);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if era_a_nossa && self.anunciado {
+            let _ = self.janela.emit("peer-desligado", &self.peer);
+        }
+    }
+}
+
 /// `iniciei` diz se fomos nós a ligar-nos ou se foi o outro lado.
 ///
 /// Não é um detalhe: abrir um stream QUIC é uma ação **local**, que quase sempre funciona.
@@ -470,6 +528,28 @@ async fn sessao(
         Destino::Fica => {}
     }
 
+    // O guarda nasce aqui, colado ao registo, e não mais abaixo: abrir o stream já é uma
+    // das saídas que deixava a ligação morta no mapa para sempre.
+    let mut guarda = SessaoViva {
+        rede: rede.clone(),
+        janela: janela.clone(),
+        peer: peer.clone(),
+        serie,
+        tarefas: Vec::new(),
+        anunciado: false,
+    };
+
+    // Uma sessão que morre ENTRE o registo e o stream é o caminho que deixava um par
+    // inalcançável para sempre. Nesta máquina não acontece — a rede local não soluça —
+    // por isso força-se, que é a única forma de o ramo deixar de estar por verificar.
+    if std::env::var("BRUMA_SESSAO_MORRE").is_ok() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static JA: AtomicBool = AtomicBool::new(false);
+        if !JA.swap(true, Ordering::Relaxed) {
+            bail!("sessão morta de propósito (BRUMA_SESSAO_MORRE)");
+        }
+    }
+
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
     let (mut envia, mut recebe) = if iniciei {
         conn.open_bi()
@@ -482,6 +562,7 @@ async fn sessao(
     };
 
     let _ = janela.emit("peer-ligado", &peer);
+    guarda.anunciado = true;
 
     // A voz chega por aqui, fora do stream de controlo: um datagrama por pedaço de som.
     let voz_conn = conn.clone();
@@ -502,6 +583,8 @@ async fn sessao(
             crate::comandos::voz_recebida(&voz_peer, &d);
         }
     });
+
+    guarda.tarefas.push(ouvinte);
 
     let meu_nome = app.nome.lock().unwrap().clone();
     escrever(&mut envia, &Msg::Ola { nome: meu_nome }).await?;
@@ -652,26 +735,13 @@ async fn sessao(
             },
         }
     }
+    // O `abort` e a remoção do mapa são agora do `SessaoViva`, que corre ao sair daqui
+    // por qualquer porta. O `leitor` fica de fora do guarda porque o `select!` precisa
+    // dele emprestado; aborta-se aqui, que é o único sítio onde ele já existe.
     leitor.abort();
-    ouvinte.abort();
     // Só se apaga do mapa se a ligação que lá está for ESTA. Ver e apagar têm de ser o
     // mesmo gesto: se entretanto entrou outra sessão, apagá-la deixava o par a parecer
     // desligado com uma ligação viva por baixo.
-    let era_a_nossa = rede
-        .ligacoes
-        .lock()
-        .map(|mut l| {
-            if l.get(&peer).map(|(_, s)| *s) == Some(serie) {
-                l.remove(&peer);
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false);
-    if era_a_nossa {
-        let _ = janela.emit("peer-desligado", &peer);
-    }
     Ok(())
 }
 

@@ -26,7 +26,7 @@
 //! qualquer, sem UAC, sem registo e sem atalhos, e é assim que a máquina que o compila o
 //! consegue verificar sem ninguém a clicar em janelas.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
@@ -132,6 +132,22 @@ fn dir_padrao() -> PathBuf {
 
 fn dir_de_dados() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Bruma"))
+}
+
+/// Onde a identidade pode estar, por ordem de probabilidade.
+///
+/// A app nao guarda os dados num sitio so: `estado.rs` prefere uma pasta `dados` ao lado
+/// -- e a app instalada corre com o cwd fixo na pasta da instalacao. Instalacoes antigas
+/// vivem assim. O desinstalador so olhava para o `%APPDATA%`, portanto quem tivesse a
+/// identidade ao lado do executavel marcava "apagar para sempre", ouvia que tinha sido
+/// apagada, e ficava com ela intacta no disco.
+fn sitios_dos_dados(destino: &Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(d) = dir_de_dados() {
+        v.push(d);
+    }
+    v.push(destino.join("dados"));
+    v
 }
 
 /* ========================================================================== elevação */
@@ -439,11 +455,29 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
         let _ = hklm.delete_subkey_all(CHAVE_DESINSTALACAO);
     }
 
+    let mut falha_dos_dados: Option<Vec<String>> = None;
     if apagar_dados {
-        // A pessoa marcou a caixa que diz PARA SEMPRE. Cumpre-se.
-        if let Some(dados) = dir_de_dados() {
-            let _ = std::fs::remove_dir_all(dados);
+        // A pessoa marcou a caixa que diz PARA SEMPRE. Cumpre-se -- e CONFIRMA-SE.
+        //
+        // Isto era um `let _ =` sobre um `remove_dir_all`, e a interface dizia "a
+        // identidade foi apagada, como pediste" a seguir, sem olhar. Se a remocao
+        // falhasse -- pasta em uso, permissoes, ou simplesmente noutro sitio -- a pessoa
+        // ficava convencida de que a identidade tinha desaparecido do mundo enquanto ela
+        // continuava no disco. E a mentira mais grave que esta app podia contar.
+        let mut queixas = Vec::new();
+        for dados in sitios_dos_dados(destino) {
+            if !dados.exists() {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_dir_all(&dados) {
+                queixas.push(format!("{}: {e}", dados.display()));
+            } else if dados.exists() {
+                queixas.push(format!("{}: ficou la depois de apagar", dados.display()));
+            }
         }
+        // A queixa fica para o FIM: a mensagem promete que o resto foi desinstalado, e
+        // isso so e verdade depois de o resto ter sido mesmo desinstalado.
+        falha_dos_dados = Some(queixas);
     }
 
     let _ = std::fs::remove_file(destino.join("bruma.exe"));
@@ -495,6 +529,13 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
             .args(["/C", &script.display().to_string()])
             .creation_flags(0x0800_0000)
             .spawn();
+    }
+
+    if let Some(queixas) = falha_dos_dados.filter(|q| !q.is_empty()) {
+        bail!(
+            "o Bruma foi desinstalado, mas NAO consegui apagar a identidade: {}.              Ela continua no disco -- apaga essa pasta a mao para a perderes mesmo.",
+            queixas.join("; ")
+        );
     }
     Ok(())
 }
