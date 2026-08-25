@@ -589,6 +589,19 @@ async fn sessao(
     let meu_nome = app.nome.lock().unwrap().clone();
     escrever(&mut envia, &Msg::Ola { nome: meu_nome }).await?;
 
+    // A subscrição vem ANTES da fotografia do log, e não depois de a mandar.
+    //
+    // Estava lá em baixo, à porta do ciclo. Entre tirar a fotografia e chegar lá passa o
+    // tempo de escrever o histórico inteiro de cada servidor — e tudo o que fosse escrito
+    // nesse intervalo caía no vazio: não ia na fotografia, porque foi escrito depois dela,
+    // e não ia pelo canal, porque ainda não havia quem o ouvisse. A pessoa escrevia uma
+    // mensagem e o outro lado só a via na próxima vez que se ligassem.
+    //
+    // Subscrever primeiro faz o contrário: o que aparecer durante o sync chega DUAS vezes,
+    // e isso não custa nada — o log é endereçado pelo conteúdo e o `merge` ignora o que já
+    // lá está. Entre perder e repetir, repete-se.
+    let mut sub = rede.tx.subscribe();
+
     // Manda tudo o que temos. Quem não tiver o servidor ignora — é mais simples e mais
     // robusto do que negociar primeiro quem tem o quê.
     let pacotes: Vec<(String, Vec<blog::Entry>)> = {
@@ -598,6 +611,14 @@ async fn sessao(
             .collect()
     };
     for (servidor, entradas) in pacotes {
+        // Um sync real de milhares de mensagens demora; nesta maquina e instantaneo, e a
+        // janela em que uma mensagem nova se podia perder fecharia sozinha sem nada provar.
+        // Alarga-se de proposito para o teste de par a poder medir.
+        if let Ok(ms) = std::env::var("BRUMA_SYNC_LENTO")
+            .and_then(|v| v.parse::<u64>().map_err(|_| std::env::VarError::NotPresent))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         escrever(&mut envia, &Msg::Sync { servidor, entradas }).await?;
     }
 
@@ -677,7 +698,6 @@ async fn sessao(
         }
     });
 
-    let mut sub = rede.tx.subscribe();
     loop {
         tokio::select! {
             // Só o leitor de controlo decide o fim. O de datagramas acabar não é motivo

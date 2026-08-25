@@ -3815,6 +3815,15 @@ function pararDeAssistir() {
       }
       diz('par ANFITRIAO escreveu 5 mensagens antes de existir convidado');
 
+      // E uma DURANTE o sync, que e a janela onde uma mensagem se perdia: entre a
+      // fotografia do log e o momento em que a sessao comecava a ouvir o canal das
+      // novidades. Escrita mal o par liga, com o sync propositadamente lento.
+      listen('peer-ligado', () => {
+        invoke('enviar', { servidor: servidorId, canal: texto.id, texto: 'durante o sync' })
+          .then(() => diz('par ANFITRIAO escreveu uma mensagem DURANTE o sync'))
+          .catch(e => diz(`par ANFITRIAO nao conseguiu escrever durante o sync: ${e}`));
+      });
+
       const convite = await invoke('criar_convite', { servidor: servidorId });
       diz(`par ANFITRIAO convite=${convite}`);
     } else {
@@ -3830,6 +3839,20 @@ function pararDeAssistir() {
         const t = srv && srv.canais.find(c => c.tipo === 'texto');
         if (t) msgs = await invoke('mensagens', { servidor: servidorId, canal: t.id }).catch(() => []);
       }
+      // A que foi escrita enquanto o sync ainda corria tem de chegar tambem.
+      let durante = false;
+      for (let i = 0; i < 24 && !durante; i++) {
+        await esperar(500);
+        const srv2 = vista.servidores.find(x => x.id === servidorId);
+        const t2 = srv2 && srv2.canais.find(c => c.tipo === 'texto');
+        if (t2) {
+          const todas = await invoke('mensagens', { servidor: servidorId, canal: t2.id }).catch(() => []);
+          durante = todas.some(m => m.texto === 'durante o sync');
+        }
+        await desenharTudo();
+      }
+      diz(`par CONVIDADO recebeu a mensagem escrita DURANTE o sync: ${durante}`);
+
       diz(`par CONVIDADO recebeu ${msgs.length}/5 mensagens escritas antes de ele entrar`
         + (msgs.length ? ` (primeira: "${msgs[0].texto}", última: "${msgs[msgs.length - 1].texto}")` : ''));
     }
