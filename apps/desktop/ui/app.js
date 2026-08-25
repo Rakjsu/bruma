@@ -4410,6 +4410,50 @@ function pararDeAssistir() {
       diz(`ui defs hora 12h: en-US="${eua}" tem-sufixo=${/[AP]M/.test(eua)}`
         + ` pt-PT="${pt}" sao-diferentes=${eua !== pt}`);
 
+      // O enquadramento: a barra, o painel e o X tem de andar JUNTOS, seja qual for a
+      // largura da janela. Num ecra largo, a grelha antiga encostava tudo a esquerda e
+      // deixava o X a centenas de pixels do texto a que pertence -- e o dono reparou
+      // primeiro do que qualquer medicao minha, porque eu media numa janela estreita.
+      await mostrarPainel('conta');
+      const rBarra = $('#defs-menu').closest('aside').getBoundingClientRect();
+      const rPainel = $('#defs-painel').getBoundingClientRect();
+      const rX = $('#defs-fechar').getBoundingClientRect();
+      const larg = document.documentElement.clientWidth;
+      const vaoBarra = Math.round(rPainel.left - rBarra.right);
+      const vaoX = Math.round(rX.left - rPainel.right);
+      const sobra = Math.round(larg - rX.right);
+      diz(`ui defs enquadramento: janela=${larg} barra-acaba=${Math.round(rBarra.right)}`
+        + ` painel=${Math.round(rPainel.left)}..${Math.round(rPainel.right)} X=${Math.round(rX.left)}`
+        + ` | vao-barra-painel=${vaoBarra} vao-painel-X=${vaoX} sobra-a-direita=${sobra}`
+        + ` juntos=${vaoBarra < 80 && vaoX < 60}`);
+
+      // E agora numa janela LARGA, que e onde isto se estragava. A janela do teste tem
+      // 1280; o dono tem quase o dobro. Medir so na estreita foi o que me deixou publicar
+      // um enquadramento que so fica esquisito a partir de certa largura.
+      const veu = $('#defs');
+      veu.style.width = '2200px';
+      await new Promise(r => setTimeout(r, 60));
+      const lBarra = $('#defs-menu').closest('aside').getBoundingClientRect();
+      const lPainel = $('#defs-painel').getBoundingClientRect();
+      const lX = $('#defs-fechar').getBoundingClientRect();
+      const centroConj = Math.round((lBarra.right - 232 + lX.right) / 2);
+      diz(`ui defs enquadramento largo: fingindo 2200 | barra-acaba=${Math.round(lBarra.right)}`
+        + ` painel=${Math.round(lPainel.left)}..${Math.round(lPainel.right)}`
+        + ` | vao-barra-painel=${Math.round(lPainel.left - lBarra.right)}`
+        + ` vao-painel-X=${Math.round(lX.left - lPainel.right)}`
+        + ` centro-do-conjunto=${centroConj} (meio da janela=1100)`);
+      // E no outro extremo: numa janela apertada o painel tem de encolher em vez de
+      // empurrar a barra para fora ou fazer a pagina rolar de lado.
+      veu.style.width = '760px';
+      await new Promise(r => setTimeout(r, 60));
+      const eBarra = $('#defs-menu').closest('aside').getBoundingClientRect();
+      const ePainel = $('#defs-painel').getBoundingClientRect();
+      const eX = $('#defs-fechar').getBoundingClientRect();
+      diz(`ui defs enquadramento estreito: fingindo 760 | barra=${Math.round(eBarra.width)}`
+        + ` painel=${Math.round(ePainel.width)} X-acaba=${Math.round(eX.right)}`
+        + ` cabe=${eX.right <= 760 && eBarra.width >= 230}`);
+      veu.style.width = '';
+
       const rs = ['ha', 'nao', 'falhou', undefined].map(respostaDaProcura);
       diz(`ui defs update: distintas=${new Set(rs.slice(0, 3)).size}/3`
         + ` falhou-nao-mente=${rs[2] !== rs[1] && /não consegui/.test(rs[2])}`
