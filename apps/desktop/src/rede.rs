@@ -342,6 +342,33 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
     }
 }
 
+/// Reserva o par para uma tentativa de ligação. `false` quer dizer «já há, ou já vai a
+/// caminho» — e nesse caso não se liga outra vez.
+fn reservar(
+    ligacoes: &std::sync::Mutex<std::collections::HashMap<String, (Connection, u64)>>,
+    a_ligar: &std::sync::Mutex<std::collections::HashSet<String>>,
+    peer: &str,
+) -> bool {
+    let ja = ligacoes
+        .lock()
+        .map(|l| l.contains_key(peer))
+        .unwrap_or(false);
+    let Ok(mut fila) = a_ligar.lock() else {
+        return false;
+    };
+    !ja && fila.insert(peer.to_string())
+}
+
+/// Qual das duas ligações sobrevive quando os dois lados se ligam ao mesmo tempo.
+///
+/// Tem de dar o **mesmo resultado nas duas máquinas**. Se cada uma ficasse com a sua, cada
+/// uma escrevia numa ligação que a outra não lia — dois pares ligados e mudos. Por isso a
+/// regra é sobre uma coisa que ambas veem igual: sobrevive a ligação que o id MENOR
+/// iniciou.
+fn fica_esta(eu: &str, peer: &str, iniciei: bool) -> bool {
+    iniciei == (eu < peer)
+}
+
 pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &str) -> Result<()> {
     let id: EndpointId = peer
         .trim()
@@ -357,18 +384,8 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     let peer = &id.to_string();
     // Já ligado, ou a ligar: não se abre uma segunda. A reserva tem de acontecer AGORA e
     // não quando a ligação ficar pronta — ver o comentário de `a_ligar`.
-    {
-        let ja = rede
-            .ligacoes
-            .lock()
-            .map(|l| l.contains_key(peer))
-            .unwrap_or(false);
-        let Ok(mut fila) = rede.a_ligar.lock() else {
-            return Ok(());
-        };
-        if ja || !fila.insert(peer.to_string()) {
-            return Ok(());
-        }
+    if !reservar(&rede.ligacoes, &rede.a_ligar, peer) {
+        return Ok(());
     }
     let conn = match rede.endpoint.connect(EndpointAddr::from(id), ALPN).await {
         Ok(c) => c,
@@ -420,7 +437,7 @@ async fn sessao(
     // das duas serve: cada um escreve na sua e lê na sua, e o outro não está lá. O
     // desempate tem de dar o MESMO resultado nas duas máquinas, por isso é pelo
     // identificador: sobrevive sempre a ligação que o id menor iniciou.
-    let canonica = iniciei == (rede.endpoint.id().to_string().as_str() < peer.as_str());
+    let canonica = fica_esta(&rede.endpoint.id().to_string(), &peer, iniciei);
     enum Destino {
         Fica,
         Substitui(Connection),
@@ -818,6 +835,57 @@ mod testes {
     /// Usa-se o preset sem relay e liga-se pelo endereço direto: o que está em causa é o
     /// transporte, não a descoberta, e depender de servidores externos tornava um teste
     /// de correção num teste de rede.
+    /// A avaria que isto trava: `ligar` consultava só o mapa das ligações, e esse mapa só
+    /// é escrito DEPOIS da ligação estar feita. Duas chamadas seguidas passavam ambas, e
+    /// ficavam duas sessões para o mesmo par — com tudo a sair a dobrar, incluindo cada
+    /// fragmento de ecrã.
+    #[test]
+    fn nao_se_liga_duas_vezes_ao_mesmo() {
+        let ligacoes = Default::default();
+        let a_ligar = Default::default();
+        assert!(
+            reservar(&ligacoes, &a_ligar, "abc"),
+            "a primeira tentativa tem de passar"
+        );
+        assert!(
+            !reservar(&ligacoes, &a_ligar, "abc"),
+            "a segunda tem de ser recusada ENQUANTO a primeira ainda vai a caminho"
+        );
+        assert!(
+            reservar(&ligacoes, &a_ligar, "xyz"),
+            "outro par não é afectado"
+        );
+        // Falhou a ligação: a reserva morre com ela, senão a falha era permanente.
+        a_ligar.lock().unwrap().remove("abc");
+        assert!(
+            reservar(&ligacoes, &a_ligar, "abc"),
+            "depois de falhar, tem de se poder tentar outra vez"
+        );
+    }
+
+    /// O que se prova aqui não é a regra em si, é que as DUAS máquinas chegam à mesma
+    /// conclusão. Uma regra de desempate em que cada lado fica com a sua ligação deixa os
+    /// dois a escrever para ninguém.
+    #[test]
+    fn o_desempate_da_o_mesmo_dos_dois_lados() {
+        for (a, b) in [("aaa", "bbb"), ("bbb", "aaa"), ("m", "mm"), ("z1", "z2")] {
+            // A ligação que A iniciou: A vê-a como iniciada, B vê-a como recebida.
+            let a_sobre_a_dela = fica_esta(a, b, true);
+            let b_sobre_a_dele = fica_esta(b, a, false);
+            assert_eq!(
+                a_sobre_a_dela, b_sobre_a_dele,
+                "{a} e {b} discordam sobre a ligação que {a} iniciou"
+            );
+            // E a outra ligação, a que B iniciou, tem de ter o veredicto CONTRÁRIO —
+            // senão ou sobreviviam as duas, ou não sobrevivia nenhuma.
+            let a_sobre_a_dele = fica_esta(a, b, false);
+            assert_ne!(
+                a_sobre_a_dela, a_sobre_a_dele,
+                "{a} não pode querer ficar com as duas ligações a {b}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn um_datagrama_atravessa_a_ligacao() {
         let a = Endpoint::builder(presets::N0DisableRelay)
