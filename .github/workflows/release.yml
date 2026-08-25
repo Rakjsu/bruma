@@ -131,6 +131,48 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item target/release/instalador.exe Instalar-Bruma.exe
 
+          # --- O instalador passa a ser EXECUTADO, e nao so compilado ------------------
+          #
+          # Ate aqui, o exe que vai para toda a gente nunca era corrido antes de ser
+          # publicado. Duas coisas que so se apanham correndo-o:
+          #
+          #   1. um payload vazio ou truncado -- o build.rs embute um payload vazio se o
+          #      bruma.exe nao existir, e uma troca de ordem publicava um instalador que
+          #      instala nada;
+          #   2. o desinstalador a levar o que nao e dele. Ele apagava `*` da pasta de
+          #      instalacao, e a pasta escreve-se a mao num campo de texto.
+          #
+          # Por isso instala-se numa pasta COM COISAS DENTRO e exige-se que elas sobrevivam.
+          $prova = Join-Path $env:RUNNER_TEMP 'prova-instalador'
+          Remove-Item -Recurse -Force $prova -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $prova | Out-Null
+          'nao me apagues' | Out-File -Encoding utf8 (Join-Path $prova 'tese.docx')
+          New-Item -ItemType Directory -Force (Join-Path $prova 'fotos') | Out-Null
+          'ferias' | Out-File -Encoding utf8 (Join-Path $prova 'fotos/praia.jpg')
+
+          & ./Instalar-Bruma.exe --silencioso --teste "--dir=$prova"
+          if ($LASTEXITCODE -ne 0) { Write-Error "o instalador saiu com $LASTEXITCODE"; exit 1 }
+
+          $app = Join-Path $prova 'bruma.exe'
+          if (-not (Test-Path $app)) { Write-Error 'o instalador nao pos la o bruma.exe'; exit 1 }
+          $mb = [math]::Round((Get-Item $app).Length / 1MB, 1)
+          if ($mb -lt 10) { Write-Error "bruma.exe instalado tem so $mb MB -- payload vazio ou truncado"; exit 1 }
+          if (-not (Test-Path (Join-Path $prova 'uninstall.exe'))) { Write-Error 'sem desinstalador'; exit 1 }
+          Write-Host "instalou: bruma.exe com $mb MB"
+
+          & (Join-Path $prova 'uninstall.exe') --silencioso --teste "--dir=$prova"
+          if ($LASTEXITCODE -ne 0) { Write-Error "o desinstalador saiu com $LASTEXITCODE"; exit 1 }
+          # A limpeza final e feita por um .cmd solto: espera-se por ela, sem adivinhar.
+          for ($i = 0; $i -lt 30 -and (Test-Path $app); $i++) { Start-Sleep -Seconds 1 }
+
+          if (Test-Path $app) { Write-Error 'o desinstalador deixou o bruma.exe para tras'; exit 1 }
+          if (Test-Path (Join-Path $prova 'uninstall.exe')) { Write-Error 'o desinstalador nao se apagou'; exit 1 }
+          if (-not (Test-Path (Join-Path $prova 'tese.docx'))) { Write-Error 'o desinstalador APAGOU um ficheiro do utilizador'; exit 1 }
+          if (-not (Test-Path (Join-Path $prova 'fotos/praia.jpg'))) { Write-Error 'o desinstalador apagou uma subpasta do utilizador'; exit 1 }
+          Write-Host 'desinstalou o que era dele e deixou o resto'
+          Remove-Item -Recurse -Force $prova -ErrorAction SilentlyContinue
+          # ----------------------------------------------------------------------------
+
           # A assinatura le a chave das MESMAS variaveis de ambiente que o tauri-action.
           npx --yes "@tauri-apps/cli@^2" signer sign Instalar-Bruma.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -39,7 +39,9 @@ jobs:
       - name: Nenhum segredo commitado
         shell: bash
         run: |
-          if git ls-files | grep -E '\.(key|pem|onion)$|^.*identity\.json$|recovery\.txt$'; then
+          # `identity.json` nunca existiu neste projeto: o ficheiro chama-se `indice.json`,
+          # e o guarda procurava um nome inventado. Agora procura o que ha mesmo.
+          if git ls-files | grep -E '\.(key|pem|onion)$|(^|/)indice\.json$|recovery\.txt$'; then
             echo "::error::Ficheiro de segredo commitado -- ver .gitignore"
             exit 1
           fi
