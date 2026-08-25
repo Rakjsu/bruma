@@ -520,8 +520,10 @@ const PAINEIS = {
       const a1 = elemento('div', 'caixa__acoes');
       a1.style.justifyContent = 'flex-start';
       const abrir = elemento('button', 'btn', 'Abrir a pasta');
-      abrir.onclick = () => invoke('abrir_pasta_de_dados').catch(() => {});
-      a1.append(abrir);
+      const nota1 = elemento('span', 'nota');
+      abrir.onclick = () => invoke('abrir_pasta_de_dados')
+        .catch(e => { nota1.textContent = `não consegui abrir: ${e}`; });
+      a1.append(abrir, nota1);
       s1.append(a1);
       painel.append(s1);
 
@@ -693,11 +695,11 @@ const PAINEIS = {
       const nota = elemento('span', 'nota');
       proc.onclick = async () => {
         nota.textContent = 'a procurar…';
-        nota.textContent = (await procurarAtualizacao())
-          ? '' : 'já estás na versão mais recente';
+        nota.textContent = respostaDaProcura(await procurarAtualizacao());
       };
       const pasta = elemento('button', 'btn', 'Abrir a pasta');
-      pasta.onclick = () => invoke('abrir_pasta_de_dados').catch(() => {});
+      pasta.onclick = () => invoke('abrir_pasta_de_dados')
+        .catch(e => { nota.textContent = `não consegui abrir: ${e}`; });
       a1.append(proc, pasta, nota);
       s1.append(a1);
       painel.append(s1);
@@ -803,6 +805,16 @@ $('#defs-buscar').oninput = () => desenharMenuDeDefinicoes($('#defs-buscar').val
 document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape' && !$('#defs').hidden) fecharDefinicoes();
 });
+
+/** O que dizer depois de procurar uma versão nova.
+ *
+ *  Está à parte por ser a única forma de provar, sem rede, que as três respostas são
+ *  mesmo três -- e não duas com a falha disfarçada de boa notícia. */
+function respostaDaProcura(r) {
+  if (r === 'ha') return '';                       // a faixa já apareceu e diz tudo
+  if (r === 'nao') return 'já estás na versão mais recente';
+  return 'não consegui verificar — sem rede, ou o servidor está em baixo';
+}
 
 /** A secção das 24 palavras. Vive na Conta, que é onde alguém a iria procurar. */
 function seccaoDasPalavras() {
@@ -1545,11 +1557,17 @@ document.addEventListener('visibilitychange', () => {
    porque reiniciar a meio de uma conversa é uma coisa que se faz a alguém.
    -------------------------------------------------------------------------- */
 
+/** Procura uma versão nova.
+ *
+ *  Devolve `'ha'`, `'nao'` ou `'falhou'` -- três respostas e não duas, porque «não há
+ *  versão nova» e «não consegui saber» são coisas diferentes para quem carregou no botão.
+ *  Enquanto isto devolvia `false` nos dois casos, as Definições diziam "já estás na versão
+ *  mais recente" a alguém que estava sem rede. */
 async function procurarAtualizacao() {
   try {
     const { check } = window.__TAURI__.updater;
     const nova = await check();
-    if (!nova) return;
+    if (!nova) return 'nao';
     $('#texto-update').textContent = `Há uma versão nova do Bruma (${nova.version}).`;
     $('#faixa-update').hidden = false;
     $('#adiar-update').onclick = () => { $('#faixa-update').hidden = true; };
@@ -1570,12 +1588,12 @@ async function procurarAtualizacao() {
         $('#btn-update').disabled = false;
       }
     };
-    return true;
+    return 'ha';
   } catch (e) {
-    // Sem rede, ou o endpoint em baixo. Não vale a pena incomodar ninguém com isso no
-    // arranque — mas quem carregou no botão das Definições está à espera de resposta.
+    // Sem rede, ou o endpoint em baixo. No arranque não vale a pena incomodar ninguém —
+    // por isso é que isto não atira. Mas quem carregou no botão tem de saber a diferença.
     console.warn('verificação de atualização falhou:', e);
-    return false;
+    return 'falhou';
   }
 }
 
@@ -4274,6 +4292,11 @@ function pararDeAssistir() {
       const meio = perguntasSobreJanelas;
       await verJogo();
       const semDeteccao = perguntasSobreJanelas - meio;
+      const rs = ['ha', 'nao', 'falhou', undefined].map(respostaDaProcura);
+      diz(`ui defs update: distintas=${new Set(rs.slice(0, 3)).size}/3`
+        + ` falhou-nao-mente=${rs[2] !== rs[1] && /não consegui/.test(rs[2])}`
+        + ` desconhecido-cai-no-seguro=${rs[3] === rs[2]}`);
+
       diz(`ui defs janelas: guardada=${ligado()} perguntas com=${comDeteccao} sem=${semDeteccao}`
         + ` cartao-escondido=${$('#jogo').hidden} jogo-esquecido=${jogoAberto === null}`);
       if (ligado()) alvo.click();                   // deixar como estava
