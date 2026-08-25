@@ -110,7 +110,14 @@ pub struct Rede {
     /// O resto do módulo trabalha por difusão: escreve-se num canal e cada sessão decide
     /// se lhe diz respeito. Para a voz isso não serve — a voz vai em **datagramas**, que
     /// são enviados na ligação e não num stream, e é preciso ter a ligação à mão.
-    pub ligacoes: std::sync::Mutex<std::collections::HashMap<String, Connection>>,
+    /// A ligação viva de cada par, e o número de série da sessão que a pôs lá.
+    ///
+    /// O número vive DENTRO do mesmo mapa de propósito. Estava à parte, e entre escrever a
+    /// ligação nova e escrever o número havia um instante em que a sessão antiga, ao
+    /// morrer, se reconhecia como a dona e apagava a ligação NOVA — deixando o par a
+    /// parecer desligado com uma sessão viva por baixo. Duas verdades em dois sítios são
+    /// duas oportunidades de discordarem.
+    pub ligacoes: std::sync::Mutex<std::collections::HashMap<String, (Connection, u64)>>,
     /// Quem já está a ser ligado, para não se ligar duas vezes ao mesmo.
     ///
     /// O guarda de `ligar` lia só o `ligacoes`, e esse só é escrito **depois** da ligação
@@ -119,9 +126,6 @@ pub struct Rede {
     /// uma escrever. O resultado eram DUAS sessões para o mesmo par, cada uma com o seu
     /// escritor — e tudo saía a dobrar, incluindo cada fragmento de ecrã.
     pub a_ligar: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Que sessão está viva por par. Serve para a limpeza do fim não apagar do mapa uma
-    /// ligação MAIS NOVA do que aquela que acabou.
-    pub sessoes: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Rede {
@@ -139,7 +143,6 @@ impl Rede {
             tx,
             ligacoes: Default::default(),
             a_ligar: Default::default(),
-            sessoes: Default::default(),
             contagem: Default::default(),
             presenca: Default::default(),
         });
@@ -215,7 +218,7 @@ impl Rede {
         };
         let bytes = bytes::Bytes::copy_from_slice(dados);
         for p in para {
-            if let Some(c) = ligacoes.get(p) {
+            if let Some((c, _)) = ligacoes.get(p) {
                 if c.send_datagram(bytes.clone()).is_ok() {
                     if let Ok(mut n) = self.contagem.lock() {
                         n.entry(p.clone()).or_default().voz_env += 1;
@@ -424,13 +427,13 @@ async fn sessao(
         };
         match l.get(&peer) {
             None => {
-                l.insert(peer.clone(), conn.clone());
+                l.insert(peer.clone(), (conn.clone(), serie));
                 Destino::Fica
             }
             Some(_) if !canonica => Destino::Sobra,
-            Some(v) => {
+            Some((v, _)) => {
                 let v = v.clone();
-                l.insert(peer.clone(), conn.clone());
+                l.insert(peer.clone(), (conn.clone(), serie));
                 Destino::Substitui(v)
             }
         }
@@ -443,9 +446,6 @@ async fn sessao(
         }
         Destino::Substitui(v) => v.close(0u32.into(), b"substituida"),
         Destino::Fica => {}
-    }
-    if let Ok(mut m) = rede.sessoes.lock() {
-        m.insert(peer.clone(), serie);
     }
 
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
@@ -632,20 +632,22 @@ async fn sessao(
     }
     leitor.abort();
     ouvinte.abort();
-    // Só se apaga do mapa se a ligação que lá está for ESTA. Se entretanto entrou outra,
-    // apagá-la deixava o par a parecer desligado com uma sessão viva por baixo.
+    // Só se apaga do mapa se a ligação que lá está for ESTA. Ver e apagar têm de ser o
+    // mesmo gesto: se entretanto entrou outra sessão, apagá-la deixava o par a parecer
+    // desligado com uma ligação viva por baixo.
     let era_a_nossa = rede
-        .sessoes
+        .ligacoes
         .lock()
-        .map(|m| m.get(&peer) == Some(&serie))
+        .map(|mut l| {
+            if l.get(&peer).map(|(_, s)| *s) == Some(serie) {
+                l.remove(&peer);
+                true
+            } else {
+                false
+            }
+        })
         .unwrap_or(false);
     if era_a_nossa {
-        if let Ok(mut l) = rede.ligacoes.lock() {
-            l.remove(&peer);
-        }
-        if let Ok(mut m) = rede.sessoes.lock() {
-            m.remove(&peer);
-        }
         let _ = janela.emit("peer-desligado", &peer);
     }
     Ok(())

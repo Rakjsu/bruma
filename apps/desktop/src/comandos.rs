@@ -847,7 +847,7 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
     peers
         .iter()
         .filter_map(|p| {
-            let c = ligacoes.get(p)?;
+            let (c, _) = ligacoes.get(p)?;
             let caminhos = c.paths();
             let escolhido = caminhos.iter().find(|x| x.is_selected());
             let (relay, ms) = match escolhido {
