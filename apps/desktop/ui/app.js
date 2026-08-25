@@ -79,6 +79,15 @@ function erroEm(id, msg) {
   el.textContent = msg || '';
 }
 
+/** A hora de uma mensagem, no formato que a máquina usa.
+ *
+ *  Estava escrita à mão em 24 horas. O fuso vinha do Windows, o formato não: quem está
+ *  num sítio onde se escreve "3:42 PM" via "15:42". `toLocaleTimeString` sem locale usa o
+ *  do sistema, que é precisamente o que as Definições prometem. */
+function horaCurta(ms) {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 /** Nunca usar innerHTML com texto de outra pessoa. */
 function elemento(tag, cls, texto) {
   const e = document.createElement(tag);
@@ -251,9 +260,7 @@ async function desenharMensagens() {
     if (!seguida) {
       const cab = elemento('div', 'msg__head');
       cab.append(elemento('b', null, m.autor_nome));
-      const d = new Date(m.ts_ms);
-      cab.append(elemento('time', null,
-        `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`));
+      cab.append(elemento('time', null, horaCurta(m.ts_ms)));
       corpo.append(cab);
     }
     corpo.append(elemento('p', null, m.texto));
@@ -720,7 +727,8 @@ const PAINEIS = {
     desenha: painel => {
       painel.append(elemento('h2', null, 'Idioma e Horário'));
       painel.append(aindaNaoHa('A app só fala português.',
-        'Não há tradução nem escolha de idioma, e as horas seguem o relógio do Windows. '
+        'Não há tradução nem escolha de idioma. As horas seguem o relógio do Windows — '
+        + 'fuso e formato, incluindo 12 ou 24 horas. '
         + 'Traduzir a app inteira é trabalho a sério, e não valia a pena antes de ela '
         + 'estar assente.'));
     },
@@ -4292,6 +4300,26 @@ function pararDeAssistir() {
       const meio = perguntasSobreJanelas;
       await verJogo();
       const semDeteccao = perguntasSobreJanelas - meio;
+      // Comparar `horaCurta` com `horaCurta` não prova nada. O que se afirma é que o
+      // formato deixou de estar escrito à mão -- por isso pergunta-se ao sistema qual ele
+      // DIZ ser, e exige-se que a hora escrita corresponda.
+      const quinzeE42 = Date.UTC(2026, 0, 2, 15, 42);
+      const nossa = horaCurta(quinzeE42);
+      const opc = new Intl.DateTimeFormat([], { hour: '2-digit' }).resolvedOptions();
+      const temSufixo = /[ap]\.?\s?m\.?/i.test(nossa);
+      const antiga = (d => `${String(d.getHours()).padStart(2, '0')}`
+        + `:${String(d.getMinutes()).padStart(2, '0')}`)(new Date(quinzeE42));
+      diz(`ui defs hora: "${nossa}" sistema-diz-12h=${!!opc.hour12} escreve-sufixo=${temSufixo}`
+        + ` coerente=${!!opc.hour12 === temSufixo} fuso-aplicado=${!/15:42/.test(nossa)}`
+        + ` difere-do-antigo=${nossa !== antiga}`);
+      // Esta máquina está em 24 h, por isso o ramo dos 12 h nunca correria aqui — e um ramo
+      // que nunca corre é um ramo por verificar. Força-se um locale de 12 h para provar que
+      // o formato responde mesmo ao sistema, em vez de calhar coincidir com o antigo.
+      const eua = new Date(quinzeE42).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const pt = new Date(quinzeE42).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+      diz(`ui defs hora 12h: en-US="${eua}" tem-sufixo=${/[AP]M/.test(eua)}`
+        + ` pt-PT="${pt}" sao-diferentes=${eua !== pt}`);
+
       const rs = ['ha', 'nao', 'falhou', undefined].map(respostaDaProcura);
       diz(`ui defs update: distintas=${new Set(rs.slice(0, 3)).size}/3`
         + ` falhou-nao-mente=${rs[2] !== rs[1] && /não consegui/.test(rs[2])}`
