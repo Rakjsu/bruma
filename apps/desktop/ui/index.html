@@ -385,4 +385,53 @@
   </div>
 </div>
 
+<div class="veu" id="veu-identidade" hidden>
+  <div class="caixa">
+    <h2>A tua identidade</h2>
+    <p>
+      Não há conta nem palavra-passe: a tua identidade é uma chave gerada neste computador.
+      Estas <b>24 palavras</b> são essa chave escrita de outra maneira — com elas recuperas
+      a identidade noutra máquina, ou nesta depois de formatar.
+    </p>
+
+    <div class="aviso">
+      <b>Quem tiver estas palavras é tu.</b> Lê o teu histórico, entra nas tuas salas e fala
+      em teu nome. Escreve-as num papel e guarda-o onde guardarias uma chave de casa — não
+      as mandes por mensagem nem as guardes num sítio partilhado.
+    </div>
+
+    <div id="palavras-caixa" hidden>
+      <div class="members__label">As tuas 24 palavras</div>
+      <div class="palavras" id="palavras"></div>
+      <div class="caixa__acoes" style="justify-content:flex-start">
+        <button class="btn" id="copiar-palavras">Copiar</button>
+        <span class="nota" id="palavras-nota"></span>
+      </div>
+    </div>
+
+    <div class="caixa__acoes" style="justify-content:flex-start">
+      <button class="btn btn--primary" id="ver-palavras">Mostrar as palavras</button>
+      <button class="btn" id="abrir-restaurar">Restaurar de outras palavras</button>
+    </div>
+
+    <div id="restaurar-caixa" hidden>
+      <div class="members__label">Escreve as 24 palavras</div>
+      <textarea id="palavras-entrada" rows="3" placeholder="palavra1 palavra2 palavra3 …"></textarea>
+      <div class="aviso aviso--perigo">
+        Isto <b>troca</b> a identidade desta máquina. Os servidores que tens aqui deixam de
+        abrir — as chaves deles pertencem à identidade antiga. Nada é apagado: o índice
+        antigo fica guardado ao lado, e voltas a entrar nas salas por convite.
+      </div>
+      <div class="caixa__acoes" style="justify-content:flex-start">
+        <button class="btn btn--perigo" id="fazer-restaurar">Restaurar</button>
+        <span class="nota" id="restaurar-nota"></span>
+      </div>
+    </div>
+
+    <div class="caixa__acoes">
+      <button class="btn btn--primary" id="fechar-identidade">Fechar</button>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>

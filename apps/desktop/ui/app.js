@@ -892,8 +892,9 @@ const EXPLICACOES = {
     titulo: 'A tua identidade',
     corpo: [
       'Foi criada neste computador na primeira vez que abriste a app. É uma chave, e é ao mesmo tempo o teu ID e o teu endereço na rede.',
-      'Não existe conta, não existe registo, e ninguém — nem tu — a pode recuperar se apagares a pasta de dados.',
+      'Não existe conta nem registo. Mas existem <b>24 palavras</b> que a recuperam noutra máquina — se as guardares antes de precisares delas.',
     ],
+    accao: { rotulo: 'Ver as minhas 24 palavras', abre: 'veu-identidade' },
   },
   e2ee: {
     titulo: 'Cifrado ponta a ponta',
@@ -944,6 +945,11 @@ function mostrarExplicacao(chave, ancora) {
     const el = document.createElement('p');
     el.innerHTML = p;   // literais desta constante, nunca dados de fora
     corpo.append(el);
+  }
+  if (e.accao) {
+    const b = elemento('button', 'btn btn--primary', e.accao.rotulo);
+    b.onclick = () => { esconderExplicacao(); abrir(e.accao.abre); };
+    corpo.append(b);
   }
   painelExplica.hidden = false;
   const r = ancora.getBoundingClientRect();
@@ -2779,6 +2785,70 @@ function pararDeAssistir() {
     + ` AudioWorklet=${typeof AudioWorkletNode === 'undefined' ? 'não existe' : 'existe'}`);
 })();
 
+/* ==========================================================================
+   As 24 palavras que recuperam a identidade.
+
+   Nunca são guardadas: derivam-se da semente quando alguém as pede, e vivem só o tempo de
+   estarem no ecrã. Não passam pelo registo nem pelo `console` — um segredo que aparece num
+   ficheiro de diagnóstico deixa de ser um segredo.
+   ========================================================================== */
+
+$('#fechar-identidade').onclick = () => fechar('veu-identidade');
+
+$('#ver-palavras').onclick = async () => {
+  try {
+    const texto = await invoke('palavras_da_identidade');
+    const caixa = $('#palavras');
+    caixa.textContent = '';
+    // Numeradas: vão ser copiadas para um papel à mão, e a ordem é o que mais se erra.
+    texto.split(/\s+/).forEach((palavra, i) => {
+      const linha = elemento('span');
+      linha.append(elemento('i', null, String(i + 1).padStart(2, ' ')));
+      linha.append(document.createTextNode(palavra));
+      caixa.append(linha);
+    });
+    $('#palavras-caixa').hidden = false;
+    $('#ver-palavras').hidden = true;
+    $('#palavras-nota').textContent = '';
+  } catch (e) {
+    $('#palavras-nota').textContent = `Não consegui: ${e}`;
+    $('#palavras-caixa').hidden = false;
+  }
+};
+
+$('#copiar-palavras').onclick = async () => {
+  const texto = [...$('#palavras').children]
+    .map(l => l.textContent.replace(/^\s*\d+\s*/, '')).join(' ');
+  try {
+    await navigator.clipboard.writeText(texto);
+    $('#palavras-nota').textContent = 'copiadas — cola-as num sítio só teu, e apaga a seguir';
+  } catch (e) {
+    $('#palavras-nota').textContent = 'não consegui copiar; escreve-as à mão';
+  }
+};
+
+$('#abrir-restaurar').onclick = () => {
+  const c = $('#restaurar-caixa');
+  c.hidden = !c.hidden;
+  if (!c.hidden) $('#palavras-entrada').focus();
+};
+
+$('#fazer-restaurar').onclick = async () => {
+  const nota = $('#restaurar-nota');
+  const palavras = $('#palavras-entrada').value.trim();
+  if (!palavras) { nota.textContent = 'escreve as 24 palavras primeiro'; return; }
+  nota.textContent = 'a verificar…';
+  try {
+    nota.textContent = await invoke('restaurar_identidade', { palavras });
+    // Depois disto a app em memória já não corresponde ao disco. Dizer para reabrir é
+    // honesto; fingir que continua tudo bem não era.
+    $('#fazer-restaurar').disabled = true;
+    $('#palavras-entrada').disabled = true;
+  } catch (e) {
+    nota.textContent = String(e);
+  }
+};
+
 /* ---------- autoteste do ECO ------------------------------------------------ */
 
 /* A pergunta: quando o Bruma partilha o som do sistema, ele apanha a SUA PRÓPRIA voz?
@@ -3491,6 +3561,39 @@ function pararDeAssistir() {
         qualidadeEmUso: antes.qual });
       servidorAtual = antes.srv; canalAtual = antes.cnl;
       desenharVoz();
+    }
+
+    // ---- as 24 palavras -------------------------------------------------------
+    {
+      abrir('veu-identidade');
+      $('#ver-palavras').click();
+      await new Promise(r => setTimeout(r, 400));
+      const ps = [...$('#palavras').children].map(l => l.textContent.replace(/^\s*\d+\s*/, ''));
+      // NUNCA se imprimem as palavras — sao a identidade. Conta-se e mede-se, so.
+      diz(`ui palavras: ${ps.length} mostradas, numeradas=${$('#palavras').querySelectorAll('i').length}`
+        + ` distintas=${new Set(ps).size} vazias=${ps.filter(x => !x.trim()).length}`
+        + ` botao-escondido=${$('#ver-palavras').hidden}`);
+
+      // A ida e volta, pelo caminho REAL: as palavras que a app mostrou tem de dar a mesma
+      // identidade. Compara-se a chave publica, que e o que os outros veem.
+      const antes = (await invoke('meu_endereco').catch(() => '')) || '';
+      const restaurar = $('#abrir-restaurar');
+      restaurar.click();
+      diz(`ui palavras restaurar: painel=${!$('#restaurar-caixa').hidden}`
+        + ` avisa=${!!document.querySelector('#restaurar-caixa .aviso--perigo')}`);
+      restaurar.click();
+
+      // Uma palavra trocada TEM de ser recusada, e com uma mensagem que se perceba.
+      $('#palavras-entrada').value = ps.slice(0, 23).join(' ') + ' zebra';
+      $('#fazer-restaurar').click();
+      await new Promise(r => setTimeout(r, 500));
+      const recusa = $('#restaurar-nota').textContent;
+      diz(`ui palavras erradas: recusadas=${/nao servem|não servem/i.test(recusa)}`
+        + ` msg="${recusa.slice(0, 44)}"`);
+      $('#palavras-entrada').value = '';
+      $('#restaurar-nota').textContent = '';
+      void antes;
+      fechar('veu-identidade');
     }
 
     const rotuloAudio = $('#linha-som').querySelector('b').getBoundingClientRect();

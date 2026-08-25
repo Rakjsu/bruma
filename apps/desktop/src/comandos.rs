@@ -680,6 +680,39 @@ pub fn autoteste_altura() -> u32 {
     720
 }
 
+/// As 24 palavras que recuperam esta identidade.
+///
+/// Não se guardam em lado nenhum nem se escrevem no registo: são derivadas da semente
+/// sempre que alguém as pede, e vivem só o tempo de estarem no ecrã.
+#[tauri::command]
+pub fn palavras_da_identidade(nucleo: State<Arc<crate::estado::App>>) -> R<String> {
+    spike_common::crypto::semente_em_palavras(nucleo.semente_bruta()).map_err(erro)
+}
+
+/// Substitui a identidade desta máquina pela que as palavras descrevem.
+///
+/// # Porque é que isto não mexe nos dados
+///
+/// A identidade nova não decifra os servidores da antiga — as chaves deles estão no índice,
+/// cifrado com a semente ANTIGA. Portanto o índice antigo é posto de lado em vez de ser
+/// apagado, e a app arranca limpa com a identidade recuperada. Quem estava numa sala volta
+/// a entrar por convite, que é o caminho normal.
+///
+/// Apagar seria mais arrumado e muito pior: se a pessoa se enganou nas palavras, o que
+/// tinha desaparecia sem volta.
+#[tauri::command]
+pub fn restaurar_identidade(palavras: String) -> R<String> {
+    let semente = spike_common::crypto::palavras_em_semente(&palavras).map_err(erro)?;
+    let raiz = crate::estado::raiz();
+    let indice = raiz.join("indice.json");
+    if indice.exists() {
+        let guardado = indice.with_extension("json.antes-de-restaurar");
+        std::fs::rename(&indice, &guardado).map_err(erro)?;
+    }
+    std::fs::write(raiz.join("identidade.key"), semente).map_err(erro)?;
+    Ok("A identidade foi restaurada. Fecha e volta a abrir o Bruma.".into())
+}
+
 /// Mede o som que sai das colunas durante `ms`, e diz se a captura nos exclui.
 ///
 /// Serve o autoteste do eco: mede-se calado e outra vez com a app a tocar um tom. Se o

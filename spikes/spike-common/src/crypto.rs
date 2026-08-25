@@ -14,6 +14,9 @@ use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 const CTX_X25519: &[u8] = b"bruma/spike1/x25519/v1";
 const CTX_SESSION: &[u8] = b"bruma/spike1/session/v1";
 const CTX_BIND: &[u8] = b"bruma/spike1/prekey-binding/v1";
+/// Contexto da chave que cifra o índice local. Separado dos outros de propósito: uma chave
+/// por finalidade significa que comprometer uma não entrega as outras.
+const CTX_INDICE: &[u8] = b"bruma/indice/v1";
 
 pub struct Identity {
     pub signing: SigningKey,
@@ -76,6 +79,90 @@ pub fn session_key(mine: &StaticSecret, theirs: &XPublic, a: &[u8; 32], b: &[u8;
     key
 }
 
+/// A semente escrita em palavras, para se poder guardar num papel.
+///
+/// # Porquê palavras e não um ficheiro
+///
+/// Um ficheiro copiado vive no mesmo disco que morre. As palavras cabem num papel dentro de
+/// uma gaveta, e sobrevivem ao computador — é essa a diferença que interessa.
+///
+/// São VINTE E QUATRO e não doze porque a semente tem 32 bytes, e 32 bytes são 24 palavras
+/// no BIP39. Doze palavras exigiriam uma semente de 16 bytes, e mudá-la agora invalidava
+/// todas as identidades que já existem. Prometeram-se doze antes de o código existir; a
+/// verdade são vinte e quatro, e é isso que se escreve.
+///
+/// **Isto é a identidade inteira.** Quem tiver estas palavras é a pessoa: lê o histórico,
+/// entra nas salas, fala em nome dela. Guardam-se como se guarda uma chave de casa.
+pub fn semente_em_palavras(seed: &[u8; 32]) -> Result<String> {
+    let m = bip39::Mnemonic::from_entropy(seed).map_err(|e| anyhow!("não deu palavras: {e}"))?;
+    Ok(m.to_string())
+}
+
+/// O caminho de volta: das palavras à semente.
+///
+/// Aceita as palavras como a pessoa as escrever — espaços a mais, linhas partidas,
+/// maiúsculas. Quem copia de um papel escrito à mão vai errar nisso, e recusar por causa de
+/// um espaço seria transformar uma recuperação numa adivinha.
+pub fn palavras_em_semente(texto: &str) -> Result<[u8; 32]> {
+    let limpo = texto
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    // As mensagens do bip39 vêm em inglês e falam de "mnemonic" e "checksum". Quem está a
+    // recuperar uma identidade está normalmente a ter um mau dia; a mensagem tem de dizer o
+    // que fazer, e não o nome do algoritmo.
+    let m = bip39::Mnemonic::parse_normalized(&limpo).map_err(|e| {
+        use bip39::Error::*;
+        match e {
+            BadWordCount(n) => anyhow!(
+                "contei {n} palavras e são precisas 24 — falta alguma, ou sobra?"
+            ),
+            UnknownWord(i) => {
+                let qual = limpo.split(' ').nth(i).unwrap_or("?");
+                anyhow!(
+                    "a palavra {} (\"{qual}\") não é do dicionário — vê se está bem escrita",
+                    i + 1
+                )
+            }
+            InvalidChecksum => anyhow!(
+                "as palavras estão todas certas mas a ordem ou uma delas não bate certo. Confere a lista do princípio ao fim"
+            ),
+            outro => anyhow!("essas palavras não servem: {outro}"),
+        }
+    })?;
+    let (bytes, n) = m.to_entropy_array();
+    if n != 32 {
+        return Err(anyhow!(
+            "essas palavras dão {n} bytes e a identidade precisa de 32 — faltam palavras?"
+        ));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&bytes[..32]);
+    Ok(s)
+}
+
+/// A chave que cifra o índice local, derivada da mesma semente da identidade.
+///
+/// # Porque é que isto tem de existir
+///
+/// O `indice.json` guarda a chave simétrica de **cada servidor**, ao lado do histórico que
+/// essas chaves decifram. Enquanto esteve em texto simples, a cifra do histórico não
+/// protegia nada de quem tivesse acesso à pasta: o cofre estava fechado e a chave colada
+/// por fora.
+///
+/// Não pede password nenhuma, e é deliberado: o Bruma não tem passwords, e inventar uma só
+/// para isto mudava a promessa do produto. Isto protege contra quem lê a pasta — uma cópia
+/// de segurança na nuvem, um disco emprestado, um backup que sai de casa — e não contra
+/// quem já tem a `identidade.key`. Quem tem a identidade é, para todos os efeitos, a pessoa.
+pub fn chave_do_indice(seed: &[u8; 32]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    Hkdf::<Sha256>::new(None, seed)
+        .expand(CTX_INDICE, &mut k)
+        .expect("hkdf índice");
+    k
+}
+
 pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0u8; 24];
@@ -90,6 +177,122 @@ pub fn open(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8]) -> Result<Vec<u8>> {
     XChaCha20Poly1305::new(key.into())
         .decrypt(XNonce::from_slice(nonce), ct)
         .map_err(|_| anyhow!("falha a decifrar"))
+}
+
+#[cfg(test)]
+mod testes_palavras {
+    use super::*;
+
+    #[test]
+    fn as_palavras_devolvem_a_mesma_semente() {
+        let semente = [7u8; 32];
+        let texto = semente_em_palavras(&semente).unwrap();
+        assert_eq!(
+            texto.split_whitespace().count(),
+            24,
+            "32 bytes dao 24 palavras"
+        );
+        assert_eq!(palavras_em_semente(&texto).unwrap(), semente);
+    }
+
+    /// Quem copia de um papel escrito a mao vai errar nos espacos e nas maiusculas.
+    /// Recusar por causa disso seria transformar uma recuperacao numa adivinha.
+    #[test]
+    fn aceita_o_que_uma_pessoa_escreveria() {
+        let semente = [200u8; 32];
+        let texto = semente_em_palavras(&semente).unwrap();
+        let sujo = format!(
+            "  {}  ",
+            texto.to_uppercase().replace(
+                ' ', "
+  "
+            )
+        );
+        assert_eq!(palavras_em_semente(&sujo).unwrap(), semente);
+    }
+
+    /// Uma palavra trocada tem de FALHAR. O BIP39 tem soma de controlo precisamente para
+    /// isto: sem ela, um erro de copia dava uma identidade diferente em silencio.
+    /// Uma palavra que nao existe no dicionario tem de ser apontada PELO NUMERO e pelo
+    /// texto. "zebra" nao serve para este teste: esta no dicionario do BIP39, e o erro
+    /// passa a ser de soma de controlo -- foi o proprio teste que mo ensinou.
+    #[test]
+    fn uma_palavra_inventada_e_apontada() {
+        let texto = semente_em_palavras(&[3u8; 32]).unwrap();
+        let mut ps: Vec<&str> = texto.split(' ').collect();
+        ps[5] = "xyzzy";
+        let e = palavras_em_semente(&ps.join(" ")).unwrap_err().to_string();
+        assert!(
+            e.contains("xyzzy") && e.contains('6'),
+            "tem de dizer QUAL: {e}"
+        );
+    }
+
+    /// A ordem trocada passa pelo dicionario e falha na soma de controlo. A mensagem tem de
+    /// mandar conferir a lista, e nao falar de "checksum".
+    #[test]
+    fn a_ordem_trocada_diz_o_que_fazer() {
+        let texto = semente_em_palavras(&[11u8; 32]).unwrap();
+        let mut ps: Vec<&str> = texto.split(' ').collect();
+        ps.swap(0, 1);
+        let e = palavras_em_semente(&ps.join(" ")).unwrap_err().to_string();
+        assert!(e.contains("ordem") || e.contains("Confere"), "{e}");
+        assert!(!e.to_lowercase().contains("checksum"), "sem jargao: {e}");
+    }
+
+    /// Poucas palavras tem de dizer QUANTAS contou, para a pessoa saber onde procurar.
+    /// Poucas palavras tem de dizer QUANTAS contou. As palavras usadas tem de ser do
+    /// dicionario, senao o erro que salta primeiro e o da palavra desconhecida.
+    #[test]
+    fn conta_as_palavras_que_encontrou() {
+        let texto = semente_em_palavras(&[5u8; 32]).unwrap();
+        let poucas: Vec<&str> = texto.split(' ').take(3).collect();
+        let e = palavras_em_semente(&poucas.join(" "))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains('3') && e.contains("24"), "{e}");
+    }
+
+    /// Doze palavras dao 16 bytes, e a identidade precisa de 32. Tem de dizer isso, e nao
+    /// aceitar e criar meia identidade.
+    #[test]
+    fn doze_palavras_nao_chegam() {
+        let curto = bip39::Mnemonic::from_entropy(&[9u8; 16])
+            .unwrap()
+            .to_string();
+        assert_eq!(curto.split_whitespace().count(), 12);
+        let e = palavras_em_semente(&curto).unwrap_err().to_string();
+        assert!(e.contains("32"), "a mensagem tem de explicar: {e}");
+    }
+
+    /// A identidade derivada das palavras tem de ser a MESMA — e nao so a semente igual.
+    #[test]
+    fn a_identidade_sobrevive_a_viagem() {
+        let semente = [42u8; 32];
+        let antes = Identity::from_seed(&semente);
+        let texto = semente_em_palavras(&semente).unwrap();
+        let depois = Identity::from_seed(&palavras_em_semente(&texto).unwrap());
+        assert_eq!(antes.verifying().as_bytes(), depois.verifying().as_bytes());
+        assert_eq!(antes.x_public().as_bytes(), depois.x_public().as_bytes());
+    }
+
+    /// A chave do indice tem de ser DIFERENTE da de sessao, com a mesma semente. Uma chave
+    /// por finalidade: comprometer uma nao entrega as outras.
+    #[test]
+    fn a_chave_do_indice_e_so_dela() {
+        let semente = [1u8; 32];
+        let ki = chave_do_indice(&semente);
+        assert_ne!(ki, semente, "a chave nao pode ser a propria semente");
+        assert_ne!(
+            ki,
+            chave_do_indice(&[2u8; 32]),
+            "sementes diferentes, chaves diferentes"
+        );
+        // e o que ela cifra, so ela decifra
+        let (n, ct) = seal(&ki, b"as chaves dos servidores").unwrap();
+        assert!(open(&chave_do_indice(&[2u8; 32]), &n, &ct).is_err());
+        assert_eq!(open(&ki, &n, &ct).unwrap(), b"as chaves dos servidores");
+    }
 }
 
 #[cfg(test)]

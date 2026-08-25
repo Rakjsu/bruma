@@ -163,6 +163,14 @@ fn main() {
             println!("Bruma pronto.");
             println!("  dados      : {}", estado::raiz().display());
             println!("  identidade : {}", nucleo.minha_chave());
+            println!(
+                "  nome       : {}",
+                nucleo.nome.lock().map(|n| n.clone()).unwrap_or_default()
+            );
+            println!(
+                "  servidores : {}",
+                nucleo.servidores.lock().map(|s| s.len()).unwrap_or(0)
+            );
             println!("  endereço   : {}", rede.id());
 
             app.manage(nucleo);
@@ -189,6 +197,8 @@ fn main() {
             comandos::autoteste_altura,
             comandos::autoteste_fonte,
             comandos::medir_som,
+            comandos::palavras_da_identidade,
+            comandos::restaurar_identidade,
             comandos::receber_ecra,
             comandos::receber_camara,
             comandos::enviar_camara,

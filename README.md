@@ -3,8 +3,8 @@
 Um Discord P2P, cifrado ponta a ponta — **sem servidor**.
 
 Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves gerado no teu
-PC. Não há máquina central a guardar as tuas mensagens, nem sequer cifradas: quem tem o
-histórico é quem está online.
+PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
+mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
 > **Estado: v0.10.4 — texto, voz, partilha de ecrã com som, e câmara.**
 >
@@ -49,7 +49,8 @@ histórico de toda a gente fique acumulado à espera de ser pedido, vendido ou r
 - **Rede**: [`iroh`](https://github.com/n0-computer/iroh) — QUIC peer-to-peer onde se marca
   por chave pública, não por IP. Hole-punch directo quando dá, relay quando não dá.
 - **Identidade**: uma semente de 32 bytes dá a chave Ed25519 que é ao mesmo tempo o teu ID e
-  o teu endereço de rede.
+  o teu endereço de rede. As mesmas 32 bytes escrevem-se em 24 palavras (BIP39) — clica na
+  marca de identidade, no canto superior esquerdo, para as ver.
 - **Mensagens**: log append-only, assinado e encadeado por hash, com relógio lógico híbrido
   para não depender de os relógios das máquinas estarem certos. O conteúdo é opaco.
 - **Cifra**: XChaCha20-Poly1305 com nonce por mensagem; assinatura Ed25519 sobre o BLAKE3 de
@@ -66,18 +67,17 @@ histórico de toda a gente fique acumulado à espera de ser pedido, vendido ou r
 Isto está aqui à frente de propósito, porque prometer demais em privacidade é como estes
 projectos morrem.
 
-- **Não há cópia de segurança da identidade.** A tua chave são 32 bytes em
-  `%APPDATA%\Bruma\identidade.key`. Se apagares essa pasta, **ninguém — nem tu — recupera a
-  identidade**. Copiar o ficheiro à mão funciona; um botão para o fazer ainda não existe.
+- **Se perderes as 24 palavras E a pasta de dados, a identidade acaba.** Não há conta, não
+  há e-mail de recuperação, não há ninguém a quem pedir. Guarda as palavras primeiro.
 - **O convite é um segredo, e é eterno.** Ele carrega a chave que decifra o servidor.
   Trata-o como uma password: quem o tiver entra e lê o histórico todo. **Não expira e não se
   revoga** — e por isso não há forma de expulsar ninguém.
 - **Não há cargos nem permissões.** Qualquer membro pode criar e apagar canais.
 - **A chave do servidor nunca roda.** Sem isso não há *forward secrecy*: quem obtiver a
   chave lê o passado e o futuro.
-- **O `indice.json`, ao lado do histórico cifrado, guarda as chaves em texto simples.** Quem
-  tiver acesso à tua pasta de dados lê tudo. A cifra protege o que sai pela rede, não o que
-  está no teu disco.
+- **A cifra do disco não te protege de quem tem a tua identidade.** O `indice.json` está
+  cifrado com uma chave derivada da tua semente — protege uma cópia de segurança que saia de
+  casa, não alguém sentado à tua máquina com a `identidade.key` à mão.
 - **Numa chamada, quem está do outro lado pode ver o teu IP** quando a ligação é directa —
   que é o caso normal e o desejável, porque é o mais rápido. Por relay não vê.
 - **O relay vê metadados**: que chaves falam entre si, quando e quanto. Nunca vê conteúdo.

@@ -940,6 +940,27 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .palco__selo--vivo { color: #fff; background: #c0392b; letter-spacing: .1em; }
 /* Quando o número não é o que a pessoa escolheu, o selo diz-o com uma marca discreta —
    e a razão inteira está no title. Âmbar porque não é um erro: é uma explicação. */
+/* As 24 palavras: numeradas, monoespaçadas e em grelha, porque vão ser copiadas para um
+   papel à mão — e a ordem é o que mais se erra. */
+.palavras {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 10px;
+  margin: 8px 0 4px; padding: 12px;
+  background: var(--rail); border: 1px solid var(--line); border-radius: var(--r-lg);
+  font: 500 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.palavras span { color: var(--text); }
+.palavras i { color: var(--dim); font-style: normal; margin-right: 6px; }
+#palavras-entrada {
+  width: 100%; margin: 6px 0; padding: 10px 12px;
+  background: var(--rail); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r-lg);
+  font: 400 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  resize: vertical;
+}
+.aviso--perigo { background: rgba(217, 154, 154, .10); border-color: rgba(217, 154, 154, .34); color: var(--rose); }
+.btn--perigo { background: var(--rose); color: #16181c; border-color: transparent; }
+.btn--perigo:hover { filter: brightness(1.08); }
+
 .palco__selo--nota { color: var(--amber); cursor: help; }
 .palco__selo--nota::after { content: "?"; font-size: 9px; opacity: .8; }
 .palco__selo--vivo .ponto {

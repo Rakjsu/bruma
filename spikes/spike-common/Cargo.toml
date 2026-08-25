@@ -16,3 +16,6 @@ serde_json = "1"
 getrandom = "0.2"
 anyhow = "1"
 data-encoding = "2"
+# As palavras de recuperacao. `default-features = false` tira a lista de idiomas que
+# nao usamos e a dependencia de rand, que aqui nao faz falta.
+bip39 = { version = "2", default-features = false, features = ["std"] }

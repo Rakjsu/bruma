@@ -148,7 +148,7 @@ impl App {
         let semente = semente_ou_cria(&raiz.join("identidade.key"))?;
         let ident = crypto::Identity::from_seed(&semente);
 
-        let indice = ler_indice(&raiz)?;
+        let (indice, em_claro) = ler_indice(&raiz, &semente)?;
         let mut servidores = BTreeMap::new();
         for s in &indice.servidores {
             // UM SERVIDOR MAU NÃO LEVA A APP COM ELE.
@@ -198,12 +198,35 @@ impl App {
             );
         }
 
-        Ok(App {
+        let app = App {
             ident,
             semente,
             nome: Mutex::new(indice.nome),
             servidores: Mutex::new(servidores),
-        })
+        };
+
+        // A CONVERSÃO ACONTECE AGORA, e não "na próxima gravação".
+        //
+        // A primeira versão disto deixava o ficheiro em claro até alguém criar um canal ou
+        // mudar o nome — e quem não fizesse nada ficava com as chaves de todos os servidores
+        // legíveis, para sempre, depois de ter actualizado precisamente para as esconder.
+        // Uma correcção que só se aplica a quem mexe na app não é uma correcção.
+        //
+        // É seguro fazê-lo aqui: tudo já carregou, e se a gravação falhar o ficheiro antigo
+        // continua onde estava. Não se perde nada por tentar.
+        if em_claro {
+            match app.gravar_indice() {
+                Ok(()) => eprintln!("[dados] o índice estava em texto simples; ficou cifrado"),
+                Err(e) => eprintln!("[dados] não consegui cifrar o índice ({e}); fica como estava"),
+            }
+        }
+        Ok(app)
+    }
+
+    /// A semente crua. Só o comando das palavras lhe toca — e por isso é que ela não é
+    /// pública sem mais: quem a tem, é a pessoa.
+    pub fn semente_bruta(&self) -> &[u8; 32] {
+        &self.semente
     }
 
     pub fn minha_chave(&self) -> String {
@@ -223,9 +246,17 @@ impl App {
                 })
                 .collect(),
         };
+        // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
+        let claro = serde_json::to_vec(&indice)?;
+        let (nonce, dados) = crypto::seal(&crypto::chave_do_indice(&self.semente), &claro)?;
+        let cofre = Cofre {
+            v: 1,
+            nonce: HEXLOWER.encode(&nonce),
+            dados: HEXLOWER.encode(&dados),
+        };
         std::fs::write(
             raiz().join("indice.json"),
-            serde_json::to_string_pretty(&indice)?,
+            serde_json::to_string_pretty(&cofre)?,
         )?;
         Ok(())
     }
@@ -242,20 +273,49 @@ fn pos_de_lado(p: &std::path::Path) {
     }
 }
 
-fn ler_indice(raiz: &std::path::Path) -> Result<Indice> {
+/// O `indice.json` cifrado. Fica em JSON com o conteúdo em hex — em vez de bytes crus —
+/// para continuar a ser um ficheiro de texto que se abre e se percebe: vê-se que está
+/// cifrado, vê-se a versão do formato, e não se vê chave nenhuma.
+#[derive(Serialize, Deserialize)]
+struct Cofre {
+    v: u8,
+    nonce: String,
+    dados: String,
+}
+
+fn ler_indice(raiz: &std::path::Path, semente: &[u8; 32]) -> Result<(Indice, bool)> {
     let p = raiz.join("indice.json");
     if !p.exists() {
-        return Ok(Indice::default());
+        return Ok((Indice::default(), false));
     }
-    match serde_json::from_str(&std::fs::read_to_string(&p)?) {
-        Ok(i) => Ok(i),
+    let bruto = std::fs::read_to_string(&p)?;
+
+    // Cifrado é o formato de hoje.
+    if let Ok(cofre) = serde_json::from_str::<Cofre>(&bruto) {
+        let nonce = hex24(&cofre.nonce)?;
+        let dados = HEXLOWER
+            .decode(cofre.dados.as_bytes())
+            .map_err(|e| anyhow!("índice ilegível: {e}"))?;
+        let claro = crypto::open(&crypto::chave_do_indice(semente), &nonce, &dados)?;
+        return Ok((serde_json::from_slice(&claro)?, false));
+    }
+
+    // Em texto simples é o formato ANTIGO: lê-se, e a primeira gravação passa-o a cifrado.
+    // Não se converte aqui de propósito — converter durante a leitura seria escrever no
+    // disco antes de a app estar de pé, e é nesse momento que menos se quer surpresas.
+    if let Ok(i) = serde_json::from_str::<Indice>(&bruto) {
+        return Ok((i, true));
+    }
+
+    match Err::<Indice, _>(anyhow!("não é nem cifrado nem do formato antigo")) {
+        Ok(i) => Ok((i, false)),
         Err(e) => {
             // O índice guarda o NOME e as chaves dos servidores. Sem ele não há nada para
             // abrir — mas há uma diferença enorme entre "a app não abre" e "a app abre
             // vazia e diz o que aconteceu". Escolhe-se a segunda.
             eprintln!("[dados] o índice está estragado ({e}); a começar vazio");
             pos_de_lado(&p);
-            Ok(Indice::default())
+            Ok((Indice::default(), false))
         }
     }
 }
