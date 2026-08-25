@@ -460,19 +460,35 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
     let script = std::env::temp_dir().join("bruma-limpar.cmd");
     // Linha a linha, para o .cmd sair sem indentacao: um `:etiqueta` do cmd tem de
     // comecar na coluna zero, senao o `goto` nao a encontra.
-    let linhas = [
+    // Apagam-se os ficheiros PELO NOME, um a um, e nao com um asterisco.
+    //
+    // A pasta de instalacao escreve-se a mao num campo de texto da interface. Quem
+    // escrevesse la a pasta do Ambiente de Trabalho ficava com um desinstalador que,
+    // mais tarde, apagava tudo o que la estivesse. O instalador poe QUATRO ficheiros
+    // nesta pasta, e sao esses quatro que ele tem o direito de tirar.
+    //
+    // O `rmdir` sem `/S` e de proposito: so remove a pasta se ela ficar vazia. Se la
+    // estiver mais alguma coisa -- a pasta `dados`, ou o que a pessoa la tinha -- a
+    // pasta fica, e e isso que tem de acontecer.
+    let nossos = ["bruma.exe", "bruma.exe.novo", "uninstall.exe", "Bruma.lnk"];
+    let mut linhas = vec![
         "@echo off".to_string(),
         "set n=0".to_string(),
         ":tentar".to_string(),
         "set /a n+=1".to_string(),
         "ping -n 2 127.0.0.1 >nul".to_string(),
-        format!("del /F /Q \"{dir}\\*\" >nul 2>&1"),
-        format!("rmdir \"{dir}\" >nul 2>&1"),
-        format!("if not exist \"{dir}\" goto fim"),
-        "if %n% lss 15 goto tentar".to_string(),
-        ":fim".to_string(),
-        "del \"%~f0\"".to_string(),
     ];
+    for f in nossos {
+        linhas.push(format!("del /F /Q \"{dir}\\{f}\" >nul 2>&1"));
+    }
+    linhas.extend([
+        // O nosso proprio exe e o ultimo a ceder: enquanto ele la estiver, volta-se.
+        format!("if exist \"{dir}\\uninstall.exe\" if %n% lss 15 goto tentar"),
+        format!("rmdir \"{dir}\" >nul 2>&1"),
+        // `del "%~f0"` a meio do ficheiro faz o cmd perder-se e escrever "nao e
+        // possivel encontrar o arquivo em lotes". O `(goto) 2>nul` fecha-o primeiro.
+        "(goto) 2>nul & del \"%~f0\"".to_string(),
+    ]);
     let conteudo = linhas.join("\r\n") + "\r\n";
     if std::fs::write(&script, conteudo).is_ok() {
         let _ = std::process::Command::new("cmd")
