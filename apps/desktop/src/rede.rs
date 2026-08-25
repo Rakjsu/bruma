@@ -350,6 +350,11 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     if id == rede.endpoint.id() {
         bail!("esse é o teu próprio identificador");
     }
+    // Daqui para baixo usa-se a forma canónica, e não o que nos deram. A reserva é posta
+    // aqui e levantada pela sessão, que só conhece o par por `remote_id()`: se as duas
+    // formas diferirem numa maiúscula ou num espaço, a reserva fica presa para sempre e o
+    // par nunca mais é tentado -- uma avaria permanente nascida de uma diferença de texto.
+    let peer = &id.to_string();
     // Já ligado, ou a ligar: não se abre uma segunda. A reserva tem de acontecer AGORA e
     // não quando a ligação ficar pronta — ver o comentário de `a_ligar`.
     {
