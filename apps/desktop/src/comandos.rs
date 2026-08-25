@@ -680,6 +680,31 @@ pub fn autoteste_altura() -> u32 {
     720
 }
 
+/// Onde ficam os dados, o registo e a versão — para as Definições poderem dizê-lo.
+#[tauri::command]
+pub fn sobre_esta_instalacao() -> serde_json::Value {
+    serde_json::json!({
+        "versao": env!("CARGO_PKG_VERSION"),
+        "pasta": crate::estado::raiz().display().to_string(),
+        "registo": crate::registo::caminho().display().to_string(),
+    })
+}
+
+/// Abre a pasta dos dados no Explorador.
+///
+/// Existe porque dizer à pessoa "vai a %APPDATA%\Bruma" é pedir-lhe que decore um caminho
+/// para ir buscar um ficheiro de registo quando alguma coisa já correu mal. Um botão poupa
+/// esse passo precisamente no momento em que ela tem menos paciência para ele.
+#[tauri::command]
+pub fn abrir_pasta_de_dados() -> R<()> {
+    let raiz = crate::estado::raiz();
+    std::process::Command::new("explorer")
+        .arg(raiz.as_os_str())
+        .spawn()
+        .map_err(erro)?;
+    Ok(())
+}
+
 /// As 24 palavras que recuperam esta identidade.
 ///
 /// Não se guardam em lado nenhum nem se escrevem no registo: são derivadas da semente

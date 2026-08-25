@@ -352,11 +352,77 @@ $('#copiar-convite').onclick = async () => {
   $('#copiado').textContent = 'copiado';
 };
 
-$('#btn-perfil').onclick = () => {
-  $('#in-nome').value = vista.nome || '';
-  erroEm('erro-nome', '');
-  abrir('veu-bemvindo');
-  $('#in-nome').focus();
+$('#btn-perfil').onclick = () => abrirDefinicoes();
+
+/** As Definições.
+ *
+ *  O botão já se chamava "Definições" e só abria a caixa de mudar o nome. Tudo o resto que
+ *  se pode configurar andava espalhado — a supressão de ruído num ícone do rodapé, a
+ *  qualidade da transmissão dentro da engrenagem do seletor, e as 24 palavras enterradas
+ *  atrás do explicador da identidade, onde ninguém as ia encontrar.
+ *
+ *  Isto não acrescenta funcionalidade: junta num sítio o que já existia e estava disperso.
+ *  Os atalhos do rodapé continuam a funcionar — quem já sabe onde eles estão não perde nada.
+ */
+async function abrirDefinicoes() {
+  abrir('veu-definicoes');
+  $('#def-nome').value = vista.nome || '';
+  $('#def-nota-nome').textContent = '';
+  erroEm('def-erro-nome', '');
+  $('#def-chave').textContent = (await invoke('meu_endereco').catch(() => '')) || '—';
+  $('#def-ruido').checked = ruidoSuprimido;
+
+  const q = qualidadeDePartilha();
+  $('#def-qualidade').textContent =
+    `transmissão: ${q.altura === 0 ? 'nativa' : q.altura + 'p'} · ${q.fps} ips`
+    + ` · som ${q.som ? 'ligado' : 'desligado'}`;
+
+  const sobre = await invoke('sobre_esta_instalacao').catch(() => null);
+  if (sobre) {
+    $('#def-versao').textContent = `Bruma ${sobre.versao}`;
+    $('#def-pasta').textContent = `${sobre.pasta}\n${sobre.registo}`;
+  }
+  $('#def-nome').focus();
+}
+
+$('#fechar-definicoes').onclick = () => fechar('veu-definicoes');
+
+$('#def-guardar-nome').onclick = async () => {
+  const nome = $('#def-nome').value.trim();
+  if (!nome) return erroEm('def-erro-nome', 'escreve um nome');
+  try {
+    await invoke('definir_nome', { nome });
+    erroEm('def-erro-nome', '');
+    $('#def-nota-nome').textContent = 'guardado';
+    await desenharTudo();
+  } catch (e) {
+    erroEm('def-erro-nome', String(e));
+  }
+};
+
+$('#def-copiar-chave').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('#def-chave').textContent.trim());
+    $('#def-nota-nome').textContent = 'chave copiada';
+  } catch (e) { /* sem área de transferência */ }
+};
+
+// A caixa e o ícone do rodapé mexem na MESMA definição — carregar no ícone é o atalho, e
+// tê-los a discordar seria pior do que não ter os dois.
+$('#def-ruido').onchange = () => {
+  if ($('#def-ruido').checked !== ruidoSuprimido) $('#btn-ruido').click();
+};
+
+$('#def-abrir-pasta').onclick = () => {
+  invoke('abrir_pasta_de_dados').catch(e => {
+    $('#def-nota-update').textContent = `não consegui abrir: ${e}`;
+  });
+};
+
+$('#def-procurar-update').onclick = async () => {
+  $('#def-nota-update').textContent = 'a procurar…';
+  const houve = await procurarAtualizacao();
+  $('#def-nota-update').textContent = houve ? '' : 'já estás na versão mais recente';
 };
 $('#ok-nome').onclick = async () => {
   const nome = $('#in-nome').value.trim();
@@ -916,7 +982,7 @@ const EXPLICACOES = {
       'Foi criada neste computador na primeira vez que abriste a app. É uma chave, e é ao mesmo tempo o teu ID e o teu endereço na rede.',
       'Não existe conta nem registo. Mas existem <b>24 palavras</b> que a recuperam noutra máquina — se as guardares antes de precisares delas.',
     ],
-    accao: { rotulo: 'Ver as minhas 24 palavras', abre: 'veu-identidade' },
+    accao: { rotulo: 'Ver as minhas 24 palavras', abre: 'veu-definicoes' },
   },
   e2ee: {
     titulo: 'Cifrado ponta a ponta',
@@ -970,7 +1036,7 @@ function mostrarExplicacao(chave, ancora) {
   }
   if (e.accao) {
     const b = elemento('button', 'btn btn--primary', e.accao.rotulo);
-    b.onclick = () => { esconderExplicacao(); abrir(e.accao.abre); };
+    b.onclick = () => { esconderExplicacao(); abrirDefinicoes(); };
     corpo.append(b);
   }
   painelExplica.hidden = false;
@@ -1041,9 +1107,12 @@ async function procurarAtualizacao() {
         $('#btn-update').disabled = false;
       }
     };
+    return true;
   } catch (e) {
-    // Sem rede, ou o endpoint em baixo. Não vale a pena incomodar ninguém com isso.
+    // Sem rede, ou o endpoint em baixo. Não vale a pena incomodar ninguém com isso no
+    // arranque — mas quem carregou no botão das Definições está à espera de resposta.
     console.warn('verificação de atualização falhou:', e);
+    return false;
   }
 }
 
@@ -2867,8 +2936,6 @@ function pararDeAssistir() {
    ficheiro de diagnóstico deixa de ser um segredo.
    ========================================================================== */
 
-$('#fechar-identidade').onclick = () => fechar('veu-identidade');
-
 $('#ver-palavras').onclick = async () => {
   try {
     const texto = await invoke('palavras_da_identidade');
@@ -3683,9 +3750,31 @@ $('#fazer-restaurar').onclick = async () => {
       desenharVoz();
     }
 
-    // ---- as 24 palavras -------------------------------------------------------
+    // ---- as Definicoes --------------------------------------------------------
     {
-      abrir('veu-identidade');
+      $('#btn-perfil').click();
+      await new Promise(r => setTimeout(r, 500));
+      const caixa = $('#veu-definicoes');
+      const secoes = [...caixa.querySelectorAll('.members__label')].map(e => e.textContent.trim());
+      diz(`ui definicoes: aberto=${!caixa.hidden} seccoes=${JSON.stringify(secoes)}`);
+      diz(`ui definicoes valores: versao="${$('#def-versao').textContent}"`
+        + ` chave=${$('#def-chave').textContent.length} car`
+        + ` qualidade="${$('#def-qualidade').textContent}"`
+        + ` pasta-tem-registo=${/bruma\.log/.test($('#def-pasta').textContent)}`
+        + ` ruido=${$('#def-ruido').checked}`);
+      // O icone do rodape e a caixa tem de mexer na MESMA definicao.
+      const antes = ruidoSuprimido;
+      $('#btn-ruido').click();
+      await new Promise(r => setTimeout(r, 200));
+      await abrirDefinicoes();
+      const acompanhou = $('#def-ruido').checked === ruidoSuprimido && ruidoSuprimido !== antes;
+      $('#btn-ruido').click();
+      diz(`ui definicoes ruido: caixa-acompanha-o-icone=${acompanhou}`);
+    }
+
+    // ---- as 24 palavras, agora dentro das Definicoes ---------------------------
+    {
+      await abrirDefinicoes();
       $('#ver-palavras').click();
       await new Promise(r => setTimeout(r, 400));
       const ps = [...$('#palavras').children].map(l => l.textContent.replace(/^\s*\d+\s*/, ''));
@@ -3708,12 +3797,17 @@ $('#fazer-restaurar').onclick = async () => {
       $('#fazer-restaurar').click();
       await new Promise(r => setTimeout(r, 500));
       const recusa = $('#restaurar-nota').textContent;
-      diz(`ui palavras erradas: recusadas=${/nao servem|não servem/i.test(recusa)}`
-        + ` msg="${recusa.slice(0, 44)}"`);
+      // O que interessa e que NAO restaurou -- e nao qual das mensagens saiu. A primeira
+      // versao deste teste procurava "nao servem" e falhava com a mensagem da soma de
+      // controlo, que e a certa aqui: "zebra" ESTA no dicionario. Foi o mesmo engano dos
+      // testes de unidade, repetido. Verifica-se o RESULTADO, nao a redaccao.
+      const restaurou = /restaurada/i.test(recusa);
+      diz(`ui palavras erradas: recusadas=${!restaurou && recusa.length > 0}`
+        + ` msg="${recusa.slice(0, 46)}"`);
       $('#palavras-entrada').value = '';
       $('#restaurar-nota').textContent = '';
       void antes;
-      fechar('veu-identidade');
+      fechar('veu-definicoes');
     }
 
     const rotuloAudio = $('#linha-som').querySelector('b').getBoundingClientRect();
