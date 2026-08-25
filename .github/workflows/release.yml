@@ -52,6 +52,18 @@ jobs:
       # Ou seja: o token consegue ENVIAR para uma release que ja exista, e as vezes nao
       # consegue CRIA-LA. Nao controlo a razao; controlo o custo. Feito aqui, no principio,
       # uma recusa custa dez segundos em vez de meia hora -- e diz o que fazer.
+      # A release nasce RASCUNHO e so e publicada no fim, quando tudo passou.
+      #
+      # A v0.12.3 ensinou porque: um passo tardio falhou, e a release ficou publicada na
+      # mesma -- sem o `Instalar-Bruma.exe` e com o `latest.json` do tauri-action a apontar
+      # para o pacote NSIS reformado. Quem procurasse actualizacao teria instalado por
+      # NSIS, noutra pasta, ao lado da instalacao boa. O workflow ficou vermelho e mais
+      # nada: o estrago ja estava na rua.
+      #
+      # O `releases/latest` do GitHub IGNORA rascunhos. Enquanto for rascunho, as
+      # instalacoes existentes continuam a ver a versao anterior, que funciona. Se algum
+      # passo falhar, e assim que fica -- e uma falha deixa de custar uma actualizacao
+      # errada em todas as maquinas.
       - name: Garantir a release
         shell: pwsh
         env:
@@ -60,7 +72,7 @@ jobs:
           $tag = '${{ github.ref_name }}'
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) { "a release $tag ja existe"; exit 0 }
-          gh release create $tag --title "Bruma $tag" --notes "Bruma $tag" --verify-tag
+          gh release create $tag --title "Bruma $tag" --notes "Bruma $tag" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) {
             Write-Error @"
           Nao consegui criar a release $tag com o token das Actions.
@@ -102,7 +114,10 @@ jobs:
             > assinatura de codigo comercial. *Mais informacoes* → *Executar mesmo assim*.
             > A assinatura que existe e a do auto-update, que garante que uma atualizacao
             > veio mesmo daqui e nao de outro sitio.
-          releaseDraft: false
+          # Rascunho ate ao fim -- ver "Garantir a release". Nao e o mesmo que prerelease:
+          # um prerelease e publico e o updater ignorava-o para sempre; um rascunho e
+          # invisivel e deixa de o ser no ultimo passo.
+          releaseDraft: true
           # NAO pode ser prerelease. O endpoint do updater aponta para
           # /releases/latest/download/latest.json, e o "latest" do GitHub IGNORA
           # pre-releases -- o updater receberia 404 para sempre, em silencio.
@@ -204,3 +219,40 @@ jobs:
           # O NSIS reformou-se: sai da pagina para ninguem o descarregar por engano.
           gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe" --yes
           gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe.sig" --yes
+
+      # O ULTIMO passo, e so agora: a partir daqui o updater de toda a gente ve isto.
+      - name: Publicar a release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+
+          # Confirmar o que la esta ANTES de o mostrar. Um `latest.json` a apontar para um
+          # ficheiro que nao existe deixa toda a gente sem actualizacoes, em silencio.
+          $nomes = (gh release view $tag --json assets --jq '[.assets[].name] | join(" ")')
+          foreach ($f in @('Instalar-Bruma.exe', 'Instalar-Bruma.exe.sig', 'latest.json')) {
+            if ($nomes -notmatch [regex]::Escape($f)) {
+              Write-Error "a release $tag nao tem o $f -- fica rascunho"
+              exit 1
+            }
+          }
+          # O `latest.json` que se confere e o MESMO ficheiro que acabou de ser enviado,
+          # aqui ao lado. Descarrega-lo outra vez so acrescentava uma forma de falhar.
+          $j = Get-Content latest.json -Raw | ConvertFrom-Json
+          $url = $j.platforms.'windows-x86_64'.url
+          if ($url -notmatch 'Instalar-Bruma\.exe$') {
+            Write-Error "o latest.json aponta para $url e nao para o Instalar-Bruma.exe -- fica rascunho"
+            exit 1
+          }
+          if ($j.version -ne $tag.TrimStart('v')) {
+            Write-Error "o latest.json diz $($j.version) e a etiqueta e $tag -- fica rascunho"
+            exit 1
+          }
+
+          # `--latest` explicito: e este que o endpoint do updater vai buscar, e nao se
+          # deixa isso a inferencia de datas.
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "publicada: $tag"
