@@ -87,8 +87,18 @@ jobs:
       # cripto de que dependem. O `--workspace` arrastava tambem o spike3, que compila o
       # Tor inteiro para nada: vinte minutos de espera em codigo que nao vai na release.
       # O CI, esse, continua a correr sobre tudo a cada push.
+      # `shell: bash` com `set -e` NAO e decoracao.
+      #
+      # Sem `shell`, um passo em Windows corre em PowerShell -- e em PowerShell um comando
+      # NATIVO que falha nao para o script. So conta o codigo de saida do ULTIMO comando.
+      # Estes tres estavam escritos em linhas seguidas, portanto durante versoes o `cargo
+      # clippy` podia falhar e o passo dava-se por bom, porque o `cargo test` a seguir
+      # passava. Foi assim que a v0.12.3 saiu com o clippy vermelho: os portoes da release
+      # nao gateavam nada.
       - name: Portoes
+        shell: bash
         run: |
+          set -euo pipefail
           cargo fmt --all -- --check
           cargo clippy -p bruma -p instalador -p spike-common --all-targets -- -D warnings
           cargo test -p bruma -p spike-common
