@@ -1920,6 +1920,9 @@ function fluxoDePedacos() {
   el.src = URL.createObjectURL(media);
 
   const fila = [];
+  el.__aparados = 0;
+  el.__filaMax = 0;
+  el.__pedacos = 0;
   let buffer = null;
   let codec = null;
   let aberto = false;
@@ -2037,9 +2040,14 @@ function fluxoDePedacos() {
       }
       if (etiqueta !== ETIQUETA_BYTES) return;
       fila.push(bytes);
+      el.__pedacos += 1;
+      if (fila.length > el.__filaMax) el.__filaMax = fila.length;
       // Se a fila crescer é porque o navegador não acompanha; nesse caso o que interessa
       // é o presente, não o passado.
-      if (fila.length > 60) fila.splice(0, fila.length - 30);
+      if (fila.length > 60) {
+        el.__aparados += fila.length - 30;
+        fila.splice(0, fila.length - 30);
+      }
       escoar();
     },
     /** A razão de não haver imagem, quando não há. `null` significa "ainda a chegar". */
@@ -3924,7 +3932,16 @@ function pararDeAssistir() {
         // acaba logo a seguir ao instante actual) e BURACO (ha dados a frente, mas com um
         // vazio pelo meio que o leitor nao salta). Sem isto, ficava-se a adivinhar.
         let faixas = '—';
+        // Um buffer inteiro devia ser UMA faixa. Se são várias, faltam bocados pelo meio,
+        // e é isso que se conta -- foi um buraco destes, com nome nenhum, que escondeu
+        // durante versões que cada fragmento de ecrã ia pela rede DUAS vezes.
+        let buracos = 0;
+        let emFalta = 0;
         if (el && el.buffered) {
+          for (let i = 1; i < el.buffered.length; i += 1) {
+            const vazio = el.buffered.start(i) - el.buffered.end(i - 1);
+            if (vazio > 0.02) { buracos += 1; emFalta += vazio; }
+          }
           faixas = [];
           for (let i = 0; i < el.buffered.length; i++) {
             faixas.push(`${el.buffered.start(i).toFixed(2)}-${el.buffered.end(i).toFixed(2)}`);
@@ -3935,7 +3952,8 @@ function pararDeAssistir() {
           + ` readyState=${el ? el.readyState : '-'}`
           + ` frames=${q ? q.totalVideoFrames : '?'}`
           + ` t=${el ? el.currentTime.toFixed(2) : '-'}`
-          + ` buffer=[${faixas}]`
+          + ` buffer=[${faixas}] buracos=${buracos} (${emFalta.toFixed(2)}s)`
+          + ` pedacos=${el ? el.__pedacos : '-'} fila-max=${el ? el.__filaMax : '-'} aparados=${el ? el.__aparados : '-'}`
           + ` codec=${el && el.__codec ? el.__codec : '?'}`
           + ` erro=${el && el.error ? el.error.code : 'nenhum'}`);
       }

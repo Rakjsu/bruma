@@ -111,6 +111,17 @@ pub struct Rede {
     /// se lhe diz respeito. Para a voz isso não serve — a voz vai em **datagramas**, que
     /// são enviados na ligação e não num stream, e é preciso ter a ligação à mão.
     pub ligacoes: std::sync::Mutex<std::collections::HashMap<String, Connection>>,
+    /// Quem já está a ser ligado, para não se ligar duas vezes ao mesmo.
+    ///
+    /// O guarda de `ligar` lia só o `ligacoes`, e esse só é escrito **depois** da ligação
+    /// estar feita. Entre a decisão de ligar e o registo passa quase um segundo, e o
+    /// vigia corre de dois em dois: duas chamadas passavam pelo guarda antes de qualquer
+    /// uma escrever. O resultado eram DUAS sessões para o mesmo par, cada uma com o seu
+    /// escritor — e tudo saía a dobrar, incluindo cada fragmento de ecrã.
+    pub a_ligar: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Que sessão está viva por par. Serve para a limpeza do fim não apagar do mapa uma
+    /// ligação MAIS NOVA do que aquela que acabou.
+    pub sessoes: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Rede {
@@ -127,6 +138,8 @@ impl Rede {
             endpoint: endpoint.clone(),
             tx,
             ligacoes: Default::default(),
+            a_ligar: Default::default(),
+            sessoes: Default::default(),
             contagem: Default::default(),
             presenca: Default::default(),
         });
@@ -334,22 +347,32 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     if id == rede.endpoint.id() {
         bail!("esse é o teu próprio identificador");
     }
-    // Já ligado: não se abre uma segunda. Duas sessões para o mesmo peer davam dois
-    // leitores a competir pelo mesmo `ligacoes`, e o segundo apagava o primeiro do mapa
-    // enquanto ele ainda corria.
-    if rede
-        .ligacoes
-        .lock()
-        .map(|l| l.contains_key(peer))
-        .unwrap_or(false)
+    // Já ligado, ou a ligar: não se abre uma segunda. A reserva tem de acontecer AGORA e
+    // não quando a ligação ficar pronta — ver o comentário de `a_ligar`.
     {
-        return Ok(());
+        let ja = rede
+            .ligacoes
+            .lock()
+            .map(|l| l.contains_key(peer))
+            .unwrap_or(false);
+        let Ok(mut fila) = rede.a_ligar.lock() else {
+            return Ok(());
+        };
+        if ja || !fila.insert(peer.to_string()) {
+            return Ok(());
+        }
     }
-    let conn = rede
-        .endpoint
-        .connect(EndpointAddr::from(id), ALPN)
-        .await
-        .map_err(|e| anyhow!("não consegui ligar: {e}"))?;
+    let conn = match rede.endpoint.connect(EndpointAddr::from(id), ALPN).await {
+        Ok(c) => c,
+        Err(e) => {
+            // A reserva morre com a tentativa, senão o par ficava marcado para sempre e
+            // nunca mais se tentava — uma falha de rede passaria a ser permanente.
+            if let Ok(mut fila) = rede.a_ligar.lock() {
+                fila.remove(peer);
+            }
+            return Err(anyhow!("não consegui ligar: {e}"));
+        }
+    };
     let (rede, app, janela) = (rede.clone(), app.clone(), janela.clone());
     tokio::spawn(async move {
         if let Err(e) = sessao(conn, true, rede, app, janela).await {
@@ -375,6 +398,56 @@ async fn sessao(
     app: Arc<App>,
     janela: AppHandle,
 ) -> Result<()> {
+    // O par sabe-se assim que a ligação existe, antes de haver stream nenhum. Registar
+    // aqui — e não lá em baixo — é o que fecha a janela em que duas sessões coexistem.
+    let peer = conn.remote_id().to_string();
+    if let Ok(mut fila) = rede.a_ligar.lock() {
+        fila.remove(&peer);
+    }
+    let serie = {
+        static PROXIMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        PROXIMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    // Se os dois lados se ligarem ao mesmo tempo, ficam com uma ligação cada um e nenhuma
+    // das duas serve: cada um escreve na sua e lê na sua, e o outro não está lá. O
+    // desempate tem de dar o MESMO resultado nas duas máquinas, por isso é pelo
+    // identificador: sobrevive sempre a ligação que o id menor iniciou.
+    let canonica = iniciei == (rede.endpoint.id().to_string().as_str() < peer.as_str());
+    enum Destino {
+        Fica,
+        Substitui(Connection),
+        Sobra,
+    }
+    let destino = {
+        let Ok(mut l) = rede.ligacoes.lock() else {
+            bail!("mapa de ligações partido");
+        };
+        match l.get(&peer) {
+            None => {
+                l.insert(peer.clone(), conn.clone());
+                Destino::Fica
+            }
+            Some(_) if !canonica => Destino::Sobra,
+            Some(v) => {
+                let v = v.clone();
+                l.insert(peer.clone(), conn.clone());
+                Destino::Substitui(v)
+            }
+        }
+    };
+    match destino {
+        // Já há uma sessão melhor com este par. Esta fecha-se caladamente.
+        Destino::Sobra => {
+            conn.close(0u32.into(), b"duplicada");
+            return Ok(());
+        }
+        Destino::Substitui(v) => v.close(0u32.into(), b"substituida"),
+        Destino::Fica => {}
+    }
+    if let Ok(mut m) = rede.sessoes.lock() {
+        m.insert(peer.clone(), serie);
+    }
+
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
     let (mut envia, mut recebe) = if iniciei {
         conn.open_bi()
@@ -386,12 +459,7 @@ async fn sessao(
             .map_err(|e| anyhow!("sem stream: {e}"))?
     };
 
-    let peer = conn.remote_id().to_string();
     let _ = janela.emit("peer-ligado", &peer);
-
-    if let Ok(mut l) = rede.ligacoes.lock() {
-        l.insert(peer.clone(), conn.clone());
-    }
 
     // A voz chega por aqui, fora do stream de controlo: um datagrama por pedaço de som.
     let voz_conn = conn.clone();
@@ -564,10 +632,22 @@ async fn sessao(
     }
     leitor.abort();
     ouvinte.abort();
-    if let Ok(mut l) = rede.ligacoes.lock() {
-        l.remove(&peer);
+    // Só se apaga do mapa se a ligação que lá está for ESTA. Se entretanto entrou outra,
+    // apagá-la deixava o par a parecer desligado com uma sessão viva por baixo.
+    let era_a_nossa = rede
+        .sessoes
+        .lock()
+        .map(|m| m.get(&peer) == Some(&serie))
+        .unwrap_or(false);
+    if era_a_nossa {
+        if let Ok(mut l) = rede.ligacoes.lock() {
+            l.remove(&peer);
+        }
+        if let Ok(mut m) = rede.sessoes.lock() {
+            m.remove(&peer);
+        }
+        let _ = janela.emit("peer-desligado", &peer);
     }
-    let _ = janela.emit("peer-desligado", &peer);
     Ok(())
 }
 
