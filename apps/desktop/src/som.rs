@@ -19,7 +19,7 @@
 //! isso, quando o relógio avança e não veio nada, fabrica-se o silêncio que falta.
 
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// O formato que o dispositivo nos deu. O WASAPI entrega no formato de mistura do
@@ -500,9 +500,11 @@ mod win {
                 ritmo: (*mix).nSamplesPerSec,
                 canais: 2,
                 bits: 16,
-                // Este caminho só serve para o codificador saber o ritmo antes de a captura
-                // começar; quem decide mesmo é o `abrir_cliente`. Assume-se o pior para
-                // ninguém confiar num `true` que ainda não foi ganho.
+                // Este caminho só serve para o codificador saber o ritmo antes de a
+                // captura começar; quem decide mesmo é o `abrir_cliente`. Fica `false`
+                // porque ainda não foi ganho — e por isso NINGUÉM deve tirar conclusões
+                // daqui. Quem quer saber se há eco tem de esperar pelo `anunciar` da
+                // captura, que traz o formato a sério.
                 sem_eco: false,
             };
             CoTaskMemFree(Some(mix as *const _));
@@ -518,6 +520,11 @@ mod win {
         origem: std::time::Instant,
         anunciar: impl FnOnce(Formato),
         mut entrega: impl FnMut(Bocado),
+        // Onde a faixa de som já vai, para quem tiver de continuar daqui. Se a captura
+        // morrer a meio, o silêncio de recurso TEM de continuar deste ponto: recomeçar em
+        // zero mandava amostras para trás no tempo e partia a linha de quem recebe.
+        cursor: &std::sync::atomic::AtomicU64,
+        atraso_visto: &std::sync::atomic::AtomicI64,
     ) -> Result<()> {
         unsafe {
             // O `loopback` é COM puro; sem isto o CoCreateInstance falha na thread nova.
@@ -557,13 +564,34 @@ mod win {
             // soma-se a tudo o que vier — é o que mantém o som colado à imagem em vez de
             // adiantado pelo tempo que a abertura demorou.
             let atraso = (origem.elapsed().as_nanos() / 100) as i64;
+            atraso_visto.store(atraso, Ordering::Relaxed);
             // Onde vai o som já entregue, em frames. É este contador — e não o relógio da
             // parede — que decide quanto silêncio falta: assim o som nunca fica com mais
             // nem menos amostras do que o tempo que passou.
             let mut entregues: u64 = 0;
 
+            // O dispositivo de som não morre a pedido, e um ramo que nunca corre é um
+            // ramo por verificar — sobretudo este, que durante versões transformou uma
+            // avaria em silêncio perfeito.
+            let morre_aos = std::env::var("BRUMA_SOM_MORRE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+
             while !parar.load(Ordering::Relaxed) {
-                let mut pacote = captura.GetNextPacketSize().unwrap_or(0);
+                if let Some(s) = morre_aos {
+                    if inicio.elapsed().as_secs() >= s {
+                        anyhow::bail!("dispositivo de som invalidado (BRUMA_SOM_MORRE)");
+                    }
+                }
+                // `unwrap_or(0)` aqui era mortal e calado. Zero significa "ninguém está a
+                // tocar nada", e é exactamente o que o WASAPI devolve num Err quando o
+                // dispositivo é invalidado -- auscultadores ligados, monitor a adormecer,
+                // o Windows a mudar o dispositivo por omissão. O laço entrava no ramo do
+                // silêncio e fabricava zeros ao ritmo certo, com carimbos certos, para
+                // sempre: quem assiste recebia uma faixa de som perfeita e muda, e quem
+                // partilha continuava a ouvir tudo nas suas colunas sem razão para
+                // desconfiar.
+                let mut pacote = captura.GetNextPacketSize()?;
                 if pacote == 0 {
                     // Com loopback de processo há um evento a avisar; sem ele, dorme-se.
                     // O prazo é curto de propósito: quando nada toca o Windows não acorda
@@ -583,6 +611,7 @@ mod win {
                             instante,
                             duracao: (faltam as u64 * 10_000_000 / ritmo as u64) as i64,
                         });
+                        cursor.store(devidos, Ordering::Relaxed);
                         entregues = devidos;
                     }
                     if evento.is_none() {
@@ -609,6 +638,7 @@ mod win {
                         };
                         let instante = atraso + (entregues * 10_000_000 / ritmo as u64) as i64;
                         entregues += frames as u64;
+                        cursor.store(entregues, Ordering::Relaxed);
                         entrega(Bocado {
                             pcm,
                             instante,
@@ -616,7 +646,7 @@ mod win {
                         });
                     }
                     captura.ReleaseBuffer(frames)?;
-                    pacote = captura.GetNextPacketSize().unwrap_or(0);
+                    pacote = captura.GetNextPacketSize()?;
                 }
             }
             let _ = cliente.Stop();
@@ -776,6 +806,8 @@ mod win {
                     n += 1;
                 }
             },
+            &std::sync::atomic::AtomicU64::new(0),
+            &std::sync::atomic::AtomicI64::new(0),
         )?;
         Ok((
             if n > 0 { (soma / n as f64).sqrt() } else { 0.0 },
@@ -811,6 +843,8 @@ mod win {
                     amostras += 1;
                 }
             },
+            &std::sync::atomic::AtomicU64::new(0),
+            &std::sync::atomic::AtomicI64::new(0),
         )?;
         let s = inicio.elapsed().as_secs_f64().max(0.001);
         let f = formato.ok_or_else(|| anyhow!("o dispositivo não disse o formato"))?;
@@ -896,12 +930,38 @@ pub fn arrancar(
     origem: std::time::Instant,
     formato: Formato,
     mut entrega: impl FnMut(Bocado) + Send + 'static,
+    // O que dizer a quem está a partilhar quando o som se cala. Sem isto, a única marca
+    // era uma linha no registo — e a pessoa continuava a ouvir tudo nas suas colunas.
+    aviso: impl Fn(String) + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        match captar(parar.clone(), origem, |_| {}, &mut entrega) {
+        let cursor = AtomicU64::new(0);
+        let atraso = AtomicI64::new(0);
+        // O `anunciar` traz o formato REAL — o que o `abrir_cliente` conseguiu, e não o
+        // que a sondagem adivinhou. É aqui, e só aqui, que se sabe se há eco.
+        let avisa_eco = &aviso;
+        match captar(
+            parar.clone(),
+            origem,
+            |f: Formato| {
+                if !f.sem_eco {
+                    avisa_eco(
+                        "Esta versão do Windows não deixa separar o som da app do resto,                          por isso a partilha vai levar de volta a voz de quem está na                          chamada. Podes desligar o som da transmissão na engrenagem."
+                            .into(),
+                    );
+                }
+            },
+            &mut entrega,
+            &cursor,
+            &atraso,
+        ) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[som] a captura do som falhou: {e:?}; a faixa segue em silêncio");
+                aviso(
+                    "o dispositivo de som mudou ou deixou de responder — a partilha continua, mas daqui para a frente vai sem som"
+                        .into(),
+                );
                 // A faixa de som JÁ FOI DECLARADA no contentor — o `moov` saiu antes disto
                 // poder falhar, e não há como o voltar atrás. Uma faixa declarada e nunca
                 // alimentada é pior do que silêncio: quem recebe fica à espera de amostras
@@ -909,7 +969,14 @@ pub fn arrancar(
                 //
                 // Portanto alimenta-se. O silêncio custa quase nada a comprimir e mantém a
                 // promessa que o cabeçalho fez.
-                silencio(parar, origem, formato, entrega);
+                silencio(
+                    parar,
+                    origem,
+                    formato,
+                    cursor.load(Ordering::Relaxed),
+                    atraso.load(Ordering::Relaxed),
+                    entrega,
+                );
             }
         }
     });
@@ -920,11 +987,15 @@ fn silencio(
     parar: Arc<AtomicBool>,
     origem: std::time::Instant,
     formato: Formato,
+    // Onde a faixa já ia. Recomeçar em zero mandava amostras para trás no tempo, e uma
+    // linha de tempo que anda para trás não é um som mau — é um leitor que pára.
+    ja_entregues: u64,
+    atraso: i64,
     mut entrega: impl FnMut(Bocado),
 ) {
     let ritmo = formato.ritmo.max(8000) as u64;
     let bytes_por_quadro = 4usize; // estéreo, 16 bits
-    let mut entregues: u64 = 0;
+    let mut entregues: u64 = ja_entregues;
     while !parar.load(Ordering::Relaxed) {
         let decorrido = origem.elapsed().as_secs_f64();
         let devidos = (decorrido * ritmo as f64) as u64;
@@ -932,7 +1003,7 @@ fn silencio(
             let faltam = (devidos - entregues) as usize;
             entrega(Bocado {
                 pcm: vec![0u8; faltam * bytes_por_quadro],
-                instante: (entregues * 10_000_000 / ritmo) as i64,
+                instante: atraso + (entregues * 10_000_000 / ritmo) as i64,
                 duracao: (faltam as u64 * 10_000_000 / ritmo) as i64,
             });
             entregues = devidos;

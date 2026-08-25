@@ -3931,6 +3931,8 @@ function pararDeAssistir() {
       // mas "saiu imagem". `frames` conta o que o descodificador DESENHOU.
       const cams = [...camarasRecebidas.entries()]
         .map(([k, c]) => `${k.slice(0, 6)} ${c.frames} frames`).join(' | ');
+      // Um aviso sobre a partilha tem de CHEGAR a interface, e nao ficar num eprintln.
+      if (partilhaAviso) diz(`par AVISO na interface: "${partilhaAviso.slice(0, 72)}"`);
       diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
         + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`
         + ` | câmaras: ${cams || 'nenhuma'} (anunciadas: ${voz.comCamara.size})`);

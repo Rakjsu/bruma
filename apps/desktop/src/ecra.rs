@@ -390,7 +390,7 @@ mod win {
             let r = GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false);
             if !r {
                 eprintln!(
-                    "[ecrã] este Windows não trava o ritmo na origem; a captura segue sem                      esse travão (o vídeo sai à mesma com a duração certa)"
+ "[ecrã] este Windows não trava o ritmo na origem; a captura segue sem esse travão (o vídeo sai à mesma com a duração certa)"
                 );
             }
             r
@@ -526,18 +526,25 @@ mod win {
 
         // E o som, se houver. Vai pelo mesmo canal, ancorado ao mesmo relógio.
         if let Some(f) = formato_som {
-            if !f.sem_eco {
-                aviso(
-                    "Esta versão do Windows não deixa separar o som da app do resto, por                      isso a partilha vai levar de volta a voz de quem está na chamada.                      Podes desligar o som da transmissão na engrenagem."
-                        .into(),
-                );
-            }
+            // O aviso do eco NÃO se decide aqui. O `formato_som` vem de uma sondagem que
+            // devolve `sem_eco: false` fixo — serve para o codificador saber o ritmo antes
+            // de a captura existir, e mais nada. Decidir por ele fazia a app avisar
+            // SEMPRE que o som ia com eco, mesmo quando não ia, e mandar desligar o som da
+            // partilha sem razão nenhuma. Quem sabe a verdade é a captura, e é ela que
+            // avisa agora.
             let envia_som = envia.clone();
             // `send` e não `try_send`: um bocado de som perdido é um buraco que fica, e os
             // buracos somam-se. O vídeo tem um teto próprio — ver `na_fila`.
-            crate::som::arrancar(parar.clone(), origem, f, move |b| {
-                let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
-            });
+            let avisa_som = aviso.clone();
+            crate::som::arrancar(
+                parar.clone(),
+                origem,
+                f,
+                move |b| {
+                    let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
+                },
+                move |m| avisa_som(m),
+            );
         }
 
         let vigia = parar.clone();
