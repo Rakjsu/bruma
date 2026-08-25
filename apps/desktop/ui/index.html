@@ -385,96 +385,39 @@
   </div>
 </div>
 
-<div class="veu" id="veu-definicoes" hidden>
-  <div class="caixa caixa--def">
-    <h2>Definições</h2>
+<!-- ========================================================================
+     Definições. Ecrã inteiro, com a barra lateral à esquerda.
 
-    <div class="def__sec">
-      <div class="members__label">Quem és</div>
-      <label for="def-nome">Como apareces para os outros</label>
-      <input id="def-nome" placeholder="o teu nome" maxlength="32" autocomplete="off">
-      <div class="caixa__erro" id="def-erro-nome"></div>
-      <div class="caixa__acoes" style="justify-content:flex-start">
-        <button class="btn btn--primary" id="def-guardar-nome">Guardar</button>
-        <span class="nota" id="def-nota-nome"></span>
-      </div>
-      <p class="nota">
-        A tua chave pública é o teu ID — é por ela que os outros te reconhecem.
-      </p>
-      <div class="def__chave" id="def-chave">—</div>
-      <div class="caixa__acoes" style="justify-content:flex-start">
-        <button class="btn" id="def-copiar-chave">Copiar a chave</button>
+     Cinco das secções não têm nada por trás — e dizem-no, em vez de mostrarem
+     um painel vazio ou controlos que não fazem nada. Uma definição que não faz
+     o que diz é pior do que uma definição que não existe.
+     ===================================================================== -->
+<div class="defs" id="defs" hidden>
+  <aside class="defs__lado">
+    <div class="defs__eu">
+      <span class="ident ident--lg" id="defs-avatar"></span>
+      <div class="defs__eu-txt">
+        <b id="defs-nome">—</b>
+        <button class="defs__editar" id="defs-editar">Editar perfil ✏️</button>
       </div>
     </div>
 
-    <div class="def__sec">
-      <div class="members__label">A tua identidade</div>
-      <p class="nota">
-        Não há conta nem palavra-passe. Estas <b>24 palavras</b> são a tua chave escrita de
-        outra maneira — com elas recuperas a identidade noutra máquina, ou nesta depois de
-        formatar.
-      </p>
-      <div class="aviso">
-        <b>Quem tiver estas palavras é tu.</b> Lê o teu histórico, entra nas tuas salas e
-        fala em teu nome. Escreve-as num papel e guarda-o onde guardarias uma chave de casa.
-      </div>
-      <div id="palavras-caixa" hidden>
-        <div class="palavras" id="palavras"></div>
-        <div class="caixa__acoes" style="justify-content:flex-start">
-          <button class="btn" id="copiar-palavras">Copiar</button>
-          <span class="nota" id="palavras-nota"></span>
-        </div>
-      </div>
-      <div class="caixa__acoes" style="justify-content:flex-start">
-        <button class="btn btn--primary" id="ver-palavras">Mostrar as palavras</button>
-        <button class="btn" id="abrir-restaurar">Restaurar de outras palavras</button>
-      </div>
-      <div id="restaurar-caixa" hidden>
-        <textarea id="palavras-entrada" rows="3" placeholder="palavra1 palavra2 palavra3 …"></textarea>
-        <div class="aviso aviso--perigo">
-          Isto <b>troca</b> a identidade desta máquina. Os servidores que tens aqui deixam de
-          abrir — as chaves deles pertencem à identidade antiga. Nada é apagado: o índice
-          antigo fica guardado ao lado, e voltas a entrar nas salas por convite.
-        </div>
-        <div class="caixa__acoes" style="justify-content:flex-start">
-          <button class="btn btn--perigo" id="fazer-restaurar">Restaurar</button>
-          <span class="nota" id="restaurar-nota"></span>
-        </div>
-      </div>
+    <div class="defs__busca">
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <circle cx="7" cy="7" r="4.4" fill="none"/><path d="M10.4 10.4 14 14" fill="none"/>
+      </svg>
+      <input id="defs-buscar" placeholder="Buscar" autocomplete="off">
     </div>
 
-    <div class="def__sec">
-      <div class="members__label">Voz</div>
-      <label class="def__linha">
-        <input type="checkbox" id="def-ruido">
-        <span><b>Supressão de ruído</b><i>tira o ventilador e o teclado; também cancela o eco do microfone</i></span>
-      </label>
-      <p class="nota">
-        Não confundir com o som da <b>partilha</b>: esse exclui-se sozinho, e a qualidade da
-        transmissão escolhe-se na engrenagem quando partilhas o ecrã.
-      </p>
-      <div class="def__valor" id="def-qualidade">—</div>
-    </div>
+    <nav class="defs__menu" id="defs-menu"></nav>
+  </aside>
 
-    <div class="def__sec">
-      <div class="members__label">Esta instalação</div>
-      <div class="def__valor" id="def-versao">—</div>
-      <p class="nota">
-        Os teus dados e o registo ficam fora da pasta do programa, para sobreviverem a
-        actualizações e desinstalações.
-      </p>
-      <div class="def__valor" id="def-pasta">—</div>
-      <div class="caixa__acoes" style="justify-content:flex-start">
-        <button class="btn" id="def-abrir-pasta">Abrir a pasta</button>
-        <button class="btn" id="def-procurar-update">Procurar atualização</button>
-        <span class="nota" id="def-nota-update"></span>
-      </div>
-    </div>
-
-    <div class="caixa__acoes">
-      <button class="btn btn--primary" id="fechar-definicoes">Fechar</button>
-    </div>
-  </div>
+  <section class="defs__conteudo" id="defs-conteudo">
+    <button class="defs__fechar" id="defs-fechar" title="Fechar (Esc)" aria-label="Fechar">
+      <svg viewBox="0 0 20 20" width="16" height="16"><path d="M5 5l10 10M15 5 5 15" fill="none" stroke-linecap="round"/></svg>
+    </button>
+    <div class="defs__painel" id="defs-painel"></div>
+  </section>
 </div>
 
 <script src="app.js"></script>

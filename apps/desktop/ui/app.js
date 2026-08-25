@@ -6,6 +6,33 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+/* ==========================================================================
+   Um erro de JavaScript deixa de desaparecer.
+
+   Tudo o que corri hoje para tornar falhas visíveis parou na fronteira do JS: uma excepção
+   não apanhada ia para um DevTools que ninguém abre, e o sintoma era a interface deixar de
+   responder a meio sem uma palavra em lado nenhum. Foi assim que uma medição minha parou a
+   meio e não deu pista nenhuma.
+
+   Agora vai para o mesmo `bruma.log` de tudo o resto.
+   ========================================================================== */
+(function erros() {
+  const contar = (o_que, msg, onde) => {
+    try {
+      window.__TAURI__.core.invoke('capacidades', {
+        linha: `[js] ${o_que}: ${msg}${onde ? ' @ ' + onde : ''}`,
+      }).catch(() => {});
+    } catch (e) { /* nem o registo há; não há mais nada a fazer */ }
+  };
+  window.addEventListener('error', ev => {
+    contar('erro', ev.message, `${ev.filename || '?'}:${ev.lineno}:${ev.colno}`);
+  });
+  window.addEventListener('unhandledrejection', ev => {
+    const r = ev.reason;
+    contar('promessa recusada', (r && (r.stack || r.message)) || String(r), '');
+  });
+})();
+
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -354,76 +381,512 @@ $('#copiar-convite').onclick = async () => {
 
 $('#btn-perfil').onclick = () => abrirDefinicoes();
 
-/** As Definições.
- *
- *  O botão já se chamava "Definições" e só abria a caixa de mudar o nome. Tudo o resto que
- *  se pode configurar andava espalhado — a supressão de ruído num ícone do rodapé, a
- *  qualidade da transmissão dentro da engrenagem do seletor, e as 24 palavras enterradas
- *  atrás do explicador da identidade, onde ninguém as ia encontrar.
- *
- *  Isto não acrescenta funcionalidade: junta num sítio o que já existia e estava disperso.
- *  Os atalhos do rodapé continuam a funcionar — quem já sabe onde eles estão não perde nada.
- */
-async function abrirDefinicoes() {
-  abrir('veu-definicoes');
-  $('#def-nome').value = vista.nome || '';
-  $('#def-nota-nome').textContent = '';
-  erroEm('def-erro-nome', '');
-  $('#def-chave').textContent = (await invoke('meu_endereco').catch(() => '')) || '—';
-  $('#def-ruido').checked = ruidoSuprimido;
+/* ==========================================================================
+   Definições, em ecrã inteiro.
 
-  const q = qualidadeDePartilha();
-  $('#def-qualidade').textContent =
-    `transmissão: ${q.altura === 0 ? 'nativa' : q.altura + 'p'} · ${q.fps} ips`
-    + ` · som ${q.som ? 'ligado' : 'desligado'}`;
+   # A regra que manda aqui
 
-  const sobre = await invoke('sobre_esta_instalacao').catch(() => null);
-  if (sobre) {
-    $('#def-versao').textContent = `Bruma ${sobre.versao}`;
-    $('#def-pasta').textContent = `${sobre.pasta}\n${sobre.registo}`;
-  }
-  $('#def-nome').focus();
+   Cinco das secções não têm nada por trás — e é isso que elas dizem. A tentação
+   era enchê-las com interruptores plausíveis, e seria a pior coisa possível: um
+   interruptor que não faz nada é uma mentira que a pessoa só descobre quando
+   precisava dele. Ficam listadas, a cinzento, a explicar o que falta e porquê.
+
+   Uma delas nunca vai ter nada, e isso é uma característica: não há cobranças
+   porque não há servidor para pagar nem subscrição para vender.
+   ========================================================================== */
+
+const SEM_MOVIMENTO = 'bruma.sem-movimento';
+const SEM_JOGO = 'bruma.sem-deteccao-de-jogo';
+
+/** Se a deteção de jogo está desligada. Lê-se em `desenharJogo`. */
+function deteccaoDeJogoDesligada() {
+  return localStorage.getItem(SEM_JOGO) === '1';
 }
 
-$('#fechar-definicoes').onclick = () => fechar('veu-definicoes');
+function aplicarMovimento() {
+  document.documentElement.classList.toggle(
+    'sem-movimento', localStorage.getItem(SEM_MOVIMENTO) === '1');
+}
+aplicarMovimento();
 
-$('#def-guardar-nome').onclick = async () => {
-  const nome = $('#def-nome').value.trim();
-  if (!nome) return erroEm('def-erro-nome', 'escreve um nome');
-  try {
-    await invoke('definir_nome', { nome });
-    erroEm('def-erro-nome', '');
-    $('#def-nota-nome').textContent = 'guardado';
-    await desenharTudo();
-  } catch (e) {
-    erroEm('def-erro-nome', String(e));
+/** Um interruptor com título e explicação, como os do Discord. */
+function interruptor(titulo, explica, ligado, aoMudar) {
+  const l = elemento('label', 'def__linha');
+  const c = document.createElement('input');
+  c.type = 'checkbox';
+  c.checked = !!ligado;
+  c.onchange = () => aoMudar(c.checked);
+  l.append(c);
+  const t = elemento('span');
+  t.append(elemento('b', null, titulo));
+  t.append(elemento('i', null, explica));
+  l.append(t);
+  return l;
+}
+
+function seccao(titulo) {
+  const d = elemento('div', 'def__sec');
+  d.append(elemento('div', 'members__label', titulo));
+  return d;
+}
+
+/** O que dizer quando não há nada. Honesto, e com o que falta para haver. */
+function aindaNaoHa(oQue, porque) {
+  const d = elemento('div', 'def__sec');
+  d.append(elemento('div', 'members__label', 'Ainda não existe'));
+  const a = elemento('div', 'aviso');
+  a.append(elemento('b', null, oQue));
+  a.append(document.createTextNode(' ' + porque));
+  d.append(a);
+  return d;
+}
+
+const PAINEIS = {
+  conta: {
+    nome: 'Conta',
+    grupo: 'Definições do utilizador',
+    ico: '<circle cx="8" cy="5.6" r="2.8"/><path d="M2.8 14c0-2.9 2.4-4.6 5.2-4.6s5.2 1.7 5.2 4.6"/>',
+    desenha: async painel => {
+      painel.append(elemento('h2', null, 'Conta'));
+      painel.append(elemento('p', null,
+        'Não há conta, e-mail nem palavra-passe. A tua identidade é uma chave que foi '
+        + 'criada neste computador — ninguém a registou em lado nenhum.'));
+
+      const s1 = seccao('Como apareces');
+      const inp = document.createElement('input');
+      inp.id = 'def-nome';
+      inp.maxLength = 32;
+      inp.placeholder = 'o teu nome';
+      inp.value = vista.nome || '';
+      s1.append(inp);
+      const erro = elemento('div', 'caixa__erro');
+      erro.id = 'def-erro-nome';
+      s1.append(erro);
+      const acs = elemento('div', 'caixa__acoes');
+      acs.style.justifyContent = 'flex-start';
+      const guardar = elemento('button', 'btn btn--primary', 'Guardar');
+      const nota = elemento('span', 'nota');
+      guardar.onclick = async () => {
+        const nome = inp.value.trim();
+        if (!nome) { erro.textContent = 'escreve um nome'; return; }
+        try {
+          await invoke('definir_nome', { nome });
+          erro.textContent = '';
+          nota.textContent = 'guardado';
+          await desenharTudo();
+          $('#defs-nome').textContent = nome;
+        } catch (e) { erro.textContent = String(e); }
+      };
+      acs.append(guardar, nota);
+      s1.append(acs);
+      painel.append(s1);
+
+      const s2 = seccao('A tua chave pública');
+      s2.append(elemento('p', 'nota', 'É o teu ID — é por ela que os outros te reconhecem.'));
+      const chave = elemento('div', 'def__chave',
+        (await invoke('meu_endereco').catch(() => '')) || '—');
+      s2.append(chave);
+      const a2 = elemento('div', 'caixa__acoes');
+      a2.style.justifyContent = 'flex-start';
+      const cp = elemento('button', 'btn', 'Copiar a chave');
+      cp.onclick = () => navigator.clipboard.writeText(chave.textContent.trim())
+        .then(() => { cp.textContent = 'copiada'; setTimeout(() => { cp.textContent = 'Copiar a chave'; }, 1400); })
+        .catch(() => {});
+      a2.append(cp);
+      s2.append(a2);
+      painel.append(s2);
+
+      painel.append(seccaoDasPalavras());
+    },
+  },
+
+  dados: {
+    nome: 'Dados e privacidade',
+    grupo: 'Definições do utilizador',
+    ico: '<path d="M8 1.8 2.8 4v4c0 3.2 2.2 5.6 5.2 6.4 3-.8 5.2-3.2 5.2-6.4V4Z"/>',
+    desenha: async painel => {
+      painel.append(elemento('h2', null, 'Dados e privacidade'));
+      painel.append(elemento('p', null,
+        'Não há servidor. Tudo o que escreves vive nesta máquina e nas máquinas de quem '
+        + 'está contigo — não há um sítio central onde o histórico se acumule.'));
+
+      const sobre = await invoke('sobre_esta_instalacao').catch(() => null);
+      const s1 = seccao('Onde ficam as tuas coisas');
+      if (sobre) {
+        s1.append(elemento('div', 'def__valor', sobre.pasta));
+        s1.append(elemento('p', 'nota',
+          'Fora da pasta do programa, para sobreviverem a actualizações e desinstalações.'));
+      }
+      const a1 = elemento('div', 'caixa__acoes');
+      a1.style.justifyContent = 'flex-start';
+      const abrir = elemento('button', 'btn', 'Abrir a pasta');
+      abrir.onclick = () => invoke('abrir_pasta_de_dados').catch(() => {});
+      a1.append(abrir);
+      s1.append(a1);
+      painel.append(s1);
+
+      const s2 = seccao('O que a cifra protege — e o que não protege');
+      const lista = elemento('div', 'aviso');
+      lista.innerHTML =
+        '<b>Protege:</b> o que sai desta máquina, e o histórico em disco.<br>'
+        + '<b>Não protege:</b> quem já tem a tua <code>identidade.key</code> — para todos os '
+        + 'efeitos, essa pessoa é tu.<br>'
+        + '<b>Não esconde:</b> quem fala com quem e quando. A isso chama-se metadados.';
+      s2.append(lista);
+      painel.append(s2);
+
+      const s3 = seccao('Deteção de jogo');
+      s3.append(interruptor(
+        'Não olhar para as minhas janelas',
+        'O rodapé mostra o jogo que tens aberto para o poderes partilhar num clique. '
+        + 'Para isso lê os títulos das janelas — nesta máquina, e nunca sai daqui.',
+        deteccaoDeJogoDesligada(),
+        v => { localStorage.setItem(SEM_JOGO, v ? '1' : '0'); verJogo(); },
+      ));
+      painel.append(s3);
+    },
+  },
+
+  permissoes: {
+    nome: 'Permissões de mensagens',
+    grupo: 'Definições do utilizador',
+    ico: '<path d="M3 3.4h10v7.2H6.4L3.4 13Z"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Permissões de mensagens'));
+      painel.append(aindaNaoHa('Não há sistema de permissões.',
+        'Qualquer membro de um servidor pode criar e apagar canais, e não há forma de '
+        + 'expulsar ninguém. E há uma razão para isto vir depois e não antes: o convite '
+        + 'carrega a chave que decifra o servidor e nunca expira — enquanto essa chave não '
+        + 'puder rodar, qualquer expulsão seria teatro, porque o expulso continuaria a '
+        + 'decifrar tudo o que fosse escrito a seguir.'));
+    },
+  },
+
+  notificacoes: {
+    nome: 'Notificações',
+    grupo: 'Definições do utilizador',
+    ico: '<path d="M4.4 6.6a3.6 3.6 0 0 1 7.2 0c0 3 1.2 4 1.2 4H3.2s1.2-1 1.2-4Z"/><path d="M6.6 13a1.6 1.6 0 0 0 2.8 0"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Notificações'));
+      painel.append(aindaNaoHa('Não há notificações nenhumas.',
+        'Nem no sistema, nem som de aviso, nem contagem de não lidas. O caminho para as '
+        + 'fazer já existe — a presença de voz viaja por fora do histórico, e é o mesmo '
+        + 'molde que uma notificação precisa — mas ainda não foram feitas.'));
+    },
+  },
+
+  cobrancas: {
+    nome: 'Cobranças',
+    grupo: 'Definições do utilizador',
+    ico: '<rect x="2.4" y="4" width="11.2" height="8" rx="1.6"/><path d="M2.4 6.8h11.2"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Cobranças'));
+      const d = elemento('div', 'def__sec');
+      d.append(elemento('div', 'members__label', 'Não existe, e não vai existir'));
+      const a = elemento('div', 'aviso');
+      a.append(elemento('b', null, 'Não há nada a pagar.'));
+      a.append(document.createTextNode(
+        ' Isto não é uma funcionalidade em falta — é o desenho. Não há servidor para '
+        + 'sustentar, não há armazenamento a alugar, e não há nada para vender: o Bruma '
+        + 'corre entre os teus computadores e mais nada. Esta secção está aqui só para não '
+        + 'ficares à procura dela.'));
+      d.append(a);
+      painel.append(d);
+    },
+  },
+
+  voz: {
+    nome: 'Voz e vídeo',
+    grupo: 'Experiência',
+    ico: '<rect x="6" y="2" width="4" height="7" rx="2"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2"/>',
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Voz e vídeo'));
+
+      const s1 = seccao('Microfone');
+      s1.append(interruptor(
+        'Supressão de ruído',
+        'Tira o ventilador e o teclado, e cancela o eco do que sai das tuas colunas para o '
+        + 'teu microfone.',
+        ruidoSuprimido,
+        () => $('#btn-ruido').click(),
+      ));
+      painel.append(s1);
+
+      const q = qualidadeDePartilha();
+      const s2 = seccao('Partilha de ecrã');
+      s2.append(interruptor(
+        'Levar o som do sistema',
+        'O que sai das tuas colunas segue com a imagem — e a tua própria chamada fica de '
+        + 'fora, para ninguém se ouvir a si próprio.',
+        q.som,
+        v => guardarQualidade({ som: v }),
+      ));
+      s2.append(elemento('div', 'def__valor',
+        `qualidade actual: ${q.altura === 0 ? 'nativa' : q.altura + 'p'} · ${q.fps} ips`
+        + `${q.debito ? ' · ' + rotuloDe(OPCOES_DEBITO, q.debito) : ' · débito automático'}`));
+      s2.append(elemento('p', 'nota',
+        'A resolução e o ritmo escolhem-se na engrenagem, no momento de partilhar — porque '
+        + 'a escolha depende do que vais mostrar. E são um TETO: nunca aumentam uma fonte '
+        + 'mais pequena do que isso.'));
+      painel.append(s2);
+
+      const s3 = seccao('Câmara');
+      s3.append(elemento('p', 'nota',
+        'Liga-se e desliga-se na barra da chamada. Não há aqui escolha de dispositivo: usa '
+        + 'a câmara que o Windows tiver como predefinida.'));
+      painel.append(s3);
+    },
+  },
+
+  aparencia: {
+    nome: 'Aparência',
+    grupo: 'Experiência',
+    ico: '<circle cx="8" cy="8" r="5.6"/><path d="M8 2.4v11.2"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Aparência'));
+      painel.append(aindaNaoHa('Há um tema só, e é escuro.',
+        'A paleta é um azul frio dessaturado — névoa — escolhida de propósito para não ser '
+        + 'o roxo do Discord. Um tema claro daria trabalho a fazer bem e ainda não foi '
+        + 'feito; um mal feito seria pior do que não haver.'));
+    },
+  },
+
+  acessibilidade: {
+    nome: 'Acessibilidade',
+    grupo: 'Experiência',
+    ico: '<circle cx="8" cy="3.6" r="1.6"/><path d="M3 6.4h10M8 6.4v4M8 10.4 5.6 14M8 10.4 10.4 14"/>',
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Acessibilidade'));
+      const s1 = seccao('Movimento');
+      s1.append(interruptor(
+        'Reduzir o movimento',
+        'Pára a névoa do fundo e encurta as transições. A app já respeita a definição do '
+        + 'Windows; isto força-a mesmo que o sistema não a peça.',
+        localStorage.getItem(SEM_MOVIMENTO) === '1',
+        v => { localStorage.setItem(SEM_MOVIMENTO, v ? '1' : '0'); aplicarMovimento(); },
+      ));
+      painel.append(s1);
+    },
+  },
+
+  sistema: {
+    nome: 'Sistema',
+    grupo: 'Experiência',
+    ico: '<rect x="2.4" y="3.2" width="11.2" height="7.6" rx="1.4"/><path d="M5.6 13.6h4.8"/>',
+    desenha: async painel => {
+      painel.append(elemento('h2', null, 'Sistema'));
+      const sobre = await invoke('sobre_esta_instalacao').catch(() => null);
+      const s1 = seccao('Esta instalação');
+      if (sobre) {
+        s1.append(elemento('div', 'def__valor', `Bruma ${sobre.versao}`));
+        s1.append(elemento('p', 'nota',
+          'Quando alguma coisa corre mal, o rasto fica aqui — e é a primeira coisa a olhar:'));
+        s1.append(elemento('div', 'def__valor', sobre.registo));
+      }
+      const a1 = elemento('div', 'caixa__acoes');
+      a1.style.justifyContent = 'flex-start';
+      const proc = elemento('button', 'btn btn--primary', 'Procurar atualização');
+      const nota = elemento('span', 'nota');
+      proc.onclick = async () => {
+        nota.textContent = 'a procurar…';
+        nota.textContent = (await procurarAtualizacao())
+          ? '' : 'já estás na versão mais recente';
+      };
+      const pasta = elemento('button', 'btn', 'Abrir a pasta');
+      pasta.onclick = () => invoke('abrir_pasta_de_dados').catch(() => {});
+      a1.append(proc, pasta, nota);
+      s1.append(a1);
+      painel.append(s1);
+
+      const s2 = seccao('Como se actualiza');
+      s2.append(elemento('p', 'nota',
+        'A app avisa quando há versão nova e nunca instala sem perguntar. A actualização é '
+        + 'assinada, e a assinatura é verificada antes de se escrever seja o que for.'));
+      painel.append(s2);
+    },
+  },
+
+  idioma: {
+    nome: 'Idioma e Horário',
+    grupo: 'Experiência',
+    ico: '<path d="M2.4 5.2h7M5.9 3.4v1.8M4.4 5.2c0 2.6 1.6 4.6 3.6 5.6M7.6 5.2c0 2-1.2 3.6-3 4.6"/><path d="M8.4 13.6 11 7.2l2.6 6.4M9.4 11.6h3.2"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Idioma e Horário'));
+      painel.append(aindaNaoHa('A app só fala português.',
+        'Não há tradução nem escolha de idioma, e as horas seguem o relógio do Windows. '
+        + 'Traduzir a app inteira é trabalho a sério, e não valia a pena antes de ela '
+        + 'estar assente.'));
+    },
+  },
+
+  sobreposicao: {
+    nome: 'Sobreposição de jogo',
+    grupo: 'Jogos e apps',
+    ico: '<rect x="2" y="4.4" width="12" height="7.2" rx="2"/><path d="M5 8h2M6 7v2M10.2 8.4h.01M11.6 7h.01"/>',
+    vazia: true,
+    desenha: painel => {
+      painel.append(elemento('h2', null, 'Sobreposição de jogo'));
+      painel.append(aindaNaoHa('Não há sobreposição por cima do jogo.',
+        'Desenhar por cima de um jogo em ecrã inteiro obriga a entrar no caminho gráfico '
+        + 'dele, e é o tipo de coisa que faz jogos fechar e antivírus reclamar. Ainda não '
+        + 'foi feito.'));
+      const s = seccao('O que existe hoje');
+      s.append(elemento('p', 'nota',
+        'O Bruma reconhece o jogo que tens aberto e mostra-o no rodapé, para o partilhares '
+        + 'num clique. Podes desligar isso em Dados e privacidade.'));
+      painel.append(s);
+    },
+  },
+};
+
+const ORDEM = ['conta', 'dados', 'permissoes', 'notificacoes', 'cobrancas',
+  'voz', 'aparencia', 'acessibilidade', 'sistema', 'idioma', 'sobreposicao'];
+
+let painelActivo = 'conta';
+
+function desenharMenuDeDefinicoes(filtro = '') {
+  const menu = $('#defs-menu');
+  menu.textContent = '';
+  const procura = filtro.trim().toLowerCase();
+  let grupoActual = undefined;
+  let algum = false;
+
+  for (const chave of ORDEM) {
+    const p = PAINEIS[chave];
+    if (procura && !p.nome.toLowerCase().includes(procura)) continue;
+    algum = true;
+    // Os títulos de grupo só aparecem quando há alguma coisa por baixo deles — a filtrar,
+    // um cabeçalho sozinho é ruído.
+    if (!procura && p.grupo !== grupoActual) {
+      grupoActual = p.grupo;
+      if (p.grupo) menu.append(elemento('div', 'defs__grupo', p.grupo));
+    }
+    const b = elemento('button', 'defs__item' + (p.vazia ? ' is-vazia' : ''));
+    b.innerHTML = `<svg viewBox="0 0 16 16" width="15" height="15">${p.ico}</svg>`;
+    b.append(document.createTextNode(p.nome));
+    b.classList.toggle('is-activa', chave === painelActivo);
+    b.onclick = () => mostrarPainel(chave);
+    menu.append(b);
   }
-};
+  if (!algum) menu.append(elemento('div', 'defs__nada', 'nada com esse nome'));
+}
 
-$('#def-copiar-chave').onclick = async () => {
-  try {
-    await navigator.clipboard.writeText($('#def-chave').textContent.trim());
-    $('#def-nota-nome').textContent = 'chave copiada';
-  } catch (e) { /* sem área de transferência */ }
-};
+async function mostrarPainel(chave) {
+  painelActivo = chave;
+  const painel = $('#defs-painel');
+  painel.textContent = '';
+  await PAINEIS[chave].desenha(painel);
+  painel.scrollTop = 0;
+  $('#defs-conteudo').scrollTop = 0;   // secção nova começa no topo, e não a meio da anterior
+  desenharMenuDeDefinicoes($('#defs-buscar').value);
+}
 
-// A caixa e o ícone do rodapé mexem na MESMA definição — carregar no ícone é o atalho, e
-// tê-los a discordar seria pior do que não ter os dois.
-$('#def-ruido').onchange = () => {
-  if ($('#def-ruido').checked !== ruidoSuprimido) $('#btn-ruido').click();
-};
+async function abrirDefinicoes(qual) {
+  const d = $('#defs');
+  d.hidden = false;
+  $('#defs-nome').textContent = vista.nome || '—';
+  pintar($('#defs-avatar'), vista.eu || '');
+  $('#defs-buscar').value = '';
+  await mostrarPainel(qual || 'conta');
+}
 
-$('#def-abrir-pasta').onclick = () => {
-  invoke('abrir_pasta_de_dados').catch(e => {
-    $('#def-nota-update').textContent = `não consegui abrir: ${e}`;
-  });
-};
+function fecharDefinicoes() { $('#defs').hidden = true; }
 
-$('#def-procurar-update').onclick = async () => {
-  $('#def-nota-update').textContent = 'a procurar…';
-  const houve = await procurarAtualizacao();
-  $('#def-nota-update').textContent = houve ? '' : 'já estás na versão mais recente';
-};
+$('#defs-fechar').onclick = fecharDefinicoes;
+$('#defs-editar').onclick = () => mostrarPainel('conta');
+$('#defs-buscar').oninput = () => desenharMenuDeDefinicoes($('#defs-buscar').value);
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && !$('#defs').hidden) fecharDefinicoes();
+});
+
+/** A secção das 24 palavras. Vive na Conta, que é onde alguém a iria procurar. */
+function seccaoDasPalavras() {
+  const d = seccao('As tuas 24 palavras');
+  d.append(elemento('p', 'nota',
+    'São a tua chave escrita de outra maneira. Com elas recuperas a identidade noutra '
+    + 'máquina, ou nesta depois de formatar.'));
+  const av = elemento('div', 'aviso');
+  av.append(elemento('b', null, 'Quem tiver estas palavras é tu.'));
+  av.append(document.createTextNode(
+    ' Lê o teu histórico, entra nas tuas salas e fala em teu nome. Escreve-as num papel e '
+    + 'guarda-o onde guardarias uma chave de casa.'));
+  d.append(av);
+
+  const caixa = elemento('div', 'palavras');
+  caixa.hidden = true;
+  d.append(caixa);
+  const nota = elemento('span', 'nota');
+
+  const acs = elemento('div', 'caixa__acoes');
+  acs.style.justifyContent = 'flex-start';
+  const ver = elemento('button', 'btn btn--primary', 'Mostrar as palavras');
+  const copiar = elemento('button', 'btn', 'Copiar');
+  copiar.hidden = true;
+  ver.onclick = async () => {
+    try {
+      const texto = await invoke('palavras_da_identidade');
+      caixa.textContent = '';
+      texto.split(/\s+/).forEach((palavra, n) => {
+        const linha = elemento('span');
+        linha.append(elemento('i', null, String(n + 1).padStart(2, ' ')));
+        linha.append(document.createTextNode(palavra));
+        caixa.append(linha);
+      });
+      caixa.hidden = false;
+      ver.hidden = true;
+      copiar.hidden = false;
+      nota.textContent = '';
+    } catch (e) { nota.textContent = `não consegui: ${e}`; }
+  };
+  copiar.onclick = () => {
+    const texto = [...caixa.children].map(l => l.textContent.replace(/^\s*\d+\s*/, '')).join(' ');
+    navigator.clipboard.writeText(texto)
+      .then(() => { nota.textContent = 'copiadas — cola-as num sítio só teu, e apaga a seguir'; })
+      .catch(() => { nota.textContent = 'não consegui copiar; escreve-as à mão'; });
+  };
+  const restaurar = elemento('button', 'btn', 'Restaurar de outras palavras');
+  acs.append(ver, copiar, restaurar, nota);
+  d.append(acs);
+
+  const cx = elemento('div');
+  cx.hidden = true;
+  const ta = document.createElement('textarea');
+  ta.id = 'palavras-entrada';
+  ta.rows = 3;
+  ta.placeholder = 'palavra1 palavra2 palavra3 …';
+  cx.append(ta);
+  const perigo = elemento('div', 'aviso aviso--perigo');
+  perigo.innerHTML = 'Isto <b>troca</b> a identidade desta máquina. Os servidores que tens '
+    + 'aqui deixam de abrir — as chaves deles pertencem à identidade antiga. Nada é apagado: '
+    + 'o índice antigo fica guardado ao lado, e voltas a entrar nas salas por convite.';
+  cx.append(perigo);
+  const a2 = elemento('div', 'caixa__acoes');
+  a2.style.justifyContent = 'flex-start';
+  const fazer = elemento('button', 'btn btn--perigo', 'Restaurar');
+  const nota2 = elemento('span', 'nota');
+  nota2.id = 'restaurar-nota';
+  fazer.onclick = async () => {
+    const palavras = ta.value.trim();
+    if (!palavras) { nota2.textContent = 'escreve as 24 palavras primeiro'; return; }
+    nota2.textContent = 'a verificar…';
+    try {
+      nota2.textContent = await invoke('restaurar_identidade', { palavras });
+      fazer.disabled = true;
+      ta.disabled = true;
+    } catch (e) { nota2.textContent = String(e); }
+  };
+  a2.append(fazer, nota2);
+  cx.append(a2);
+  d.append(cx);
+  restaurar.onclick = () => { cx.hidden = !cx.hidden; if (!cx.hidden) ta.focus(); };
+  return d;
+}
+
 $('#ok-nome').onclick = async () => {
   const nome = $('#in-nome').value.trim();
   if (!nome) return erroEm('erro-nome', 'escreve um nome');
@@ -2483,10 +2946,27 @@ listen('sinal', ev => {
 
 let jogoAberto = null;
 
+/** Quantas vezes já perguntámos ao Windows o que está aberto.
+ *
+ *  Existe para o `--medir-ui` poder provar que o interruptor "não olhar para as minhas
+ *  janelas" cala mesmo a pergunta. Sem isto, a única forma de verificar era ler o código e
+ *  acreditar -- e um interruptor de privacidade é precisamente onde acreditar não chega. */
+let perguntasSobreJanelas = 0;
+
 /* --- o que tens aberto ----------------------------------------------------- */
 
 async function verJogo() {
+  // Quem desliga isto está a pedir que não se olhe para as janelas dele. Esconder o cartão
+  // e continuar a perguntar ao Windows o que está aberto seria dar-lhe a aparência da
+  // privacidade sem a privacidade -- o pedido é sobre o que se pergunta, não sobre o que
+  // se mostra. Por isso a saída é ANTES do invoke.
+  if (deteccaoDeJogoDesligada()) {
+    jogoAberto = null;
+    $('#jogo').hidden = true;
+    return;
+  }
   try {
+    perguntasSobreJanelas += 1;
     const j = await invoke('jogo_em_execucao');
     jogoAberto = j;
     const linha = $('#jogo');
@@ -2927,68 +3407,6 @@ function pararDeAssistir() {
     + ` MediaStreamTrackProcessor=${typeof window.MediaStreamTrackProcessor === 'undefined' ? 'não existe' : 'existe'}`
     + ` AudioWorklet=${typeof AudioWorkletNode === 'undefined' ? 'não existe' : 'existe'}`);
 })();
-
-/* ==========================================================================
-   As 24 palavras que recuperam a identidade.
-
-   Nunca são guardadas: derivam-se da semente quando alguém as pede, e vivem só o tempo de
-   estarem no ecrã. Não passam pelo registo nem pelo `console` — um segredo que aparece num
-   ficheiro de diagnóstico deixa de ser um segredo.
-   ========================================================================== */
-
-$('#ver-palavras').onclick = async () => {
-  try {
-    const texto = await invoke('palavras_da_identidade');
-    const caixa = $('#palavras');
-    caixa.textContent = '';
-    // Numeradas: vão ser copiadas para um papel à mão, e a ordem é o que mais se erra.
-    texto.split(/\s+/).forEach((palavra, i) => {
-      const linha = elemento('span');
-      linha.append(elemento('i', null, String(i + 1).padStart(2, ' ')));
-      linha.append(document.createTextNode(palavra));
-      caixa.append(linha);
-    });
-    $('#palavras-caixa').hidden = false;
-    $('#ver-palavras').hidden = true;
-    $('#palavras-nota').textContent = '';
-  } catch (e) {
-    $('#palavras-nota').textContent = `Não consegui: ${e}`;
-    $('#palavras-caixa').hidden = false;
-  }
-};
-
-$('#copiar-palavras').onclick = async () => {
-  const texto = [...$('#palavras').children]
-    .map(l => l.textContent.replace(/^\s*\d+\s*/, '')).join(' ');
-  try {
-    await navigator.clipboard.writeText(texto);
-    $('#palavras-nota').textContent = 'copiadas — cola-as num sítio só teu, e apaga a seguir';
-  } catch (e) {
-    $('#palavras-nota').textContent = 'não consegui copiar; escreve-as à mão';
-  }
-};
-
-$('#abrir-restaurar').onclick = () => {
-  const c = $('#restaurar-caixa');
-  c.hidden = !c.hidden;
-  if (!c.hidden) $('#palavras-entrada').focus();
-};
-
-$('#fazer-restaurar').onclick = async () => {
-  const nota = $('#restaurar-nota');
-  const palavras = $('#palavras-entrada').value.trim();
-  if (!palavras) { nota.textContent = 'escreve as 24 palavras primeiro'; return; }
-  nota.textContent = 'a verificar…';
-  try {
-    nota.textContent = await invoke('restaurar_identidade', { palavras });
-    // Depois disto a app em memória já não corresponde ao disco. Dizer para reabrir é
-    // honesto; fingir que continua tudo bem não era.
-    $('#fazer-restaurar').disabled = true;
-    $('#palavras-entrada').disabled = true;
-  } catch (e) {
-    nota.textContent = String(e);
-  }
-};
 
 /* ---------- autoteste do ECO ------------------------------------------------ */
 
@@ -3750,65 +4168,99 @@ $('#fazer-restaurar').onclick = async () => {
       desenharVoz();
     }
 
-    // ---- as Definicoes --------------------------------------------------------
+    // ---- as Definicoes, todas as seccoes --------------------------------------
+    //
+    // Nao se mede so "abriu": desenha-se CADA seccao e exige-se que cada uma produza um
+    // titulo e conteudo. Uma seccao que rebenta a desenhar deixaria um painel em branco, e
+    // um painel em branco parece uma definicao que ainda nao foi feita -- exactamente o
+    // que este painel tem de saber distinguir.
     {
-      $('#btn-perfil').click();
-      await new Promise(r => setTimeout(r, 500));
-      const caixa = $('#veu-definicoes');
-      const secoes = [...caixa.querySelectorAll('.members__label')].map(e => e.textContent.trim());
-      diz(`ui definicoes: aberto=${!caixa.hidden} seccoes=${JSON.stringify(secoes)}`);
-      diz(`ui definicoes valores: versao="${$('#def-versao').textContent}"`
-        + ` chave=${$('#def-chave').textContent.length} car`
-        + ` qualidade="${$('#def-qualidade').textContent}"`
-        + ` pasta-tem-registo=${/bruma\.log/.test($('#def-pasta').textContent)}`
-        + ` ruido=${$('#def-ruido').checked}`);
-      // O icone do rodape e a caixa tem de mexer na MESMA definicao.
-      const antes = ruidoSuprimido;
-      $('#btn-ruido').click();
-      await new Promise(r => setTimeout(r, 200));
       await abrirDefinicoes();
-      const acompanhou = $('#def-ruido').checked === ruidoSuprimido && ruidoSuprimido !== antes;
-      $('#btn-ruido').click();
-      diz(`ui definicoes ruido: caixa-acompanha-o-icone=${acompanhou}`);
-    }
+      const lado = $('#defs');
+      const itens = [...document.querySelectorAll('.defs__item')].map(b => b.textContent.trim());
+      const grupos = [...document.querySelectorAll('.defs__grupo')].map(b => b.textContent.trim());
+      diz(`ui defs: aberto=${!lado.hidden} seccoes=${itens.length} grupos=${JSON.stringify(grupos)}`
+        + ` avatar=${!!$('#defs-avatar').style.backgroundImage}`
+        + ` editar-perfil=${!!$('#defs-editar')} busca=${!!$('#defs-buscar')}`);
 
-    // ---- as 24 palavras, agora dentro das Definicoes ---------------------------
-    {
-      await abrirDefinicoes();
-      $('#ver-palavras').click();
+      let falharam = [];
+      let vazias = 0;
+      for (const chave of ORDEM) {
+        try {
+          await mostrarPainel(chave);
+          const painel = $('#defs-painel');
+          const titulo = painel.querySelector('h2');
+          const conteudo = painel.textContent.trim().length;
+          if (!titulo || conteudo < 60) falharam.push(chave);
+          if (PAINEIS[chave].vazia) {
+            // As vazias TEM de dizer que estao vazias -- e nao mostrar um painel mudo.
+            const diz_o = /ainda não existe|não vai existir/i.test(painel.textContent);
+            if (!diz_o) falharam.push(chave + ':nao-avisa');
+            vazias += 1;
+          }
+        } catch (e) {
+          falharam.push(`${chave}:${e && e.message ? e.message : e}`);
+        }
+      }
+      diz(`ui defs paineis: ${ORDEM.length} desenhados, ${vazias} honestamente vazios,`
+        + ` falharam=${JSON.stringify(falharam)}`);
+
+      // A busca filtra, e o que nao existe diz-se.
+      $('#defs-buscar').value = 'voz';
+      desenharMenuDeDefinicoes('voz');
+      const comVoz = document.querySelectorAll('.defs__item').length;
+      $('#defs-buscar').value = 'xpto';
+      desenharMenuDeDefinicoes('xpto');
+      const semNada = !!document.querySelector('.defs__nada');
+      $('#defs-buscar').value = '';
+      desenharMenuDeDefinicoes('');
+      diz(`ui defs busca: "voz"=${comVoz} item(ns), "xpto" diz-que-nao-ha=${semNada},`
+        + ` limpa=${document.querySelectorAll('.defs__item').length}`);
+
+      // As 24 palavras vivem na Conta, que e onde alguem as iria procurar.
+      await mostrarPainel('conta');
+      const ver = [...document.querySelectorAll('#defs-painel .btn')]
+        .find(b => /Mostrar as palavras/.test(b.textContent));
+      ver.click();
       await new Promise(r => setTimeout(r, 400));
-      const ps = [...$('#palavras').children].map(l => l.textContent.replace(/^\s*\d+\s*/, ''));
-      // NUNCA se imprimem as palavras — sao a identidade. Conta-se e mede-se, so.
-      diz(`ui palavras: ${ps.length} mostradas, numeradas=${$('#palavras').querySelectorAll('i').length}`
-        + ` distintas=${new Set(ps).size} vazias=${ps.filter(x => !x.trim()).length}`
-        + ` botao-escondido=${$('#ver-palavras').hidden}`);
+      const ps = [...document.querySelectorAll('#defs-painel .palavras span')]
+        .map(l => l.textContent.replace(/^\s*\d+\s*/, ''));
+      diz(`ui defs palavras: ${ps.length} mostradas, distintas=${new Set(ps).size},`
+        + ` vazias=${ps.filter(x => !x.trim()).length}, botao-escondido=${ver.hidden}`);
 
-      // A ida e volta, pelo caminho REAL: as palavras que a app mostrou tem de dar a mesma
-      // identidade. Compara-se a chave publica, que e o que os outros veem.
-      const antes = (await invoke('meu_endereco').catch(() => '')) || '';
-      const restaurar = $('#abrir-restaurar');
-      restaurar.click();
-      diz(`ui palavras restaurar: painel=${!$('#restaurar-caixa').hidden}`
-        + ` avisa=${!!document.querySelector('#restaurar-caixa .aviso--perigo')}`);
-      restaurar.click();
-
-      // Uma palavra trocada TEM de ser recusada, e com uma mensagem que se perceba.
+      // Uma palavra trocada NAO pode restaurar. Verifica-se o resultado, nao a redaccao.
+      [...document.querySelectorAll('#defs-painel .btn')]
+        .find(b => /Restaurar de outras/.test(b.textContent)).click();
       $('#palavras-entrada').value = ps.slice(0, 23).join(' ') + ' zebra';
-      $('#fazer-restaurar').click();
+      [...document.querySelectorAll('#defs-painel .btn--perigo')][0].click();
       await new Promise(r => setTimeout(r, 500));
-      const recusa = $('#restaurar-nota').textContent;
-      // O que interessa e que NAO restaurou -- e nao qual das mensagens saiu. A primeira
-      // versao deste teste procurava "nao servem" e falhava com a mensagem da soma de
-      // controlo, que e a certa aqui: "zebra" ESTA no dicionario. Foi o mesmo engano dos
-      // testes de unidade, repetido. Verifica-se o RESULTADO, nao a redaccao.
-      const restaurou = /restaurada/i.test(recusa);
-      diz(`ui palavras erradas: recusadas=${!restaurou && recusa.length > 0}`
-        + ` msg="${recusa.slice(0, 46)}"`);
+      const msg = $('#restaurar-nota').textContent;
+      diz(`ui defs restauro: recusado=${!/restaurada/i.test(msg) && msg.length > 0}`
+        + ` msg="${msg.slice(0, 46)}"`);
       $('#palavras-entrada').value = '';
-      $('#restaurar-nota').textContent = '';
-      void antes;
-      fechar('veu-definicoes');
+
+      // O interruptor da privacidade tem de CALAR a pergunta, não esconder a resposta.
+      await mostrarPainel('dados');
+      const alvo = [...document.querySelectorAll('#defs-painel label.def__linha')]
+        .find(l => /não olhar/i.test(l.textContent))
+        .querySelector('input[type=checkbox]');
+      const ligado = () => localStorage.getItem(SEM_JOGO) === '1';
+      if (ligado()) alvo.click();                  // garantir que começa ligada
+      await new Promise(r => setTimeout(r, 60));
+      const antes = perguntasSobreJanelas;
+      await verJogo();
+      const comDeteccao = perguntasSobreJanelas - antes;
+      alvo.click();                                 // desligar a deteção
+      await new Promise(r => setTimeout(r, 60));
+      const meio = perguntasSobreJanelas;
+      await verJogo();
+      const semDeteccao = perguntasSobreJanelas - meio;
+      diz(`ui defs janelas: guardada=${ligado()} perguntas com=${comDeteccao} sem=${semDeteccao}`
+        + ` cartao-escondido=${$('#jogo').hidden} jogo-esquecido=${jogoAberto === null}`);
+      if (ligado()) alvo.click();                   // deixar como estava
+      fecharDefinicoes();
     }
+
 
     const rotuloAudio = $('#linha-som').querySelector('b').getBoundingClientRect();
     const antes = $('#mudo-transmissao').checked;
