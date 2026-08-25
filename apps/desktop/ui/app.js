@@ -4181,7 +4181,26 @@ function pararDeAssistir() {
       const grupos = [...document.querySelectorAll('.defs__grupo')].map(b => b.textContent.trim());
       diz(`ui defs: aberto=${!lado.hidden} seccoes=${itens.length} grupos=${JSON.stringify(grupos)}`
         + ` avatar=${!!$('#defs-avatar').style.backgroundImage}`
-        + ` editar-perfil=${!!$('#defs-editar')} busca=${!!$('#defs-buscar')}`);
+        + ` busca=${!!$('#defs-buscar')}`);
+
+      // "Editar perfil" tem de LEVAR a algum lado, e o nome tem de mudar mesmo. Verificar
+      // que o botão existe não distingue um atalho de um enfeite.
+      await mostrarPainel('sistema');
+      $('#defs-editar').click();
+      await new Promise(r => setTimeout(r, 120));
+      const foiParaConta = painelActivo === 'conta' && !!$('#def-nome');
+      const antigo = vista.nome || '';
+      $('#def-nome').value = 'medicao-' + antigo;
+      [...document.querySelectorAll('#defs-painel .btn--primary')]
+        .find(b => b.textContent === 'Guardar').click();
+      await new Promise(r => setTimeout(r, 500));
+      const mudou = vista.nome === 'medicao-' + antigo;
+      $('#def-nome').value = antigo;
+      [...document.querySelectorAll('#defs-painel .btn--primary')]
+        .find(b => b.textContent === 'Guardar').click();
+      await new Promise(r => setTimeout(r, 500));
+      diz(`ui defs perfil: editar-leva-a-conta=${foiParaConta} nome-mudou=${mudou}`
+        + ` reposto=${vista.nome === antigo} sidebar="${$('#defs-nome').textContent}"`);
 
       let falharam = [];
       let vazias = 0;
