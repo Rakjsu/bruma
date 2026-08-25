@@ -41,11 +41,15 @@ jobs:
       #
       # Ate aqui o release nao consultava o CI: uma etiqueta num commit que falhasse os
       # testes ou o clippy publicava a mesma, porque so o `cargo build` era exercitado.
+      # Os portoes correm sobre o que SAI DAQUI -- a app e o instalador, mais o crate de
+      # cripto de que dependem. O `--workspace` arrastava tambem o spike3, que compila o
+      # Tor inteiro para nada: vinte minutos de espera em codigo que nao vai na release.
+      # O CI, esse, continua a correr sobre tudo a cada push.
       - name: Portoes
         run: |
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          cargo clippy -p bruma -p instalador -p spike-common --all-targets -- -D warnings
+          cargo test -p bruma -p spike-common
 
       - name: Compilar, assinar e publicar
         uses: tauri-apps/tauri-action@v0
