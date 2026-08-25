@@ -162,8 +162,15 @@ jobs:
 
           & (Join-Path $prova 'uninstall.exe') --silencioso --teste "--dir=$prova"
           if ($LASTEXITCODE -ne 0) { Write-Error "o desinstalador saiu com $LASTEXITCODE"; exit 1 }
-          # A limpeza final e feita por um .cmd solto: espera-se por ela, sem adivinhar.
-          for ($i = 0; $i -lt 30 -and (Test-Path $app); $i++) { Start-Sleep -Seconds 1 }
+          # A limpeza final e feita por um .cmd solto, e o que ele tem de tirar por ultimo
+          # e o PROPRIO uninstall.exe -- o bruma.exe ja foi apagado antes, pelo Rust, de
+          # forma sincrona. Esperar pelo bruma.exe era esperar por uma coisa que ja tinha
+          # acontecido: o poll saia de imediato e a verificacao seguinte corria antes de o
+          # .cmd ter tido tempo de existir. Localmente passava por sorte de escalonamento;
+          # no runner falhou a primeira vez.
+          $desinst = Join-Path $prova 'uninstall.exe'
+          for ($i = 0; $i -lt 60 -and (Test-Path $desinst); $i++) { Start-Sleep -Seconds 1 }
+          Write-Host "o desinstalador levou ~$i s a apagar-se"
 
           if (Test-Path $app) { Write-Error 'o desinstalador deixou o bruma.exe para tras'; exit 1 }
           if (Test-Path (Join-Path $prova 'uninstall.exe')) { Write-Error 'o desinstalador nao se apagou'; exit 1 }
