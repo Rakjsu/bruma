@@ -415,6 +415,18 @@ function contextoDeAudio() {
 
 let envio = null;
 
+/** Porque é que a tua voz não está a sair, se não está.
+ *
+ *  A câmara já tinha isto (`camaraFalhou`); a voz não tinha, e é a mais grave das duas:
+ *  continuas na sala, com o microfone aceso e a aparecer presente, e **ninguém te ouve**.
+ *  Sem uma palavra em lado nenhum, o sintoma do outro lado é "ele hoje está calado".
+ */
+let vozFalhou = null;
+
+/** De quem é que deixaste de ouvir, e porquê. Um descodificador que morre tira-te UMA
+ *  pessoa da chamada — ela continua a aparecer, e a suspeita cai nela. */
+const vozPartida = new Map();
+
 function comecarAEnviarVoz(microfone) {
   pararDeEnviarVoz();
   const faixa = microfone && microfone.getAudioTracks()[0];
@@ -432,7 +444,13 @@ function comecarAEnviarVoz(microfone) {
       pedaco.copyTo(bytes);
       invoke('enviar_voz', { para: gente, dados: [...bytes] }).catch(() => {});
     },
-    error: e => console.warn('o codificador de voz parou:', e),
+    error: e => {
+      console.warn('o codificador de voz parou:', e);
+      vozFalhou = 'O codificador de voz desistiu — ninguém te ouve. Sai e volta a entrar.';
+      pararDeEnviarVoz();
+      desenharRodape();
+      desenharVoz();
+    },
   });
   codificador.configure({
     codec: 'opus',
@@ -789,7 +807,11 @@ function vozDe(chave) {
   v = { ganho, proximo: 0, descodificador: null, ctx };
   v.descodificador = new AudioDecoder({
     output: som => tocar(chave, som),
-    error: e => console.warn('descodificador de voz de', chave, e),
+    error: e => {
+      console.warn('descodificador de voz de', chave, e);
+      vozPartida.set(chave, 'o áudio desta pessoa não está a descodificar');
+      desenharVoz();
+    },
   });
   v.descodificador.configure({ codec: 'opus', sampleRate: VOZ_HZ, numberOfChannels: 1 });
   voz.audio.set(chave, v);
@@ -1006,7 +1028,13 @@ async function procurarAtualizacao() {
       $('#btn-update').disabled = true;
       $('#texto-update').textContent = 'A descarregar…';
       try {
+        // A ultima linha que a app escreve antes de se fechar sozinha. Se o registo acabar
+        // aqui, a instalacao nao chegou ao fim -- e o instalador continua a escrever nele.
+        await invoke('capacidades', { linha: 'a instalar a actualizacao...' }).catch(() => {});
         await nova.downloadAndInstall();
+        // Código morto, e fica escrito porquê: o `downloadAndInstall` acima chama
+        // `exit(0)` assim que lança o instalador, portanto esta linha nunca corre. O que
+        // relança a app é o próprio instalador, no fim.
         await window.__TAURI__.process.relaunch();
       } catch (e) {
         $('#texto-update').textContent = `Não consegui atualizar: ${e}`;
@@ -1179,6 +1207,8 @@ async function desenharDiagnostico() {
 $('#fechar-rede').onclick = () => fechar('veu-rede');
 
 async function entrarEmVoz(servidor, canal) {
+  vozFalhou = null;
+  vozPartida.clear();
   if (voz.canal === canal) return;
   await sairDeVoz(false);
   voz.servidor = servidor;
@@ -1210,6 +1240,9 @@ async function entrarEmVoz(servidor, canal) {
   } catch (e) {
     // Sem microfone continua a dar para ouvir e para partilhar ecra.
     console.warn('sem microfone:', e);
+    // Aparecer mudo SEM RAZÃO é o pior dos dois mundos: a pessoa vê o ícone cortado e
+    // assume que carregou nele sem querer.
+    vozFalhou = `Sem microfone: ${e && e.message ? e.message : e}`;
     voz.micro = null;
   }
   desenharVoz();
@@ -1332,6 +1365,10 @@ function fluxoDePedacos() {
   let buffer = null;
   let codec = null;
   let aberto = false;
+  // Porque é que este fluxo não dá imagem, se não der. O comentário aqui ao lado já avisava
+  // que o codec VARIA com a placa gráfica de quem partilha — ou seja, isto vai acontecer em
+  // máquinas reais, e ia parecer um problema de ligação.
+  let recusa = null;
 
   /* O codec não se assume, vem escrito no fluxo.
      O `addSourceBuffer` obriga a declará-lo, e o navegador VALIDA o que se lhe declara
@@ -1344,6 +1381,9 @@ function fluxoDePedacos() {
     el.__codec = codec;
     if (!window.MediaSource || !MediaSource.isTypeSupported(tipo)) {
       console.warn('esta webview não sabe descodificar', tipo);
+      recusa = `Esta máquina não sabe descodificar ${tipo}. `
+        + 'A placa gráfica de quem partilha produziu um formato que esta não lê.';
+      desenharVoz();
       return;
     }
     try {
@@ -1353,6 +1393,8 @@ function fluxoDePedacos() {
       escoar();
     } catch (e) {
       console.warn('não consegui abrir o buffer de vídeo:', e);
+      recusa = `Não consegui abrir o vídeo: ${e && e.message ? e.message : e}`;
+      desenharVoz();
     }
   };
 
@@ -1442,6 +1484,8 @@ function fluxoDePedacos() {
       if (fila.length > 60) fila.splice(0, fila.length - 30);
       escoar();
     },
+    /** A razão de não haver imagem, quando não há. `null` significa "ainda a chegar". */
+    porqueNaoDa() { return recusa; },
     fechar() {
       clearInterval(relogioDoVivo);
       try { el.pause(); } catch (e) { /* já parado */ }
@@ -1839,6 +1883,14 @@ function painelDeVoz(chave, opcoes = {}) {
     t.append(sem);
   }
 
+  const partido = vozPartida.get(chave);
+  if (partido) {
+    // Sem isto, quem deixa de ouvir uma pessoa suspeita DELA — e ela continua ali, a
+    // aparecer presente e sem noção de nada.
+    const aviso = elemento('span', 'tile__sem-audio', 'sem áudio');
+    aviso.title = partido;
+    t.append(aviso);
+  }
   t.append(elemento('span', 'tile__nome', nomeDoPeer(chave)));
   t.append(accoesDoPainel(chave, { transmite, aVer, temVideo }));
   return t;
@@ -1902,8 +1954,20 @@ function palcoDeTransmissao(quem, canal, outros) {
   const vidro = elemento('div', 'palco__vidro');
 
   const el = ecraDe(quem);
-  if (el) vidro.append(el);
-  else vidro.append(elemento('div', 'tile__sem-video', 'à espera da imagem…'));
+  const fluxo = quem === voz.eu ? voz.vejoMeuEcra : fluxosRecebidos.get(quem);
+  const recusa = fluxo && fluxo.porqueNaoDa && fluxo.porqueNaoDa();
+  if (recusa) {
+    // Um rectângulo preto para sempre é indistinguível de "a rede está má". Dizer a razão
+    // é a diferença entre a pessoa esperar em vão e saber que não vale a pena.
+    const caixa = elemento('div', 'palco__pausa');
+    caixa.append(elemento('b', null, 'Não consigo mostrar esta transmissão'));
+    caixa.append(elemento('span', null, recusa));
+    vidro.append(caixa);
+  } else if (el) {
+    vidro.append(el);
+  } else {
+    vidro.append(elemento('div', 'tile__sem-video', 'à espera da imagem…'));
+  }
 
   // --- cima à esquerda: onde estou e de quem é isto
   const onde = elemento('div', 'palco__onde');
@@ -2061,6 +2125,14 @@ function fotinha(chave, noPalco) {
       tampa.append(b);
       m.append(tampa);
     }
+  }
+  const partida = vozPartida.get(chave);
+  if (partida) {
+    const aviso = elemento('span', 'mini__vivo', 'SEM ÁUDIO');
+    aviso.style.background = 'var(--amber)';
+    aviso.style.color = '#16181c';
+    aviso.title = partida;
+    m.append(aviso);
   }
   m.append(elemento('span', 'mini__nome', nomeDoPeer(chave)));
   return m;
@@ -2447,8 +2519,10 @@ async function desenharRodape() {
   }
 
   const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
-  $('#btn-mic').classList.toggle('is-cortado', !!t && !t.enabled);
-  $('#btn-mic').title = !t ? 'Sem microfone' : (t.enabled ? 'Silenciar microfone' : 'Ligar microfone');
+  $('#btn-mic').classList.toggle('is-cortado', (!!t && !t.enabled) || !!vozFalhou);
+  // A razão da avaria GANHA ao texto normal, como no botão da câmara.
+  $('#btn-mic').title = vozFalhou
+    || (!t ? 'Sem microfone' : (t.enabled ? 'Silenciar microfone' : 'Ligar microfone'));
   $('#btn-surdo').classList.toggle('is-cortado', surdo);
   $('#btn-surdo').title = surdo ? 'Voltar a ouvir' : 'Silenciar tudo';
 }
@@ -3559,6 +3633,52 @@ $('#fazer-restaurar').onclick = async () => {
       Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor,
         ecra: antes.ecra, aVer: antes.aVer, ecraTamanho: antes.tam,
         qualidadeEmUso: antes.qual });
+      servidorAtual = antes.srv; canalAtual = antes.cnl;
+      desenharVoz();
+    }
+
+    // ---- as avarias que antes eram invisiveis ---------------------------------
+    {
+      const antes = { eu: voz.eu, canal: voz.canal, srv: servidorAtual, cnl: canalAtual };
+      let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+      if (!srv) {
+        const id = await invoke('criar_servidor', { nome: 'medicao' });
+        await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+        await desenharTudo();
+        srv = vista.servidores.find(x => x.id === id);
+      }
+      const cv = srv.canais.find(c => c.tipo === 'voz');
+      servidorAtual = srv.id; canalAtual = cv.id;
+      voz.eu = 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id;
+      voz.presentes.set('outro1', cv.id);
+
+      // 1) a minha voz morreu: o botao do microfone tem de dizer PORQUE.
+      vozFalhou = 'O codificador de voz desistiu — ninguém te ouve.';
+      desenharRodape(); await new Promise(r => setTimeout(r, 250));
+      diz(`ui voz morta: cortado=${$('#btn-mic').classList.contains('is-cortado')}`
+        + ` title-diz-porque=${/desistiu/.test($('#btn-mic').title)}`);
+      vozFalhou = null;
+
+      // 2) deixei de ouvir UMA pessoa: ela tem de ficar marcada.
+      vozPartida.set('outro1', 'o áudio desta pessoa não está a descodificar');
+      voz.aVer = null; desenharVoz();
+      const marcas = document.querySelectorAll('.tile__sem-audio');
+      diz(`ui voz de um so: marcas=${marcas.length}`
+        + ` no-painel-certo=${!!document.querySelector('.tile[data-chave="outro1"] .tile__sem-audio')}`);
+      vozPartida.clear();
+
+      // 3) o codec que esta maquina nao le: em vez de preto, a razao.
+      const falso = { porqueNaoDa: () => 'Esta máquina não sabe descodificar avc1.640033.' };
+      fluxosRecebidos.set('outro1', falso);
+      voz.aPartilhar.add('outro1'); voz.aVer = 'outro1';
+      desenharVoz();
+      const pausa = document.querySelector('.palco__pausa');
+      diz(`ui codec recusado: explica=${!!pausa}`
+        + ` texto="${pausa ? pausa.textContent.replace(/\s+/g, ' ').slice(0, 46) : ''}"`);
+
+      fluxosRecebidos.delete('outro1'); voz.aPartilhar.delete('outro1');
+      voz.presentes.delete('outro1'); voz.aVer = null;
+      Object.assign(voz, { eu: antes.eu, canal: antes.canal });
       servidorAtual = antes.srv; canalAtual = antes.cnl;
       desenharVoz();
     }

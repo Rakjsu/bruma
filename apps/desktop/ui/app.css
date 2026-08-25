@@ -1002,6 +1002,15 @@ body.ghost .app { transition: filter .8s var(--ease); }
   background: rgba(5, 7, 10, .72); border-radius: 6px; padding: 3px 6px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* Âmbar e não vermelho: não é um erro da chamada, é uma pessoa que se deixou de ouvir —
+   e a diferença importa para quem está a olhar. */
+.tile__sem-audio {
+  position: absolute; right: 8px; top: 8px;
+  font: 700 9.5px/1 var(--ui); letter-spacing: .08em; text-transform: uppercase;
+  color: #16181c; background: var(--amber); border-radius: 5px; padding: 4px 6px;
+  cursor: help;
+}
+
 .mini__vivo {
   position: absolute; right: 6px; top: 5px;
   font: 700 8.5px/1 var(--ui); letter-spacing: .1em; color: #fff;

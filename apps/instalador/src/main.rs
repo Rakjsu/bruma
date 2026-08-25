@@ -221,6 +221,38 @@ fn avisar(janela: Option<&tauri::WebviewWindow>, passo: &str) {
         let _ = j.emit("passo", passo);
     }
     println!("[instalador] {passo}");
+    anotar(passo);
+}
+
+/// Escreve no mesmo registo da app.
+///
+/// # Porque é que isto tem de existir
+///
+/// A app não sabe se a actualização correu bem. O plugin do Tauri lança o instalador e
+/// chama `exit(0)` a seguir: não espera, não lê o código de saída. Se o UAC for recusado,
+/// se a extracção falhar, se o registo não deixar escrever — a app **fechou-se e não
+/// volta**, e não havia uma linha em lado nenhum.
+///
+/// A falha típica era "cliquei em Atualizar e o Bruma desapareceu". Não se consegue evitar
+/// o desaparecimento — mas consegue-se deixar dito até onde é que ele chegou.
+fn anotar(linha: &str) {
+    use std::io::Write;
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let destino = std::path::PathBuf::from(base)
+        .join("Bruma")
+        .join("bruma.log");
+    if let Some(pai) = destino.parent() {
+        let _ = std::fs::create_dir_all(pai);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&destino)
+    {
+        let _ = writeln!(f, "[instalador] {linha}");
+    }
 }
 
 fn fechar_o_bruma() {
@@ -600,6 +632,7 @@ fn main() {
         };
         if let Err(e) = r {
             eprintln!("[instalador] falhou: {e:#}");
+            anotar(&format!("FALHOU: {e:#}"));
             std::process::exit(1);
         }
         // Já elevados e sem pai à espera (--teste, ou alguém correu-nos já como admin):
