@@ -41,6 +41,36 @@ jobs:
       #
       # Ate aqui o release nao consultava o CI: uma etiqueta num commit que falhasse os
       # testes ou o clippy publicava a mesma, porque so o `cargo build` era exercitado.
+      # A RELEASE E CRIADA AQUI, ANTES DE SE COMPILAR NADA.
+      #
+      # Na v0.10.4 o token das Actions recusou criar a release -- "Resource not accessible
+      # by integration" -- DEPOIS de trinta minutos de compilacao. E o mais estranho: o
+      # token tinha `Contents: write` (esta escrito no log do "Set up job") e a v0.10.3
+      # tinha passado com o mesmo ficheiro. Criar a release a mao com o `gh` funcionou, e a
+      # partir dai o passo do tauri-action enviou para ela sem se queixar.
+      #
+      # Ou seja: o token consegue ENVIAR para uma release que ja exista, e as vezes nao
+      # consegue CRIA-LA. Nao controlo a razao; controlo o custo. Feito aqui, no principio,
+      # uma recusa custa dez segundos em vez de meia hora -- e diz o que fazer.
+      - name: Garantir a release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { "a release $tag ja existe"; exit 0 }
+          gh release create $tag --title "Bruma $tag" --notes "Bruma $tag" --verify-tag
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error @"
+          Nao consegui criar a release $tag com o token das Actions.
+          Cria-a a mao e volta a correr este workflow:
+              gh release create $tag --title "Bruma $tag" --notes "Bruma $tag"
+          O envio dos ficheiros para uma release que ja existe costuma funcionar.
+          "@
+            exit 1
+          }
+
       # Os portoes correm sobre o que SAI DAQUI -- a app e o instalador, mais o crate de
       # cripto de que dependem. O `--workspace` arrastava tambem o spike3, que compila o
       # Tor inteiro para nada: vinte minutos de espera em codigo que nao vai na release.
