@@ -19,7 +19,7 @@
 //! isso, quando o relógio avança e não veio nada, fabrica-se o silêncio que falta.
 
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// O formato que o dispositivo nos deu. O WASAPI entrega no formato de mistura do
@@ -524,7 +524,6 @@ mod win {
         // morrer a meio, o silêncio de recurso TEM de continuar deste ponto: recomeçar em
         // zero mandava amostras para trás no tempo e partia a linha de quem recebe.
         cursor: &std::sync::atomic::AtomicU64,
-        atraso_visto: &std::sync::atomic::AtomicI64,
     ) -> Result<()> {
         unsafe {
             // O `loopback` é COM puro; sem isto o CoCreateInstance falha na thread nova.
@@ -560,15 +559,31 @@ mod win {
             let bytes_por_frame = 4;
             let inicio = std::time::Instant::now();
             // O som não começa no instante zero da partilha: o codificador nasceu primeiro
-            // e o dispositivo levou o seu tempo a abrir. Esse atraso mede-se UMA vez e
-            // soma-se a tudo o que vier — é o que mantém o som colado à imagem em vez de
-            // adiantado pelo tempo que a abertura demorou.
+            // e o dispositivo levou o seu tempo a abrir.
+            //
+            // Isto era somado ao `instante` de cada bocado — e não servia de nada. O único
+            // sítio do fluxo que carrega tempo é o `tfdt`, e o `mse.rs` fabrica-o a partir
+            // da SOMA DAS DURAÇÕES de cada faixa (mse.rs:297): o instante que o Media
+            // Foundation escreve é descartado. Toda a faixa começa obrigatoriamente em
+            // zero, e o comentário que aqui estava — «é o que mantém o som colado à
+            // imagem» — descrevia uma coisa que não acontecia.
+            //
+            // Põe-se o atraso na MATÉRIA em vez de no carimbo: um bocado de silêncio com a
+            // duração do atraso, e daí para a frente tudo conta a partir dele. Assim a
+            // soma das durações carrega o desvio sozinha, sem depender de ninguém o ler.
             let atraso = (origem.elapsed().as_nanos() / 100) as i64;
-            atraso_visto.store(atraso, Ordering::Relaxed);
+            let frames_do_atraso = (atraso.max(0) as u64) * ritmo as u64 / 10_000_000;
+            if frames_do_atraso > 0 {
+                entrega(Bocado {
+                    pcm: vec![0u8; frames_do_atraso as usize * bytes_por_frame],
+                    instante: 0,
+                    duracao: (frames_do_atraso * 10_000_000 / ritmo as u64) as i64,
+                });
+            }
             // Onde vai o som já entregue, em frames. É este contador — e não o relógio da
             // parede — que decide quanto silêncio falta: assim o som nunca fica com mais
             // nem menos amostras do que o tempo que passou.
-            let mut entregues: u64 = 0;
+            let mut entregues: u64 = frames_do_atraso;
 
             // O dispositivo de som não morre a pedido, e um ramo que nunca corre é um
             // ramo por verificar — sobretudo este, que durante versões transformou uma
@@ -605,7 +620,7 @@ mod win {
                     let devidos = (decorrido * ritmo as f64) as u64;
                     if devidos > entregues + ritmo as u64 / 50 {
                         let faltam = (devidos - entregues) as usize;
-                        let instante = atraso + (entregues * 10_000_000 / ritmo as u64) as i64;
+                        let instante = (entregues * 10_000_000 / ritmo as u64) as i64;
                         entrega(Bocado {
                             pcm: vec![0u8; faltam * bytes_por_frame],
                             instante,
@@ -636,7 +651,7 @@ mod win {
                             );
                             para_estereo(cru, forma, canais)
                         };
-                        let instante = atraso + (entregues * 10_000_000 / ritmo as u64) as i64;
+                        let instante = (entregues * 10_000_000 / ritmo as u64) as i64;
                         entregues += frames as u64;
                         cursor.store(entregues, Ordering::Relaxed);
                         entrega(Bocado {
@@ -807,7 +822,6 @@ mod win {
                 }
             },
             &std::sync::atomic::AtomicU64::new(0),
-            &std::sync::atomic::AtomicI64::new(0),
         )?;
         Ok((
             if n > 0 { (soma / n as f64).sqrt() } else { 0.0 },
@@ -844,7 +858,6 @@ mod win {
                 }
             },
             &std::sync::atomic::AtomicU64::new(0),
-            &std::sync::atomic::AtomicI64::new(0),
         )?;
         let s = inicio.elapsed().as_secs_f64().max(0.001);
         let f = formato.ok_or_else(|| anyhow!("o dispositivo não disse o formato"))?;
@@ -936,7 +949,6 @@ pub fn arrancar(
 ) {
     std::thread::spawn(move || {
         let cursor = AtomicU64::new(0);
-        let atraso = AtomicI64::new(0);
         // O `anunciar` traz o formato REAL — o que o `abrir_cliente` conseguiu, e não o
         // que a sondagem adivinhou. É aqui, e só aqui, que se sabe se há eco.
         let avisa_eco = &aviso;
@@ -953,7 +965,6 @@ pub fn arrancar(
             },
             &mut entrega,
             &cursor,
-            &atraso,
         ) {
             Ok(()) => {}
             Err(e) => {
@@ -974,7 +985,6 @@ pub fn arrancar(
                     origem,
                     formato,
                     cursor.load(Ordering::Relaxed),
-                    atraso.load(Ordering::Relaxed),
                     entrega,
                 );
             }
@@ -988,9 +998,9 @@ fn silencio(
     origem: std::time::Instant,
     formato: Formato,
     // Onde a faixa já ia. Recomeçar em zero mandava amostras para trás no tempo, e uma
-    // linha de tempo que anda para trás não é um som mau — é um leitor que pára.
+    // linha de tempo que anda para trás não é um som mau — é um leitor que pára. Já traz o
+    // silêncio inicial do atraso lá dentro, por isso os instantes contam a partir de zero.
     ja_entregues: u64,
-    atraso: i64,
     mut entrega: impl FnMut(Bocado),
 ) {
     let ritmo = formato.ritmo.max(8000) as u64;
@@ -1003,7 +1013,7 @@ fn silencio(
             let faltam = (devidos - entregues) as usize;
             entrega(Bocado {
                 pcm: vec![0u8; faltam * bytes_por_quadro],
-                instante: atraso + (entregues * 10_000_000 / ritmo) as i64,
+                instante: (entregues * 10_000_000 / ritmo) as i64,
                 duracao: (faltam as u64 * 10_000_000 / ritmo) as i64,
             });
             entregues = devidos;
