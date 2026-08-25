@@ -46,6 +46,7 @@ struct Opcoes {
     modo: Modo,
     silencioso: bool,
     teste: bool,
+    apagar_dados: bool,
     dir: Option<PathBuf>,
     /// `/R` do updater: relançar a app no fim.
     relancar: bool,
@@ -71,6 +72,7 @@ fn opcoes() -> Opcoes {
         },
         silencioso: false,
         teste: false,
+        apagar_dados: false,
         dir: None,
         relancar: false,
         atualizacao: false,
@@ -91,6 +93,10 @@ fn opcoes() -> Opcoes {
                 break;
             }
             "--teste" => o.teste = true,
+            // O caminho silencioso passava sempre `false`, e por isso o ramo que apaga a
+            // identidade nunca corria fora da interface -- justamente o ramo que dizia
+            // "apaguei" sem olhar.
+            "--apagar-dados" => o.apagar_dados = true,
             _ => {
                 if let Some(d) = a.strip_prefix("--dir=") {
                     o.dir = Some(PathBuf::from(d));
@@ -141,10 +147,15 @@ fn dir_de_dados() -> Option<PathBuf> {
 /// vivem assim. O desinstalador so olhava para o `%APPDATA%`, portanto quem tivesse a
 /// identidade ao lado do executavel marcava "apagar para sempre", ouvia que tinha sido
 /// apagada, e ficava com ela intacta no disco.
-fn sitios_dos_dados(destino: &Path) -> Vec<PathBuf> {
+fn sitios_dos_dados(destino: &Path, teste: bool) -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Some(d) = dir_de_dados() {
-        v.push(d);
+    // Em teste NAO se toca no %APPDATA%: e a pasta de dados a serio de quem esta a correr
+    // o teste. Um portao de verificacao que apaga a identidade do dono e pior do que nao
+    // existir portao nenhum.
+    if !teste {
+        if let Some(d) = dir_de_dados() {
+            v.push(d);
+        }
     }
     v.push(destino.join("dados"));
     v
@@ -465,7 +476,7 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
         // ficava convencida de que a identidade tinha desaparecido do mundo enquanto ela
         // continuava no disco. E a mentira mais grave que esta app podia contar.
         let mut queixas = Vec::new();
-        for dados in sitios_dos_dados(destino) {
+        for dados in sitios_dos_dados(destino, teste) {
             if !dados.exists() {
                 continue;
             }
@@ -533,7 +544,7 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
 
     if let Some(queixas) = falha_dos_dados.filter(|q| !q.is_empty()) {
         bail!(
-            "o Bruma foi desinstalado, mas NAO consegui apagar a identidade: {}.              Ela continua no disco -- apaga essa pasta a mao para a perderes mesmo.",
+            "o Bruma foi desinstalado, mas NAO consegui apagar a identidade: {}. Ela continua no disco -- apaga essa pasta a mao para a perderes mesmo.",
             queixas.join("; ")
         );
     }
@@ -685,7 +696,7 @@ fn main() {
         }
         let r = match o.modo {
             Modo::Instalar => instalar(&destino, true, o.atualizacao, o.teste, None),
-            Modo::Desinstalar => desinstalar(&destino, false, o.teste),
+            Modo::Desinstalar => desinstalar(&destino, o.apagar_dados, o.teste),
         };
         if let Err(e) = r {
             eprintln!("[instalador] falhou: {e:#}");
