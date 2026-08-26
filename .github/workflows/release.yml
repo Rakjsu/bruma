@@ -135,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo clippy -p bruma -p instalador -p spike-common -p verificar-assinatura --all-targets -- -D warnings
+          cargo clippy -p bruma -p instalador -p spike-common -p verificar-assinatura -p so-o-que-vai-na-release --all-targets -- -D warnings
           cargo test -p bruma -p spike-common
 
       - name: Compilar, assinar e publicar
@@ -179,6 +179,22 @@ jobs:
       # release -- o updater das versoes antigas le o latest.json novo e corre o nosso
       # exe com /P /R /UPDATE /ARGS, o dialeto que ele implementa. Um instalador so,
       # para descarregar e para atualizar.
+      # Os andaimes de medicao nao vao no que se instala.
+      #
+      # Foram tirados a mao, e a mao ficaram dois comandos esquecidos que so apanhei a olhar
+      # para o exe publicado por outra razao. Da proxima vez que acrescentar uma ferramenta
+      # de medicao, o mesmo esquecimento chega sozinho -- por isso e um portao e nao uma boa
+      # intencao.
+      #
+      # Corre DEPOIS do tauri-action, que e quem compila o bruma.exe de release, e ANTES de
+      # o instalador o embrulhar: depois de embrulhado o payload vai comprimido e uma busca
+      # de texto deixaria de ver seja o que for -- passaria sempre, sem provar nada.
+      - name: A release nao leva andaimes de medicao?
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -q -p so-o-que-vai-na-release -- target/release/bruma.exe
+
       - name: Instalador proprio (download e auto-update)
         shell: pwsh
         env:

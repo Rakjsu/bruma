@@ -218,6 +218,7 @@ pub fn aplicar_bloqueio(
 /// app usa, portanto o que se experimenta e um convite a serio e nao a minha ideia de como um
 /// convite e feito. Um teste que constroi o seu proprio formato acaba a testar o construtor
 /// do teste.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn convites_de_teste() -> R<String> {
     let bom = "aa".repeat(32);
@@ -257,6 +258,7 @@ pub fn convites_de_teste() -> R<String> {
 }
 
 /// Alguma coisa apareceu FORA da pasta de dados, ou com um nome que nao e um id nosso?
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn escapou_alguma_coisa(app: State<Arc<App>>) -> R<String> {
     let raiz = estado::raiz();

@@ -81,6 +81,87 @@ fn responder_a_permissoes(janela: &tauri::WebviewWindow) {
 #[cfg(not(windows))]
 fn responder_a_permissoes(_janela: &tauri::WebviewWindow) {}
 
+/// A lista de comandos, escrita UMA vez, com um buraco para os que só existem em debug.
+///
+/// Duas listas copiadas seriam a receita para um comando novo funcionar em debug e faltar na
+/// release — e o sintoma seria «essa funcionalidade não faz nada na versão instalada», sem
+/// erro nenhum. Aqui a lista comum tem um só sítio.
+///
+/// Os extras vêm à frente e cada um com a sua vírgula (`$($extra,)*`), para que a lista com
+/// zero extras não fique com uma vírgula pendurada.
+macro_rules! handler_com {
+    ($($extra:path),* $(,)?) => {
+        tauri::generate_handler![
+            $($extra,)*
+            comandos::estado,
+            comandos::definir_nome,
+            comandos::criar_servidor,
+            comandos::criar_canal,
+            comandos::apagar_canal,
+            comandos::criar_convite,
+            comandos::entrar_com_convite,
+            comandos::abrir_conversa,
+            comandos::amigos,
+            comandos::adicionar_amigo,
+            comandos::remover_amigo,
+            comandos::marcar_verificado,
+            comandos::permissoes,
+            comandos::bloquear,
+            comandos::definir_quem_escreve,
+            comandos::marcar_lido,
+            comandos::enviar,
+            comandos::mensagens,
+            comandos::presenca_de_voz,
+            comandos::enviar_sinal,
+            comandos::meu_endereco,
+            comandos::saude,
+            comandos::capacidades,
+            comandos::autoteste_pedido,
+            comandos::autoteste_fps,
+            comandos::autoteste_altura,
+            comandos::autoteste_fonte,
+            comandos::medir_som,
+            comandos::sobre_esta_instalacao,
+            comandos::abrir_pasta_de_dados,
+            comandos::palavras_da_identidade,
+            comandos::restaurar_identidade,
+            comandos::receber_ecra,
+            comandos::receber_camara,
+            comandos::enviar_camara,
+            comandos::receber_voz,
+            comandos::enviar_voz,
+            comandos::qualidade,
+            comandos::autoteste_par,
+            comandos::medir_ui_pedido,
+            comandos::comecar_a_partilhar,
+            comandos::parar_de_partilhar,
+            fontes::fontes_de_partilha,
+            comandos::ver_meu_ecra,
+            comandos::parar_de_ver_meu_ecra,
+            comandos::definir_espectadores,
+            jogo::jogo_em_execucao
+        ]
+    };
+}
+
+/// Os comandos de MEDIÇÃO não vão na release.
+///
+/// O `convites_de_teste` existe para FABRICAR convites envenenados e o
+/// `escapou_alguma_coisa` para vasculhar a pasta de dados. Ficavam registados no binário que
+/// vai para as pessoas — a mesma incoerência que corrigi nas variáveis de ambiente, deixada
+/// ao lado. Só são alcançáveis a partir da própria janela da app, portanto o risco é
+/// pequeno; mas código que existe só para produzir cargas de ataque não tem nada que ir numa
+/// release, e a lista de comandos é uma superfície que se mantém curta de propósito.
+#[cfg(debug_assertions)]
+fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    handler_com![comandos::convites_de_teste, comandos::escapou_alguma_coisa]
+}
+
+#[cfg(not(debug_assertions))]
+fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    handler_com![]
+}
+
 fn main() {
     // A PRIMEIRA coisa: o `std` guarda o descritor de saída na primeira utilização e não
     // volta a perguntar, portanto isto tem de acontecer antes de alguém escrever seja o
@@ -178,57 +259,7 @@ fn main() {
             app.manage(rede);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            comandos::estado,
-            comandos::definir_nome,
-            comandos::criar_servidor,
-            comandos::criar_canal,
-            comandos::apagar_canal,
-            comandos::criar_convite,
-            comandos::entrar_com_convite,
-            comandos::abrir_conversa,
-            comandos::amigos,
-            comandos::adicionar_amigo,
-            comandos::remover_amigo,
-            comandos::marcar_verificado,
-            comandos::permissoes,
-            comandos::bloquear,
-            comandos::definir_quem_escreve,
-            comandos::marcar_lido,
-            comandos::convites_de_teste,
-            comandos::escapou_alguma_coisa,
-            comandos::enviar,
-            comandos::mensagens,
-            comandos::presenca_de_voz,
-            comandos::enviar_sinal,
-            comandos::meu_endereco,
-            comandos::saude,
-            comandos::capacidades,
-            comandos::autoteste_pedido,
-            comandos::autoteste_fps,
-            comandos::autoteste_altura,
-            comandos::autoteste_fonte,
-            comandos::medir_som,
-            comandos::sobre_esta_instalacao,
-            comandos::abrir_pasta_de_dados,
-            comandos::palavras_da_identidade,
-            comandos::restaurar_identidade,
-            comandos::receber_ecra,
-            comandos::receber_camara,
-            comandos::enviar_camara,
-            comandos::receber_voz,
-            comandos::enviar_voz,
-            comandos::qualidade,
-            comandos::autoteste_par,
-            comandos::medir_ui_pedido,
-            comandos::comecar_a_partilhar,
-            comandos::parar_de_partilhar,
-            fontes::fontes_de_partilha,
-            comandos::ver_meu_ecra,
-            comandos::parar_de_ver_meu_ecra,
-            comandos::definir_espectadores,
-            jogo::jogo_em_execucao,
-        ])
+        .invoke_handler(handler_de_comandos())
         .run(tauri::generate_context!())
         .expect("falha a arrancar o Bruma");
 }

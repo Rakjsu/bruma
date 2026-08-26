@@ -1,0 +1,10 @@
+[package]
+name = "so-o-que-vai-na-release"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# Ferramenta de PORTAO, nao faz parte de nada que se instale. Ver src/main.rs.
+
+[dependencies]
+anyhow = "1"
