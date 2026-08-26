@@ -178,7 +178,16 @@ pub fn aplicar_bloqueio(
             if let Some((c, _)) = l.get(&chave) {
                 // O `Drop` do guarda da sessão trata do resto: aborta as tarefas, tira-o do
                 // mapa e avisa a interface. A sessão morre como morreria uma nova.
-                c.close(0u32.into(), b"bloqueado");
+                // SEM RAZAO NENHUMA, e isso e a funcionalidade.
+                //
+                // O painel promete que ele nao distingue estar bloqueado de eu estar
+                // desligado. Mas o QUIC leva a razao do `close` ate ao outro lado, e o
+                // Bruma escreve o que lhe chega no registo: a palavra "bloqueado"
+                // aterrava no bruma.log dele. A promessa era falsa e a app e que a
+                // desmentia.
+                //
+                // Uma ligacao que fecha sem razao e indistinguivel de uma que caiu.
+                c.close(0u32.into(), b"");
             }
         }
     }

@@ -381,7 +381,17 @@ impl App {
         // falar com alguem com quem NAO se partilha servidor nenhum. Sem isto, o unico teste
         // possivel seria entre duas pessoas do mesmo servidor -- onde a amizade nao muda nada
         // e o teste passaria sem provar o que se afirma.
+        // Só em debug, e com `#[cfg]` e não `cfg!()`.
+        //
+        // Com `cfg!(debug_assertions)` o comportamento fica certo, mas o texto
+        // "BRUMA_AMIGO" continua no binário e a chamada ao ambiente continua a ser feita —
+        // fica a depender do optimizador não a ter deixado lá. Medi: com `cfg!()` uma das
+        // duas bandeiras desapareceu do exe de release e a outra ficou. «O optimizador
+        // provavelmente tira» não é uma garantia; `#[cfg]` é.
+        #[cfg(debug_assertions)]
         let amigo_de_teste = std::env::var("BRUMA_AMIGO").ok();
+        #[cfg(not(debug_assertions))]
+        let amigo_de_teste: Option<String> = None;
 
         let app = App {
             ident,
@@ -394,6 +404,7 @@ impl App {
             quem_escreve: Mutex::new(indice.quem_escreve),
         };
 
+        #[cfg(debug_assertions)]
         if let Ok(chave) = std::env::var("BRUMA_BLOQUEIA") {
             match app.bloquear(&chave, true) {
                 Ok(()) => eprintln!(

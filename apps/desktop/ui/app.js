@@ -37,6 +37,9 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
 let vista = null;        // o último estado vindo do Rust
+// Os amigos, em cache, para o `nomeDoPeer` poder preferir o nome LOCAL sem ser assíncrono.
+// A lista nunca sai desta máquina — tê-la aqui não a expõe a nada.
+let amigos = [];
 let servidorAtual = null;
 let canalAtual = null;
 /** Onde estamos: numa sala de um servidor, ou nas conversas privadas.
@@ -408,7 +411,8 @@ async function desenharMensagensPrivadas() {
  *  Não é um estado partilhado: é uma decisão minha, guardada aqui. Alguém pôr-me na lista
  *  dele não me põe na minha — e é por isso que ninguém entra nesta por pedir. */
 async function desenharAmigos(stream) {
-  const lista = await invoke('amigos').catch(() => []);
+  const lista = await invoke('amigos').catch(() => amigos);
+  amigos = lista;
 
   const cab = elemento('div', 'vazio');
   cab.style.textAlign = 'left';
@@ -519,6 +523,7 @@ function desenharTopo() {
 
 async function desenharTudo() {
   vista = await invoke('estado');
+  amigos = await invoke('amigos').catch(() => amigos);
   $('#meu-nome').textContent = vista.nome || 'sem nome';
   $('#minha-chave').textContent = chaveCurta(vista.chave);
   pintar($('#meu-avatar'), vista.chave);
@@ -865,6 +870,13 @@ const PAINEIS = {
         try {
           await invoke('bloquear', { chave: inB.value, sim: true });
           inB.value = '';
+          // A APP INTEIRA, e nao so este painel.
+          //
+          // Bloquear tira a pessoa dos amigos e fecha-lhe a ligacao -- e a lista de amigos e
+          // a grelha da chamada continuavam a mostra-la, porque nada aqui chamava o
+          // `desenharTudo`. Fechavam-se as Definicoes e la estava ela, como amiga e como
+          // presente. A app dizia duas coisas contrarias sobre a mesma pessoa.
+          await desenharTudo();
           await mostrarPainel('permissoes');
         } catch (e) { notaB.textContent = String(e); }
       };
@@ -885,6 +897,7 @@ const PAINEIS = {
           const bt = elemento('button', 'btn', 'Desbloquear');
           bt.onclick = async () => {
             await invoke('bloquear', { chave: c, sim: false }).catch(e => alert(String(e)));
+            await desenharTudo();
             await mostrarPainel('permissoes');
           };
           l.append(av, t, bt);
@@ -2796,8 +2809,18 @@ function actualizarEspectadores() {
   invoke('definir_espectadores', { chaves: lista }).catch(() => {});
 }
 
+/** O nome LOCAL manda sobre o que a pessoa escolheu chamar-se.
+ *
+ *  O painel diz que ninguém garante que uma chave é de quem julgas, e que a defesa é
+ *  compará-la por outro caminho e marcá-la como verificada. Só que o nome verificado vivia
+ *  no ecrã dos Amigos e mais lado nenhum: em cada mensagem, na lista de membros e na
+ *  chamada, aparecia o nome que a OUTRA pessoa escreveu — que é exactamente o campo que um
+ *  impostor controla. A defesa existia e não se via onde é precisa.
+ */
 function nomeDoPeer(peer) {
   if (peer === voz.eu) return 'tu';
+  const amigo = (amigos || []).find(a => a.chave === peer);
+  if (amigo && amigo.nome) return amigo.nome;
   // Varre TODOS os servidores, e não só o que está aberto. Numa conversa privada não há
   // servidor aberto de onde tirar o nome, e mesmo num servidor a pessoa pode ser conhecida
   // de outra sala.

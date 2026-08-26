@@ -222,6 +222,7 @@ impl Rede {
         // Bloquear alguem A MEIO de uma sessao viva -- que e o caso que o bloqueio no
         // arranque nunca poe a prova, porque nessa altura ainda nao ha sessao nenhuma para
         // derrubar. Sem isto, a medicao dizia "esta na lista" e ficava-se por ai.
+        #[cfg(debug_assertions)]
         if let Ok(alvo) = std::env::var("BRUMA_BLOQUEIA_TARDE") {
             let app = Arc::clone(&app);
             let rede = Arc::clone(&rede);
@@ -250,6 +251,7 @@ impl Rede {
             });
         }
 
+        #[cfg(debug_assertions)]
         if let Ok(alvo) = std::env::var("BRUMA_ESTRANHO") {
             let rede = rede.clone();
             let app = app.clone();
@@ -494,6 +496,17 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
             v.dedup();
             v
         };
+        // TIRAR OS BLOQUEADOS DA LISTA DE QUEM DISCAR.
+        //
+        // Bloquear escreve na lista e fecha a ligação viva — e mais nada. A pessoa continua
+        // em `srv.peers` de todas as salas, e o vigia continuava a ligar-se-lhe de dois em
+        // dois segundos. A sessão morria no primeiro `if e_bloqueado`, o vigia voltava a
+        // tentar, e ficava um ciclo a encher o registo com tentativas a alguém que eu
+        // recusei — e a dizer-lhe, com o próprio tráfego, que eu estou online.
+        let conhecidos: Vec<String> = conhecidos
+            .into_iter()
+            .filter(|p| !app.e_bloqueado(p))
+            .collect();
         let agora = std::time::Instant::now();
         for peer in conhecidos {
             let ja_ligado = rede
@@ -688,7 +701,16 @@ async fn sessao(
     // E fica aqui em cima e não mais abaixo porque um guarda que corre depois de já se ter
     // dito «olá» já disse «olá».
     if app.e_bloqueado(&peer) {
-        conn.close(0u32.into(), b"bloqueado");
+        // SEM RAZAO NENHUMA, e isso e a funcionalidade.
+        //
+        // O painel promete que ele nao distingue estar bloqueado de eu estar
+        // desligado. Mas o QUIC leva a razao do `close` ate ao outro lado, e o
+        // Bruma escreve o que lhe chega no registo: a palavra "bloqueado"
+        // aterrava no bruma.log dele. A promessa era falsa e a app e que a
+        // desmentia.
+        //
+        // Uma ligacao que fecha sem razao e indistinguivel de uma que caiu.
+        conn.close(0u32.into(), b"");
         if let Ok(mut fila) = rede.a_ligar.lock() {
             fila.remove(&peer);
         }
@@ -775,6 +797,18 @@ async fn sessao(
     // Antes de decidir o que sai e o que entra: ver se este par já escreveu numa sala
     // minha. Se escreveu, é de casa, mesmo que nunca tenhamos sincronizado um com o outro.
     aprender_dos_logs(&app, &peer);
+
+    // OUTRA VEZ, DEPOIS DE INSCRITO.
+    //
+    // A verificação lá em cima acontece antes de esta sessão existir no mapa `ligacoes`. Um
+    // bloqueio que caísse nessa janela não encontrava nada para fechar — o `aplicar_bloqueio`
+    // procura no mapa — e a sessão seguia viva apesar de a pessoa estar na lista. A janela é
+    // pequena e uma ligação dura horas: um bloqueio que não pega é um bloqueio que não
+    // existe.
+    if app.e_bloqueado(&peer) {
+        conn.close(0u32.into(), b"");
+        return Ok(());
+    }
 
     let _ = janela.emit("peer-ligado", &peer);
     guarda.anunciado = true;
@@ -948,7 +982,7 @@ async fn sessao(
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Sync { servidor, entradas })) => {
-                    if std::env::var("BRUMA_ESTRANHO").is_ok() {
+                    if ataque_permitido() {
                         eprintln!(
                             "[estranho] recebi um SYNC do servidor {} com {} entradas",
                             &servidor[..8.min(servidor.len())],
@@ -1038,7 +1072,7 @@ async fn sessao(
                             // chega a ser posto à prova, e conclui-se que a defesa aguenta
                             // quando o ataque nem saiu de casa. Foi o que me aconteceu três
                             // vezes hoje.
-                            let ataque = std::env::var("BRUMA_ESTRANHO").is_ok();
+                            let ataque = ataque_permitido();
                             if ataque || pode_sincronizar(&app, &servidor, &peer) {
                                 Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
                             } else {
@@ -1053,7 +1087,7 @@ async fn sessao(
                             // à saída e o porteiro do outro lado nunca chegava a ser posto
                             // à prova — que é o erro de medir a defesa com um ataque que
                             // nunca sai de casa.
-                            let ataque = std::env::var("BRUMA_ESTRANHO").is_ok();
+                            let ataque = ataque_permitido();
                             if ataque || participa(&app, &servidor, &peer) {
                                 Some(Quadro::Controlo(Msg::Presenca { servidor, canal }))
                             } else {
@@ -1075,7 +1109,7 @@ async fn sessao(
                                 // Simulador de ataque: mandar um `Sync` de um servidor que
                                 // NÃO tenho, só para ver se o outro lado me inscreve por eu
                                 // dizer o nome. Era assim que o porteiro se contornava.
-                                None if std::env::var("BRUMA_ESTRANHO").is_ok() => Some(
+                                None if ataque_permitido() => Some(
                                     Quadro::Controlo(Msg::Sync {
                                         servidor,
                                         entradas: Vec::new(),
@@ -1233,6 +1267,28 @@ fn aprender_dos_logs(app: &Arc<App>, peer: &str) {
 ///
 /// O porteiro (`conhecido`, `participa`) continua a ler só `peers`, onde só se entra
 /// provando. Este é o único sítio onde o `convidou` conta.
+/// As bandeiras de ataque existem, e NÃO existem no binário que vai para o utilizador.
+///
+/// Cinco delas fazem um guarda ser saltado ou escrevem estado permanente: o `BRUMA_ESTRANHO`
+/// desliga o `pode_sincronizar` à saída, o simulador escreve lixo assinado num servidor REAL
+/// escolhido às cegas, o `BRUMA_BLOQUEIA` e o `BRUMA_AMIGO` gravam no índice, e o
+/// `BRUMA_BLOQUEIA_TARDE` derruba uma ligação.
+///
+/// Tudo isso é necessário para medir — um ataque que não sai de casa passa em todos os
+/// testes — e nada disso tem que ver com usar a app. Ficando atrás de `debug_assertions`, o
+/// binário de release simplesmente não os tem: não é «difícil de accionar», é inexistente.
+/// Os testes correm sobre `target/debug` e continuam a tê-los todos.
+#[cfg(debug_assertions)]
+fn ataque_permitido() -> bool {
+    std::env::var("BRUMA_ESTRANHO").is_ok()
+}
+
+/// Na release nem sequer se vai perguntar ao ambiente — e o nome da variável não fica no exe.
+#[cfg(not(debug_assertions))]
+fn ataque_permitido() -> bool {
+    false
+}
+
 fn pode_sincronizar(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
     app.servidores
         .lock()

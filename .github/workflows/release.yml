@@ -11,6 +11,15 @@ on:
 permissions:
   contents: write
 
+# Duas corridas sobre a MESMA etiqueta mutavam a mesma release com `--clobber` ao mesmo
+# tempo: re-etiquetar, ou lancar um `workflow_dispatch` enquanto a corrida do push ainda
+# compila, poe duas a enviar Instalar-Bruma.exe para o mesmo sitio. Quem ganhasse a corrida
+# decidia o que ficava, e a assinatura podia acabar a ser de OUTRO binario -- o portao novo
+# apanharia isso, mas depois de meia hora de compilacao.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Windows
@@ -253,8 +262,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           # O NSIS reformou-se: sai da pagina para ninguem o descarregar por engano.
-          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe" --yes
-          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe.sig" --yes
+          # O NSIS reformou-se, mas pode nem la estar -- e nesse caso o `delete-asset`
+          # falha. Como e o ULTIMO comando do passo, o codigo de saida dele passava a ser o
+          # do passo: uma limpeza opcional a falhar deitava abaixo uma publicacao boa. E ao
+          # contrario, se um comando ANTERIOR falhasse, este apagava o rasto disso.
+          # Explicito nos dois sentidos: estes podem falhar, e o passo acaba com 0.
+          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe" --yes 2>$null
+          gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe.sig" --yes 2>$null
+          $global:LASTEXITCODE = 0
+          exit 0
 
       # O portao que faltava, e o que tinha a pior forma de falhar.
       #
