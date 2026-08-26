@@ -130,6 +130,19 @@ impl Servidor {
         (saida, ids)
     }
 
+    /// Quem PROVOU pertencer aqui.
+    ///
+    /// Não é «quem assinou uma entrada»: o `merge` verifica a assinatura e mais nada, portanto
+    /// qualquer pessoa consegue anexar lixo assinado por ela própria e passar por autor. A
+    /// prova a sério é uma entrada **que decifra** — isso exige a chave simétrica desta sala,
+    /// que só se recebe no convite.
+    ///
+    /// É este o conjunto que o porteiro da rede usa. Enquanto era «quem se ligou e disse o id»,
+    /// bastava uma mensagem vazia para entrar.
+    pub fn autores_provados(&self) -> std::collections::BTreeSet<String> {
+        self.aplicaveis().0.into_iter().map(|a| a.autor).collect()
+    }
+
     pub fn estado(&self) -> EstadoDoServidor {
         let (aps, _) = self.aplicaveis();
         modelo::reconstruir(&aps)
@@ -313,7 +326,7 @@ impl App {
             &x25519_dalek::PublicKey::from(hex32(&x_hex)?),
             &eu,
             &ele,
-        );
+        )?;
 
         let log = blog::Log::load(caminho_do_log(&id))?;
         self.servidores.lock().unwrap().insert(

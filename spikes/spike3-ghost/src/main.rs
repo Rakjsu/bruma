@@ -260,7 +260,8 @@ where
         &XPublic::from(peer_x),
         shared.ident.verifying().as_bytes(),
         &peer_id,
-    );
+    )
+    .expect("chave de sessão");
     *shared.key.lock().await = Some(key);
     println!("[ok] Peer {} verificado; chave de sessao pronta.", &id[..8]);
     println!();

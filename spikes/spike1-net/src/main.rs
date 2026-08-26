@@ -193,7 +193,8 @@ async fn session(
         &XPublic::from(peer_x),
         shared.ident.verifying().as_bytes(),
         peer_id.as_bytes(),
-    );
+    )
+    .expect("chave de sessão");
     *shared.key.lock().await = Some(key);
     save_peer_cache(&shared.peer_path, &peer_id.to_string(), &x_pub)?;
     println!("[ok] Chave de sessao estabelecida (prekey assinada e verificada)");
@@ -311,7 +312,8 @@ async fn restore_cached_key(shared: &Arc<Shared>) -> bool {
         &XPublic::from(x),
         shared.ident.verifying().as_bytes(),
         peer_id.as_bytes(),
-    );
+    )
+    .expect("chave de sessão");
     *shared.key.lock().await = Some(key);
     true
 }

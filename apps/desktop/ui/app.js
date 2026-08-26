@@ -1815,7 +1815,10 @@ document.addEventListener('contextmenu', ev => {
       accao: () => invoke('apagar_canal', { servidor: servidorAtual, canal: id }).catch(console.error),
     });
   }
-  if (servidorAtual && !canal && !msg && !membro) {
+  // Só no modo servidor: no modo privado o `servidorAtual` continua preenchido por baixo, e
+  // isto oferecia "convidar alguém" para um servidor que não está no ecrã — e o que sairia
+  // seria a chave que o decifra.
+  if (modo === 'servidor' && servidorAtual && !canal && !msg && !membro) {
     itens.push({ rotulo: 'Convidar alguém', accao: () => $('#btn-convite').click() });
   }
   if (itens.length) itens.push('-');
@@ -2952,7 +2955,9 @@ function accoesDoPainel(chave, { transmite, aVer, temVideo }) {
 function desenharVoz() {
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
-  const eDeVoz = canal && canal.tipo === 'voz';
+  // A vista de voz vive no modo servidor. Sem esta condição ela lia o `canalAtual` velho —
+  // o da última sala onde se esteve — e abria-se por cima da conversa privada.
+  const eDeVoz = modo === 'servidor' && canal && canal.tipo === 'voz';
   $('#vista-voz').hidden = !eDeVoz;
   desenharNaChamada();
   if (!eDeVoz) return;

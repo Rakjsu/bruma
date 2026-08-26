@@ -305,6 +305,14 @@ pub fn apagar_canal(
 
 #[tauri::command]
 pub fn criar_convite(servidor: String, app: State<Arc<App>>, rede: State<Arc<Rede>>) -> R<String> {
+    // Uma conversa não se convida: ela existe porque as duas chaves existem, e não há segredo
+    // nenhum para pôr num convite. Cinto de segurança para o caso de a interface pedir.
+    {
+        let s = app.servidores.lock().map_err(erro)?;
+        if s.get(&servidor).is_some_and(|x| x.com.is_some()) {
+            return Err("uma conversa privada não tem convite".into());
+        }
+    }
     let servidores = app.servidores.lock().map_err(erro)?;
     let srv = servidores
         .get(&servidor)

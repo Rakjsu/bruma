@@ -4,7 +4,7 @@
 //! secrecy. É deliberado — o spike só quer provar transporte + opacidade. No produto isto é
 //! substituído pelas chaves de época por trás do trait `GroupKeyAgreement`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -87,8 +87,30 @@ pub fn id_da_conversa(a: &[u8; 32], b: &[u8; 32]) -> [u8; 16] {
 }
 
 /// ECDH + HKDF. O sal ordena as duas identidades para os dois lados derivarem a MESMA chave.
-pub fn session_key(mine: &StaticSecret, theirs: &XPublic, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+/// # Porque é que isto devolve `Result`
+///
+/// Uma prekey assinada prova que aquela pessoa a **anunciou** — não prova que ela conhece o
+/// segredo correspondente, nem que os 32 bytes são sequer um ponto útil. Existem pontos de
+/// ordem pequena (o zero é o mais simples) para os quais o Diffie-Hellman devolve sempre
+/// zeros, aconteça o que acontecer do outro lado.
+///
+/// Anunciar um desses transforma a chave da conversa numa função **só de dados públicos**:
+/// `HKDF(sal = as duas identidades, ikm = 0)`. Qualquer pessoa que veja as duas chaves
+/// públicas a calcula, e lê a conversa toda. E não haveria sintoma nenhum — a conversa
+/// funciona, cifra, decifra, e está aberta a quem passar.
+///
+/// O `was_contributory` é a pergunta «o meu segredo contou para alguma coisa?». Se não
+/// contou, isto não é uma chave partilhada; é um número que ambos os lados sabiam de antemão.
+pub fn session_key(
+    mine: &StaticSecret,
+    theirs: &XPublic,
+    a: &[u8; 32],
+    b: &[u8; 32],
+) -> Result<[u8; 32]> {
     let shared = mine.diffie_hellman(theirs);
+    if !shared.was_contributory() {
+        bail!("a chave de conversa anunciada não serve: o segredo partilhado seria público");
+    }
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     let mut salt = Vec::with_capacity(64);
     salt.extend_from_slice(lo);
@@ -97,7 +119,7 @@ pub fn session_key(mine: &StaticSecret, theirs: &XPublic, a: &[u8; 32], b: &[u8;
     Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
         .expand(CTX_SESSION, &mut key)
         .expect("hkdf sessão");
-    key
+    Ok(key)
 }
 
 /// A semente escrita em palavras, para se poder guardar num papel.
@@ -204,6 +226,46 @@ pub fn open(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8]) -> Result<Vec<u8>> {
 mod testes_palavras {
     use super::*;
 
+    /// Uma prekey de ordem pequena tornava a chave da conversa calculavel por QUALQUER UM.
+    ///
+    /// Uma assinatura sobre a prekey prova que ela foi anunciada por aquela pessoa. Nao prova
+    /// que ela conhece o segredo, nem que os 32 bytes servem para alguma coisa. Anunciando um
+    /// ponto degenerado, o Diffie-Hellman devolve zeros aconteca o que acontecer do outro
+    /// lado, e a chave passa a ser uma funcao so de dados publicos -- sem sintoma nenhum: a
+    /// conversa cifra, decifra, e esta aberta a quem passar.
+    #[test]
+    fn uma_prekey_degenerada_e_recusada() {
+        let eu = Identity::from_seed(&[1u8; 32]);
+        let ed = eu.verifying().to_bytes();
+        let outro = [9u8; 32];
+
+        let zeros = XPublic::from([0u8; 32]);
+        assert!(
+            session_key(&eu.x_secret, &zeros, &ed, &outro).is_err(),
+            "aceitou a prekey de zeros -- a chave seria publica"
+        );
+        let mut um = [0u8; 32];
+        um[0] = 1;
+        assert!(
+            session_key(&eu.x_secret, &XPublic::from(um), &ed, &outro).is_err(),
+            "aceitou um ponto de ordem pequena"
+        );
+
+        // E uma prekey de verdade continua a passar -- uma recusa que recusasse tudo tambem
+        // nao servia de nada.
+        let dele = Identity::from_seed(&[2u8; 32]);
+        assert!(
+            session_key(
+                &eu.x_secret,
+                &dele.x_public(),
+                &ed,
+                &dele.verifying().to_bytes()
+            )
+            .is_ok(),
+            "recusou uma prekey boa"
+        );
+    }
+
     /// Os dois lados TEM de chegar ao mesmo id, e a ordem nao pode contar.
     ///
     /// Se contasse, cada um abria a sua conversa, escrevia no seu log, e nenhum via o do
@@ -232,13 +294,13 @@ mod testes_palavras {
         let ib = Identity::from_seed(&[2u8; 32]);
         let ea = ia.verifying().to_bytes();
         let eb = ib.verifying().to_bytes();
-        let ka = session_key(&ia.x_secret, &ib.x_public(), &ea, &eb);
-        let kb = session_key(&ib.x_secret, &ia.x_public(), &eb, &ea);
+        let ka = session_key(&ia.x_secret, &ib.x_public(), &ea, &eb).expect("chave de sessão");
+        let kb = session_key(&ib.x_secret, &ia.x_public(), &eb, &ea).expect("chave de sessão");
         assert_eq!(ka, kb, "os dois lados derivaram chaves diferentes");
 
         let ic = Identity::from_seed(&[3u8; 32]);
         let ec = ic.verifying().to_bytes();
-        let kc = session_key(&ia.x_secret, &ic.x_public(), &ea, &ec);
+        let kc = session_key(&ia.x_secret, &ic.x_public(), &ea, &ec).expect("chave de sessão");
         assert_ne!(ka, kc, "duas conversas diferentes com a mesma chave");
     }
 
@@ -406,14 +468,16 @@ mod tests {
             &b.x_public(),
             a.verifying().as_bytes(),
             b.verifying().as_bytes(),
-        );
+        )
+        .expect("chave de sessão");
         // B chama com os argumentos pela ordem dele. Tem de dar o mesmo.
         let kb = session_key(
             &b.x_secret,
             &a.x_public(),
             b.verifying().as_bytes(),
             a.verifying().as_bytes(),
-        );
+        )
+        .expect("chave de sessão");
         assert_eq!(ka, kb, "o sal ordenado devia tornar a derivacao simetrica");
     }
 

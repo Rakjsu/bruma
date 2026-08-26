@@ -231,10 +231,19 @@ impl Rede {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-                // Forjar presença na sala dele. Era isto que o punha a mandar-me o
-                // microfone e a câmara: a interface acreditava em quem se anunciasse.
                 if let Ok(sala) = std::env::var("BRUMA_ESTRANHO_SALA") {
                     let (srv, canal) = sala.split_once('/').unwrap_or((sala.as_str(), "x"));
+
+                    // Primeiro dizer o nome da sala dele, que era o que bastava para eu ficar
+                    // inscrito nos peers — e a partir daí passar por membro em tudo o resto.
+                    let _ = rede.tx.send(Saida::SyncPara {
+                        para: alvo.trim().to_string(),
+                        servidor: srv.to_string(),
+                    });
+                    eprintln!("[estranho] disse o nome da sala {srv} sem ter a chave dela");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                    // E agora forjar presença. Se a inscrição pegou, isto passa o porteiro.
                     let _ = rede
                         .tx
                         .send(Saida::Presenca(srv.to_string(), Some(canal.to_string())));
@@ -736,9 +745,13 @@ async fn sessao(
 
     // E dizer onde estamos agora. Sem isto, quem chega depois de nós entrarmos numa sala
     // não sabe que lá estamos, e não nos manda voz nenhuma.
+    // ...mas só a quem é dessa sala. Isto ia para qualquer par que se ligasse, e levava o id
+    // do servidor E o da sala de voz onde estou neste momento — a um estranho, no primeiro
+    // segundo da ligação. Com esses dois valores ele devolvia-me a mesma presença e passava a
+    // constar da minha lista de presentes.
     let onde = rede.presenca.lock().ok().and_then(|p| p.clone());
     if let Some((servidor, canal)) = onde {
-        if canal.is_some() {
+        if canal.is_some() && participa(&app, &servidor, &peer) {
             escrever(&mut envia, &Msg::Presenca { servidor, canal }).await?;
         }
     }
@@ -853,6 +866,17 @@ async fn sessao(
                     canal,
                     dados,
                 })) => {
+                    // O `Sinal` não tinha porteiro nenhum, e é ele que a interface usa para
+                    // saber quem entende câmara e quem pediu para assistir — ou seja, é por
+                    // aqui que se decide para quem sai a minha câmara e o meu ecrã. Fechei a
+                    // voz, o vídeo e a presença e deixei esta porta aberta ao lado.
+                    if !participa(&leitura_app, &servidor, &peer_leitura) {
+                        eprintln!(
+                            "[porteiro] recusei um sinal de {}: não é dessa sala",
+                            &peer_leitura[..8.min(peer_leitura.len())]
+                        );
+                        continue;
+                    }
                     let _ = leitura_janela.emit(
                         "sinal",
                         serde_json::json!({ "de": &peer_leitura, "servidor": servidor, "canal": canal, "dados": dados }),
@@ -906,9 +930,21 @@ async fn sessao(
                                 .lock()
                                 .ok()
                                 .and_then(|s| s.get(&servidor).map(|srv| srv.log.ordered()));
-                            entradas.map(|entradas| {
-                                Quadro::Controlo(Msg::Sync { servidor, entradas })
-                            })
+                            match entradas {
+                                Some(entradas) => {
+                                    Some(Quadro::Controlo(Msg::Sync { servidor, entradas }))
+                                }
+                                // Simulador de ataque: mandar um `Sync` de um servidor que
+                                // NÃO tenho, só para ver se o outro lado me inscreve por eu
+                                // dizer o nome. Era assim que o porteiro se contornava.
+                                None if std::env::var("BRUMA_ESTRANHO").is_ok() => Some(
+                                    Quadro::Controlo(Msg::Sync {
+                                        servidor,
+                                        entradas: Vec::new(),
+                                    }),
+                                ),
+                                None => None,
+                            }
                         }
                         Saida::SyncPara { .. } => None,
                         // Sinalizacao e video sao dirigidos: as outras sessoes deixam passar.
@@ -978,6 +1014,11 @@ async fn sessao(
 /// eu criei — podia injectar som nas minhas colunas a meio de uma chamada e, forjando uma
 /// presença, passar a receber o meu microfone e a minha câmara. A cifra protegia o conteúdo
 /// dos logs; o transporte não tinha porteiro nenhum.
+/// A minha própria chave, que nunca deve entrar na lista de pares.
+fn peer_proprio(app: &Arc<App>) -> String {
+    app.minha_chave()
+}
+
 fn conhecido(app: &Arc<App>, peer: &str) -> bool {
     app.servidores
         .lock()
@@ -1065,11 +1106,43 @@ fn aplicar(
         let Some(srv) = s.get_mut(servidor) else {
             return; // não temos este servidor: não é erro, é só não ser para nós
         };
-        let aprendi = !srv.peers.iter().any(|p| p == peer);
-        if aprendi {
-            srv.peers.push(peer.to_string());
+
+        // UMA CONVERSA TEM DOIS PARTICIPANTES, E SÓ DOIS.
+        //
+        // O id de uma conversa sai de duas chaves PÚBLICAS — qualquer pessoa que veja os dois
+        // na lista de membros de um servidor o consegue calcular, sem falar com ninguém. Se
+        // dizê-lo bastasse para entrar, um terceiro entrava na conversa dos outros: recebia o
+        // log de volta (autores e horas em claro), ficava a saber que eles falam e quando, e
+        // passava a contar como conhecido para a voz e para o vídeo.
+        if srv.com.as_deref().is_some_and(|c| c != peer) {
+            return;
         }
-        (srv.log.merge(entradas).unwrap_or(0), aprendi)
+
+        let novas = srv.log.merge(entradas).unwrap_or(0);
+
+        // E aqui está o que faltava: PROVAR, e não dizer.
+        //
+        // Isto era `aprendi = !peers.contains(peer)` — ou seja, nomear um id que eu tenho era
+        // prova bastante. Uma mensagem vazia punha um estranho nos meus peers, para sempre, e
+        // a partir daí ele passava o porteiro da voz, do vídeo e da presença. Construí a porta
+        // e deixei o caixilho de fora.
+        //
+        // A prova é ter escrito aqui uma entrada que DECIFRA, o que exige a chave da sala. E
+        // de caminho aprendem-se todos os que a têm — que é o que faz duas pessoas entradas
+        // pelo mesmo convite chegarem a conhecer-se, em vez de falarem para sempre através de
+        // quem as convidou.
+        let mut aprendi = false;
+        if novas > 0 {
+            for autor in srv.autores_provados() {
+                if autor != peer_proprio(app) && !srv.peers.iter().any(|p| p == &autor) {
+                    if autor == peer {
+                        aprendi = true;
+                    }
+                    srv.peers.push(autor);
+                }
+            }
+        }
+        (novas, aprendi)
     };
     // Gravar TAMBÉM quando só se aprendeu um par. Antes só se gravava se viessem entradas
     // novas, e por isso um par que sincronizasse sem trazer nada ficava só em memória e
@@ -1088,6 +1161,21 @@ fn aplicar(
             para: peer.to_string(),
             servidor: servidor.to_string(),
         });
+
+        // E dizer-lhe outra vez onde estou.
+        //
+        // A presença é dita UMA vez, no arranque da sessão — e nessa altura ele ainda não era
+        // conhecido, portanto o guarda calou-a e ela nunca mais seria dita. O outro lado
+        // ficava a ouvir-me sem me ver na lista: «0 presentes» com a voz a chegar.
+        //
+        // Agora que ele provou ser de casa, repete-se. Repetir uma presença não custa nada;
+        // perdê-la custa a chamada inteira.
+        let onde = rede.presenca.lock().ok().and_then(|p| p.clone());
+        if let Some((srv_voz, canal)) = onde {
+            if canal.is_some() {
+                let _ = rede.tx.send(Saida::Presenca(srv_voz, canal));
+            }
+        }
     }
 }
 
