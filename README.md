@@ -6,7 +6,7 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.15.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.15.1 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos e permissões de mensagens.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
@@ -77,6 +77,10 @@ projectos morrem.
 - **O convite é um segredo, e é eterno.** Ele carrega a chave que decifra o servidor.
   Trata-o como uma password: quem o tiver entra e lê o histórico todo. **Não expira e não se
   revoga** — e por isso não há forma de expulsar ninguém.
+- **Aceitar um convite não dá direitos a quem to deu.** Um convite não é assinado: quem o
+  escreve escolhe o que lá está, incluindo a chave que diz ser a do anfitrião. Essa chave
+  serve para te ligares e trocares o histórico daquela sala, e mais nada — só passa a contar
+  como membro depois de escrever lá uma entrada que **decifra**, o que exige a chave da sala.
 - **Não há cargos nem permissões.** Qualquer membro pode criar e apagar canais.
 - **A chave do servidor nunca roda.** Sem isso não há *forward secrecy*: quem obtiver a
   chave lê o passado e o futuro.
