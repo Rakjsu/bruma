@@ -50,6 +50,20 @@ pub enum Msg {
         canal: String,
         dados: String,
     },
+    /// Uma mensagem que esta versão não conhece.
+    ///
+    /// # Porque é que isto tem de existir
+    ///
+    /// Sem esta variante, o `serde` recusa qualquer `t` que não esteja na lista, o `ler()`
+    /// devolve `Err` e o leitor faz `break` — **a sessão inteira cai**. Ou seja: no dia em
+    /// que uma versão nova acrescentar uma mensagem, ela deixa de conseguir falar com todas
+    /// as versões anteriores. Não é uma funcionalidade que falha; é a ligação que morre.
+    ///
+    /// Com ela, o que não se conhece é ignorado e a conversa continua. Não salva as versões
+    /// já instaladas — salva todas as que vierem a seguir, e é por isso que entra sozinha e
+    /// antes de tudo o resto.
+    #[serde(other)]
+    Desconhecida,
 }
 
 /// O que sai daqui para as sessoes abertas.
@@ -659,6 +673,16 @@ async fn sessao(
                 Ok(Quadro::Controlo(Msg::Ola { nome })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
                 }
+                // Uma mensagem de uma versão mais nova do que esta. Ignora-se e segue-se:
+                // o que não se conhece não pode ser tratado, mas também não é razão para
+                // derrubar a ligação. Fica no registo porque, se um dia alguém disser «ele
+                // está online mas não recebo nada», é aqui que a resposta aparece.
+                Ok(Quadro::Controlo(Msg::Desconhecida)) => {
+                    eprintln!(
+                        "[rede] {} falou uma coisa que esta versão não conhece; ignorada",
+                        &peer_leitura[..8.min(peer_leitura.len())]
+                    );
+                }
                 Ok(Quadro::Controlo(Msg::Sync { servidor, entradas })) => {
                     aplicar(
                         &leitura_app,
@@ -917,6 +941,38 @@ async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// Uma mensagem de uma versao mais nova NAO pode derrubar a ligacao.
+    ///
+    /// Sem `#[serde(other)]`, o `serde` recusa um `t` que nao conheca, o `ler()` devolve
+    /// `Err` e o leitor faz `break`. No dia em que uma versao acrescentasse uma mensagem,
+    /// deixava de conseguir falar com todas as anteriores -- e o sintoma nao seria "essa
+    /// funcionalidade nao funciona", seria "o outro aparece ligado e nao chega nada".
+    #[test]
+    fn uma_mensagem_desconhecida_nao_derruba_a_sessao() {
+        // O que uma versao futura mandaria, com campos que esta nem imagina.
+        let futuro = br#"{"t":"Conversa","id":"abc","entrada":{"seja_o_que_for":1}}"#;
+        let m: Msg = serde_json::from_slice(futuro)
+            .expect("uma mensagem desconhecida tem de desserializar, nao de falhar");
+        assert!(
+            matches!(m, Msg::Desconhecida),
+            "devia cair na variante de recurso, deu {m:?}"
+        );
+
+        // E a tolerancia nao pode engolir o que se conhece: um `other` mal posto faz TUDO
+        // cair na variante de recurso, e ai a app fica muda sem um unico erro.
+        let ola: Msg = serde_json::from_slice(br#"{"t":"Ola","nome":"Rakjsu"}"#).unwrap();
+        assert!(
+            matches!(ola, Msg::Ola { .. }),
+            "o Ola deixou de ser lido: {ola:?}"
+        );
+        let sync: Msg =
+            serde_json::from_slice(br#"{"t":"Sync","servidor":"s","entradas":[]}"#).unwrap();
+        assert!(
+            matches!(sync, Msg::Sync { .. }),
+            "o Sync deixou de ser lido: {sync:?}"
+        );
+    }
 
     /// A voz vai em datagramas, e datagramas não são streams: se o iroh não os suportar,
     /// ou se o par não os aceitar, o `send_datagram` falha em silêncio e a chamada fica
