@@ -1303,3 +1303,48 @@ body.ghost .app { transition: filter .8s var(--ease); }
 }
 .tile__bt:hover { background: var(--mist-lo); color: var(--mist); transform: scale(1.06); }
 .tile__bt.is-on { background: rgba(217, 154, 154, .18); color: var(--rose); border-color: rgba(217, 154, 154, .35); }
+
+/* ---------- por ler ----------------------------------------------------------------
+ *
+ * A bolha é o único sítio da app com vermelho, e é de propósito: numa interface onde tudo
+ * é fumo e azul-escuro, uma cor que não aparece em mais lado nenhum não precisa de ser
+ * grande para ser vista. O canal por ler fica também a BRANCO e a negrito — a bolha diz
+ * quantas, e o peso do texto diz que há.
+ */
+.bolha {
+  min-width: 17px; height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #c0392b;
+  color: #fff;
+  font: 700 11px/17px var(--ui);
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--bg);
+  flex: 0 0 auto;
+}
+
+/* O invólucro existe porque o `.rail__pill` é redondo com o canto arredondado a animar:
+ * uma bolha lá dentro ficava cortada na borda. */
+.rail__slot { position: relative; display: grid; place-items: center; }
+.rail__slot .bolha { position: absolute; right: -3px; bottom: -2px; }
+
+#btn-privado { position: relative; }
+#btn-privado .bolha { position: absolute; right: -3px; bottom: -2px; }
+
+.chan.tem-novas { color: #fff; font-weight: 600; }
+.chan.tem-novas .chan__glyph { color: var(--mist); }
+.chan .bolha, .member .bolha { margin-left: auto; }
+.member.tem-novas b { color: #fff; font-weight: 700; }
+
+/* A linha de «novas mensagens». Corta a conversa ao meio, onde a leitura parou. */
+.novas-aqui {
+  display: flex; align-items: center; gap: 10px;
+  margin: 10px 0 2px;
+  color: #c0392b;
+  font: 600 11.5px/1 var(--ui);
+  letter-spacing: .08em; text-transform: uppercase;
+}
+.novas-aqui::before, .novas-aqui::after {
+  content: ""; height: 1px; background: currentColor; opacity: .5; flex: 1;
+}
+.novas-aqui::before { flex: 0 0 8px; }

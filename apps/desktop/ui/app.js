@@ -112,6 +112,19 @@ function chaveCurta(k) {
 
 /* ---------- desenhar ---------- */
 
+/** Quantas mensagens por ler tem um servidor, somando os canais. */
+function porLerNoServidor(s) {
+  return Object.values(s.nao_lidos || {}).reduce((a, b) => a + b, 0);
+}
+
+/** A bolinha com o número. Acima de 99 diz «99+», como toda a gente faz — o número exacto
+ *  deixa de querer dizer nada e passa a estragar o alinhamento. */
+function bolha(n) {
+  const b = elemento('span', 'bolha', n > 99 ? '99+' : String(n));
+  b.title = `${n} por ler`;
+  return b;
+}
+
 function desenharRail() {
   $('#btn-privado').classList.toggle('is-active', modo === 'privado');
   const rail = $('#rail-servidores');
@@ -121,8 +134,21 @@ function desenharRail() {
     b.dataset.tip = s.nome;
     if (modo === 'servidor' && s.id === servidorAtual) b.classList.add('is-active');
     b.onclick = () => escolherServidor(s.id);
-    rail.append(b);
+    const n = porLerNoServidor(s);
+    // A bolha vai num invólucro, e não dentro do botão: o `.rail__pill` é redondo e com
+    // `overflow` escondido, e a bolha ficava cortada ao meio na borda.
+    const caixa = elemento('div', 'rail__slot');
+    caixa.append(b);
+    if (n) caixa.append(bolha(n));
+    rail.append(caixa);
   }
+  // E o botão do modo privado: sem isto, uma mensagem privada com o modo servidor à frente
+  // não tinha onde aparecer — que é exactamente o caso em que uma notificação serve.
+  const priv = $('#btn-privado');
+  const antiga = priv.querySelector('.bolha');
+  if (antiga) antiga.remove();
+  const nc = (vista.conversas || []).reduce((a, c) => a + (c.nao_lidos || 0), 0);
+  if (nc) priv.append(bolha(nc));
 }
 
 function servidor() {
@@ -210,6 +236,10 @@ function desenharConversas() {
     txt.append(elemento('b', null, c.nome));
     txt.append(elemento('i', null, chaveCurta(c.com)));
     l.append(av, txt);
+    if (c.nao_lidos) {
+      l.classList.add('tem-novas');
+      l.append(bolha(c.nao_lidos));
+    }
     l.onclick = () => escolherConversa(c.id);
     lista.append(l);
   }
@@ -249,6 +279,11 @@ function desenharCanais() {
         await invoke('apagar_canal', { servidor: s.id, canal: c.id }).catch(alertar);
       };
       b.append(x);
+      const porLer = (s.nao_lidos || {})[c.id] || 0;
+      if (porLer) {
+        b.classList.add('tem-novas');
+        b.append(bolha(porLer));
+      }
       b.onclick = () => escolherCanal(c.id);
       g.append(b);
       if (tipo === 'voz') {
@@ -349,12 +384,47 @@ async function desenharMensagens() {
     return;
   }
 
+  await escreverMensagens(stream, msgs, s.id, canal.id);
+}
+
+/** Escreve a lista de mensagens no stream, com a linha de «novas mensagens» no sítio.
+ *
+ *  Uma função só, chamada pelas duas vistas, pela mesma razão que o `umaMensagem` existe:
+ *  duplicar isto era garantir que um dia divergiam, e a diferença apareceria como «nas
+ *  privadas a linha das novas não aparece», sem ninguém saber porquê.
+ *
+ *  A marcação de lido é feita DEPOIS de desenhar, e com o valor ANTERIOR na mão: se se
+ *  marcasse primeiro, a linha aparecia sempre no fim — que é o mesmo que não aparecer.
+ */
+async function escreverMensagens(stream, msgs, servidorId, canalId) {
+  const antes = await invoke('marcar_lido', { servidor: servidorId, canal: canalId })
+    .catch(() => 0);
+  stream.textContent = '';
   let anterior = null;
+  let linhaPosta = false;
   for (const m of msgs) {
-    stream.append(umaMensagem(m, anterior));
+    // A minha própria mensagem nunca puxa a linha: eu sei o que escrevi.
+    if (!linhaPosta && antes > 0 && m.ts_ms > antes && m.autor !== vista.chave) {
+      stream.append(elemento('div', 'novas-aqui', 'novas mensagens'));
+      linhaPosta = true;
+    }
+    stream.append(umaMensagem(m, linhaPosta && !anterior ? null : anterior));
     anterior = m;
   }
   stream.scrollTop = stream.scrollHeight;
+  // O contador na barra tem de desaparecer agora, e não só no redesenho seguinte.
+  if (antes >= 0) await refrescarBolhas();
+}
+
+/** Volta a pedir o estado só para as contagens, sem redesenhar a conversa a meio da
+ *  leitura — um `desenharTudo()` aqui fazia o stream saltar para o fim. */
+async function refrescarBolhas() {
+  const novo = await invoke('estado').catch(() => null);
+  if (!novo) return;
+  vista.servidores = novo.servidores;
+  vista.conversas = novo.conversas;
+  desenharRail();
+  desenharCanais();
 }
 
 /** Uma mensagem desenhada, num canal ou numa conversa.
@@ -398,12 +468,7 @@ async function desenharMensagensPrivadas() {
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para ${c.nome}`;
   const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
-  let anterior = null;
-  for (const m of msgs) {
-    stream.append(umaMensagem(m, anterior));
-    anterior = m;
-  }
-  stream.scrollTop = stream.scrollHeight;
+  await escreverMensagens(stream, msgs, c.id, c.canal);
 }
 
 /** A lista de pessoas que EU decidi conhecer.
@@ -961,13 +1026,68 @@ const PAINEIS = {
     nome: 'Notificações',
     grupo: 'Definições do utilizador',
     ico: '<path d="M4.4 6.6a3.6 3.6 0 0 1 7.2 0c0 3 1.2 4 1.2 4H3.2s1.2-1 1.2-4Z"/><path d="M6.6 13a1.6 1.6 0 0 0 2.8 0"/>',
-    vazia: true,
-    desenha: painel => {
+    desenha: async painel => {
       painel.append(elemento('h2', null, 'Notificações'));
-      painel.append(aindaNaoHa('Não há notificações nenhumas.',
-        'Nem no sistema, nem som de aviso, nem contagem de não lidas. O caminho para as '
-        + 'fazer já existe — a presença de voz viaja por fora do histórico, e é o mesmo '
-        + 'molde que uma notificação precisa — mas ainda não foram feitas.'));
+      painel.append(elemento('p', null,
+        'Aqui não há servidor a guardar mensagens para te avisar depois: o aviso nasce nesta '
+        + 'máquina, quando a mensagem chega.'));
+
+      const s1 = seccao('Avisos do sistema');
+      s1.append(interruptor(
+        'Avisar-me quando chegar uma mensagem',
+        'Só com a janela do Bruma fora da frente. Se estiveres a olhar para ela, já a viste.',
+        avisosLigados(),
+        v => { localStorage.setItem(AVISOS, v ? '1' : '0'); mostrarPainel('notificacoes'); },
+      ));
+      s1.append(interruptor(
+        'Mostrar também o texto da mensagem',
+        'Desligado de propósito. Um aviso do Windows não é a app: aparece no ecrã bloqueado, '
+        + 'fica no histórico de notificações do sistema e é lido por quem passar ao pé do '
+        + 'computador. O Bruma existe para o conteúdo não sair cifrado de ponta a ponta — '
+        + 'copiá-lo para ali desfaz isso, e nada do que se faça aqui o pode desfazer de '
+        + 'volta. Sem isto ligado, o aviso diz quem e onde, nunca o quê.',
+        avisosComTexto(),
+        v => { localStorage.setItem(AVISOS_TEXTO, v ? '1' : '0'); mostrarPainel('notificacoes'); },
+      ));
+
+      const acoes = elemento('div', 'caixa__acoes');
+      acoes.style.justifyContent = 'flex-start';
+      const testar = elemento('button', 'btn', 'Experimentar um aviso');
+      const nota = elemento('span', 'nota');
+      testar.onclick = async () => {
+        nota.textContent = 'a pedir…';
+        const foi = await avisar('Bruma', 'É assim que um aviso aparece.');
+        nota.textContent = foi
+          ? 'apareceu — se não viste, o Windows pode ter os avisos desligados para esta app'
+          : 'não apareceu: ou os avisos estão desligados aqui em cima, ou o Windows recusou '
+            + 'a permissão';
+      };
+      acoes.append(testar, nota);
+      s1.append(acoes);
+      painel.append(s1);
+
+      const s2 = seccao('Por ler');
+      s2.append(elemento('p', 'nota',
+        'A contagem por canal e por conversa está sempre ligada, e vive só nesta máquina — '
+        + 'guardada dentro do índice, que é cifrado. Saber que canais lês e a que horas é '
+        + 'saber a tua rotina; não fica em claro numa pasta.'));
+      s2.append(elemento('p', 'nota',
+        'Um canal conta-se como lido quando o abres. As tuas próprias mensagens nunca '
+        + 'contam — a app não te avisa de que tu falaste.'));
+      painel.append(s2);
+
+      const s3 = seccao('O que não existe');
+      const a = elemento('div', 'aviso');
+      a.append(elemento('p', null,
+        'Som de aviso, e avisos só quando alguém escreve o teu nome. O primeiro é trabalho '
+        + 'a sério de mistura com o áudio da chamada, que já usa o dispositivo; o segundo '
+        + 'precisa de decidir o que é «o teu nome» numa app onde as pessoas se chamam o que '
+        + 'quiserem e a identidade é uma chave.'));
+      a.append(elemento('p', null,
+        'Avisos com a app fechada. Não há servidor a receber por ti: se o Bruma não está a '
+        + 'correr, a mensagem espera na máquina de quem a escreveu.'));
+      s3.append(a);
+      painel.append(s3);
     },
   },
 
@@ -1839,8 +1959,116 @@ function ajustarTodosOsVolumes() {
 
 /* ---------- eventos vindos do núcleo ---------- */
 
+/* ---------- avisos do sistema -------------------------------------------------------
+ *
+ * O QUE VAI NO AVISO, E PORQUE E QUE O TEXTO NAO VAI POR OMISSAO.
+ *
+ * Um aviso do Windows nao e a app: ele aparece no ecra bloqueado, fica no historico de
+ * notificacoes, e e lido por quem passar ao pe do computador. A app inteira existe para o
+ * conteudo nao sair cifrado de ponta a ponta -- e depois copiava-o para uma superficie do
+ * sistema operativo, onde nada disto vale.
+ *
+ * Por isso, por omissao, o aviso diz QUEM e onde, e nao O QUE. Quem quiser o texto liga-o
+ * nas Definicoes, e la esta escrito o que isso custa.
+ */
+const AVISOS = 'bruma.avisos';         // '0' desliga
+const AVISOS_TEXTO = 'bruma.avisos.texto';  // '1' mostra o texto da mensagem
+
+function avisosLigados() { return localStorage.getItem(AVISOS) !== '0'; }
+function avisosComTexto() { return localStorage.getItem(AVISOS_TEXTO) === '1'; }
+
+let permissaoDeAviso = null;
+
+async function avisar(titulo, corpo) {
+  if (!avisosLigados()) return false;
+  const api = window.__TAURI__ && window.__TAURI__.notification;
+  if (!api) return false;
+  try {
+    if (permissaoDeAviso === null) {
+      permissaoDeAviso = await api.isPermissionGranted();
+      if (!permissaoDeAviso) {
+        permissaoDeAviso = (await api.requestPermission()) === 'granted';
+      }
+    }
+    if (!permissaoDeAviso) return false;
+    await api.sendNotification({ title: titulo, body: corpo });
+    return true;
+  } catch (e) {
+    // Um aviso que falha nao pode levar a app com ele: isto corre a cada mensagem.
+    console.warn('aviso do sistema falhou', e);
+    return false;
+  }
+}
+
+/** O que ficou por ler, por sitio, para se saber o que e NOVO entre dois estados. */
+function fotoDoPorLer(v) {
+  const m = new Map();
+  for (const s of (v && v.servidores) || []) {
+    for (const [canal, n] of Object.entries(s.nao_lidos || {})) {
+      const nome = (s.canais.find(c => c.id === canal) || {}).nome || canal;
+      m.set(`s:${s.id}/${canal}`,
+        { n, onde: `#${nome}`, quem: s.nome, servidor: s.id, canal });
+    }
+  }
+  for (const c of (v && v.conversas) || []) {
+    if (c.nao_lidos) {
+      m.set(`c:${c.id}`,
+        { n: c.nao_lidos, onde: 'mensagem privada', quem: c.nome, servidor: c.id, canal: c.canal });
+    }
+  }
+  return m;
+}
+
+/** O que vai no corpo do aviso do sistema.
+ *
+ *  À parte, e não escrito no meio do `talvezAvisar`, porque é a DECISÃO em que assenta a
+ *  promessa de privacidade — «por omissão, o texto não sai da app». Uma promessa dessas tem
+ *  de ser mensurável sozinha, sem depender de o Windows mostrar seja o que for.
+ *
+ *  O `texto` já chega a `null` quando a opção está desligada; a verificação aqui é o cinto
+ *  de segurança, para o dia em que alguém chamar isto de outro sítio.
+ */
+function corpoDoAviso(onde, texto) {
+  if (avisosComTexto() && texto) return texto;
+  return `Tens mensagens novas em ${onde}.`;
+}
+
+/** O texto da última mensagem que não é minha, para o aviso — só quando foi pedido. */
+async function ultimoTexto(servidor, canal) {
+  const msgs = await invoke('mensagens', { servidor, canal }).catch(() => []);
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].autor !== vista.chave) return msgs[i].texto;
+  }
+  return null;
+}
+
+// `null` e não um Map vazio, e a diferença importa: com um Map vazio, a primeira comparação
+// depois de arrancar via TODO o não lido como «subiu» e despejava um aviso por cada canal
+// com atraso. `null` quer dizer «ainda não sei o que havia» — a primeira foto só regista.
+let porLerAnterior = null;
+
+/** Avisa do que subiu desde a ultima vez, e so com a janela fora da frente.
+ *
+ * Comparar com a foto anterior em vez de reagir ao evento e o que evita avisar duas vezes
+ * pela mesma mensagem: o `servidor-mudou` dispara tambem quando sou EU a escrever, quando
+ * chega historico antigo, e varias vezes durante um sync.
+ */
+async function talvezAvisar() {
+  const agora = fotoDoPorLer(vista);
+  if (porLerAnterior === null) { porLerAnterior = agora; return; }
+  const focada = document.hasFocus();
+  for (const [k, v] of agora) {
+    const antes = porLerAnterior.get(k);
+    if (v.n <= (antes ? antes.n : 0) || focada) continue;
+    const t = avisosComTexto() ? await ultimoTexto(v.servidor, v.canal) : null;
+    await avisar(v.quem, corpoDoAviso(v.onde, t));
+  }
+  porLerAnterior = agora;
+}
+
 listen('servidor-mudou', async ev => {
   await desenharTudo();
+  await talvezAvisar();
   // O chat da sala vive na coluna da direita, fora da vista de canal: se estivermos a
   // ler um canal de texto, o desenharTudo não lhe toca e as mensagens novas não apareciam.
   await desenharChatDaSala();
@@ -4415,6 +4643,23 @@ function pararDeAssistir() {
           + ` [${msgs.map(m => `${m.autor_nome}: ${m.texto}`).join(' | ')}]`
           + ` conversas-na-vista=${st.conversas.length}`
           + ` servidores-na-vista=${st.servidores.length}`);
+
+        // O NAO-LIDO, de ponta a ponta e com duas maquinas.
+        //
+        // A logica da contagem ja tem teste proprio sem maquinas nenhumas. O que SO se
+        // consegue ver aqui e o caminho todo: a mensagem do outro atravessa a rede, entra no
+        // meu log, e o contador sobe -- e depois desce quando eu abro a conversa.
+        const porLerAntes = (st.conversas.find(c => c.id === conversa.id) || {}).nao_lidos;
+        const antesDeMarcar = await invoke('marcar_lido', {
+          servidor: conversa.id, canal: conversa.canal,
+        }).catch(() => -1);
+        const st2 = await invoke('estado');
+        const porLerDepois = (st2.conversas.find(c => c.id === conversa.id) || {}).nao_lidos;
+        // E as bolhas que a interface DESENHOU, e nao so os numeros: um contador certo com
+        // uma bolha que ninguem pintou nao serve para nada.
+        const bolhasAgora = document.querySelectorAll('.bolha').length;
+        diz(`par nao lido: antes=${porLerAntes} depois-de-abrir=${porLerDepois}`
+          + ` marca-devolveu-anterior=${antesDeMarcar >= 0} bolhas-no-ecra=${bolhasAgora}`);
       }
 
       const gente = [...voz.presentes.keys()];
@@ -5166,6 +5411,31 @@ function pararDeAssistir() {
       + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+
+    // ---- o que o aviso do sistema deixa sair -----------------------------------
+    //
+    // A promessa e "por omissao, o texto da mensagem NAO vai para o aviso do Windows".
+    // Mede-se a decisao, e nao o Windows: se dependesse de um aviso aparecer no ecra, nao
+    // corria em CI e nao provava nada.
+    {
+      const antes = localStorage.getItem(AVISOS_TEXTO);
+      const segredo = 'ISTO-NAO-PODE-SAIR';
+
+      localStorage.removeItem(AVISOS_TEXTO);              // o estado de fabrica
+      const porOmissao = corpoDoAviso('#geral', segredo);
+      localStorage.setItem(AVISOS_TEXTO, '0');            // desligado a mao
+      const desligado = corpoDoAviso('#geral', segredo);
+      localStorage.setItem(AVISOS_TEXTO, '1');            // ligado de propria vontade
+      const ligado = corpoDoAviso('#geral', segredo);
+
+      if (antes === null) localStorage.removeItem(AVISOS_TEXTO);
+      else localStorage.setItem(AVISOS_TEXTO, antes);
+
+      diz(`ui aviso privacidade: por-omissao-esconde=${!porOmissao.includes(segredo)}`
+        + ` desligado-esconde=${!desligado.includes(segredo)}`
+        + ` ligado-mostra=${ligado === segredo}`
+        + ` diz-onde=${porOmissao.includes('#geral')}`);
+    }
 
     // ---- convites com veneno lá dentro (NO FIM, e de propósito) -----------------
     //

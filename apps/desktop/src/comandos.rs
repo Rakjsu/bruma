@@ -17,11 +17,15 @@ pub struct VistaServidor {
     pub nome: String,
     pub canais: Vec<Canal>,
     pub membros: Vec<Membro>,
+    /// Por canal: quantas por ler. Só os canais com alguma coisa aparecem aqui.
+    pub nao_lidos: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Serialize)]
 pub struct VistaConversa {
     pub id: String,
+    /// Quantas mensagens por ler nesta conversa.
+    pub nao_lidos: usize,
     /// A chave da outra pessoa. Uma conversa é sempre entre duas.
     pub com: String,
     pub nome: String,
@@ -58,6 +62,10 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     // canais, membros e um nome que alguém escolheu; uma conversa é uma pessoa.
     let mut vistas = Vec::new();
     let mut conversas = Vec::new();
+    // Uma cópia, e o lock largado: o `nao_lidos` de cada servidor consulta este mapa dentro
+    // do ciclo, e segurar dois locks durante um ciclo é como se fazem inversões de ordem.
+    let lido = app.lido.lock().map_err(erro)?.clone();
+    let eu = app.minha_chave();
     let mut nomes: std::collections::BTreeMap<String, String> = Default::default();
 
     for s in servidores.values() {
@@ -67,6 +75,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                 .entry(m.chave.clone())
                 .or_insert_with(|| m.nome.clone());
         }
+        let por_ler = s.nao_lidos(&eu, &lido);
         match &s.com {
             None => vistas.push(VistaServidor {
                 id: s.id.clone(),
@@ -77,8 +86,16 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                 },
                 canais: e.canais,
                 membros: e.membros,
+                nao_lidos: por_ler.into_iter().map(|(c, (n, _))| (c, n)).collect(),
             }),
-            Some(com) => conversas.push((s.id.clone(), com.clone())),
+            Some(com) => conversas.push((
+                s.id.clone(),
+                com.clone(),
+                por_ler
+                    .get(modelo::CANAL_DA_CONVERSA)
+                    .map(|(n, _)| *n)
+                    .unwrap_or(0),
+            )),
         }
     }
 
@@ -86,13 +103,14 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     // aberto de onde o tirar, e a pessoa pode ser de uma sala que não é a que está à frente.
     let conversas = conversas
         .into_iter()
-        .map(|(id, com)| {
+        .map(|(id, com, nao_lidos)| {
             let nome = nomes
                 .get(&com)
                 .cloned()
                 .unwrap_or_else(|| format!("{}…", &com[..6.min(com.len())]));
             VistaConversa {
                 id,
+                nao_lidos,
                 com,
                 nome,
                 canal: modelo::CANAL_DA_CONVERSA.into(),
@@ -284,6 +302,27 @@ pub fn escapou_alguma_coisa(app: State<Arc<App>>) -> R<String> {
     } else {
         achados.join(",")
     })
+}
+
+/// Marca um canal como lido até à sua última mensagem.
+///
+/// Devolve a hora até onde ESTAVA lido antes desta chamada — é isso que a interface usa para
+/// desenhar a linha de «novas mensagens» no sítio certo. Se devolvesse o valor novo, a linha
+/// aparecia sempre no fim e não servia para nada.
+#[tauri::command]
+pub fn marcar_lido(servidor: String, canal: String, app: State<Arc<App>>) -> R<i64> {
+    let antes = app.lido_ate(&servidor, &canal);
+    let ate = {
+        let s = app.servidores.lock().map_err(erro)?;
+        match s.get(&servidor) {
+            Some(srv) => srv.ultima_mensagem(&canal),
+            None => return Ok(antes),
+        }
+    };
+    if ate > 0 && app.marcar_lido(&servidor, &canal, ate) {
+        app.gravar_indice().map_err(erro)?;
+    }
+    Ok(antes)
 }
 
 #[tauri::command]

@@ -146,6 +146,18 @@ pub struct Indice {
     /// do que o Discord dá.
     #[serde(default)]
     pub bloqueados: Vec<String>,
+    /// Até quando é que cada canal já foi lido, em ms. A chave é `"{servidor}/{canal}"`.
+    ///
+    /// Vive no índice, que já é cifrado, e por uma razão que não é só comodidade: saber que
+    /// canais eu leio e quando é saber a minha rotina. Num ficheiro à parte e em claro, isso
+    /// ficava legível a quem abrisse a pasta.
+    ///
+    /// É por TEMPO e não por contagem: uma contagem obriga a saber quantas mensagens havia
+    /// quando li, e isso muda quando chega histórico antigo de outro par — de repente eu
+    /// teria «não lidas» de coisas que já tinha lido. O tempo da última mensagem que eu vi
+    /// não muda por chegar histórico.
+    #[serde(default)]
+    pub lido: BTreeMap<String, i64>,
     #[serde(default)]
     pub quem_escreve: QuemEscreve,
 }
@@ -248,6 +260,53 @@ impl Servidor {
         &self.provados
     }
 
+    /// Quantas mensagens por canal ficaram por ler, e a hora da mais recente.
+    ///
+    /// As minhas não contam — ver a minha própria mensagem como «não lida» seria a app a
+    /// avisar-me de que eu falei.
+    ///
+    /// Uma passagem só pelo log, e não uma por canal: com dez canais, uma por canal seria
+    /// decifrar tudo dez vezes.
+    pub fn nao_lidos(
+        &self,
+        eu: &str,
+        lido: &BTreeMap<String, i64>,
+    ) -> BTreeMap<String, (usize, i64)> {
+        let mut fora: BTreeMap<String, (usize, i64)> = BTreeMap::new();
+        for a in self.aplicaveis().0 {
+            let Carga::Mensagem { canal, .. } = &a.carga else {
+                continue;
+            };
+            if a.autor == eu {
+                continue;
+            }
+            let ts = a.ts_ms as i64;
+            let ate = lido
+                .get(&App::chave_de_leitura(&self.id, canal))
+                .copied()
+                .unwrap_or(0);
+            if ts > ate {
+                let e = fora.entry(canal.clone()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(ts);
+            }
+        }
+        fora
+    }
+
+    /// A hora da mensagem mais recente de um canal, para se poder marcar como lido «até aqui».
+    pub fn ultima_mensagem(&self, canal: &str) -> i64 {
+        self.aplicaveis()
+            .0
+            .iter()
+            .filter_map(|a| match &a.carga {
+                Carga::Mensagem { canal: c, .. } if c == canal => Some(a.ts_ms as i64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn estado(&self) -> EstadoDoServidor {
         let (aps, _) = self.aplicaveis();
         modelo::reconstruir(&aps)
@@ -314,6 +373,8 @@ pub struct App {
     pub amigos: Mutex<Vec<Amigo>>,
     pub bloqueados: Mutex<Vec<String>>,
     pub quem_escreve: Mutex<QuemEscreve>,
+    /// Ver [`Indice::lido`].
+    pub lido: Mutex<BTreeMap<String, i64>>,
 }
 
 impl App {
@@ -402,6 +463,7 @@ impl App {
             amigos: Mutex::new(indice.amigos),
             bloqueados: Mutex::new(indice.bloqueados),
             quem_escreve: Mutex::new(indice.quem_escreve),
+            lido: Mutex::new(indice.lido),
         };
 
         #[cfg(debug_assertions)]
@@ -657,6 +719,45 @@ impl App {
         Ok(id)
     }
 
+    /// A chave com que uma sala/canal é identificado no mapa de leitura.
+    ///
+    /// Numa função e não escrita nos dois sítios: uma chave composta escrita à mão em dois
+    /// lados é uma chave que um dia deixa de ser a mesma nos dois lados, e o sintoma seria
+    /// «o não lido nunca desaparece», sem um erro em lado nenhum.
+    pub fn chave_de_leitura(servidor: &str, canal: &str) -> String {
+        format!("{servidor}/{canal}")
+    }
+
+    /// Marca um canal como lido até àquele instante. Devolve `true` se mudou alguma coisa.
+    ///
+    /// Só avança, nunca recua: se já estava lido mais à frente (por exemplo por a app estar
+    /// aberta noutra janela), uma marcação mais antiga não pode desfazer isso.
+    pub fn marcar_lido(&self, servidor: &str, canal: &str, ate_ms: i64) -> bool {
+        let mut l = match self.lido.lock() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let k = Self::chave_de_leitura(servidor, canal);
+        match l.get(&k) {
+            Some(anterior) if *anterior >= ate_ms => false,
+            _ => {
+                l.insert(k, ate_ms);
+                true
+            }
+        }
+    }
+
+    pub fn lido_ate(&self, servidor: &str, canal: &str) -> i64 {
+        self.lido
+            .lock()
+            .map(|l| {
+                l.get(&Self::chave_de_leitura(servidor, canal))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
     pub fn gravar_indice(&self) -> Result<()> {
         // Recolher primeiro, e largar. Isto segurava `servidores` durante a serialização, a
         // cifra e a escrita no disco, enquanto ia pedindo os outros quatro — uma janela larga
@@ -681,6 +782,7 @@ impl App {
             amigos: self.amigos.lock().unwrap().clone(),
             bloqueados: self.bloqueados.lock().unwrap().clone(),
             quem_escreve: *self.quem_escreve.lock().unwrap(),
+            lido: self.lido.lock().unwrap().clone(),
         };
         // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
         let claro = serde_json::to_vec(&indice)?;
@@ -840,6 +942,103 @@ pub fn caminho_do_log(id: &str) -> PathBuf {
 mod testes {
     use super::*;
     use std::sync::Arc;
+
+    /// A contagem do que falta ler, sem máquinas nenhumas.
+    ///
+    /// Está aqui e não no teste de par porque é uma DECISÃO, não um desenho: quem conta,
+    /// a partir de quando, e o que não conta. Um teste que precisa de duas instâncias
+    /// ligadas mede a orquestração e só de passagem a decisão — e quando falha não diz qual
+    /// das duas se partiu.
+    #[test]
+    fn o_que_falta_ler() {
+        let dir = std::env::temp_dir().join(format!("bruma-lidos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let eu = crypto::Identity::from_seed(&[1u8; 32]);
+        let outro = crypto::Identity::from_seed(&[2u8; 32]);
+        let minha = HEXLOWER.encode(eu.signing.verifying_key().as_bytes());
+
+        let log = blog::Log::load(dir.join("s.json")).unwrap();
+        let mut srv = Servidor::novo("aa".repeat(16), [7u8; 32], log, vec![], None, None);
+
+        // Uma função e não um closure: um closure que captura `srv` mutavelmente prende-o
+        // durante todo o teste, e as leituras a seguir deixam de compilar.
+        fn escreve(srv: &mut Servidor, quem: &crypto::Identity, canal: &str, texto: &str) -> i64 {
+            srv.escrever(
+                &quem.signing,
+                &Carga::Mensagem {
+                    canal: canal.into(),
+                    texto: texto.into(),
+                },
+            )
+            .unwrap()
+            .ts_ms as i64
+        }
+
+        escreve(&mut srv, &outro, "geral", "olá");
+        escreve(&mut srv, &outro, "geral", "estás aí?");
+        let ate = escreve(&mut srv, &outro, "outro", "noutro canal");
+        escreve(&mut srv, &eu, "geral", "estou");
+
+        // Nada lido ainda: as duas dele no geral, a dele no outro, e a MINHA não conta.
+        let vazio = BTreeMap::new();
+        let c = srv.nao_lidos(&minha, &vazio);
+        assert_eq!(c.get("geral").map(|(n, _)| *n), Some(2), "as dele no geral");
+        assert_eq!(c.get("outro").map(|(n, _)| *n), Some(1), "a dele no outro");
+        assert_eq!(c.len(), 2, "a minha não podia contar");
+
+        // Lido até à última do outro canal: o geral fica limpo, o outro também.
+        let mut lido = BTreeMap::new();
+        lido.insert(App::chave_de_leitura(&srv.id, "geral"), ate);
+        let c = srv.nao_lidos(&minha, &lido);
+        assert_eq!(c.get("geral"), None, "o geral tinha de ficar limpo");
+        assert_eq!(
+            c.get("outro").map(|(n, _)| *n),
+            Some(1),
+            "o outro não foi lido"
+        );
+
+        // Uma nova dele DEPOIS de eu ter lido volta a contar.
+        escreve(&mut srv, &outro, "geral", "voltei");
+        let c = srv.nao_lidos(&minha, &lido);
+        assert_eq!(
+            c.get("geral").map(|(n, _)| *n),
+            Some(1),
+            "a nova tinha de contar"
+        );
+
+        // E o `ultima_mensagem` tem de dar a mais recente, senão marcar como lido deixava
+        // sempre uma por ler e o contador nunca chegava a zero.
+        assert!(srv.ultima_mensagem("geral") > ate);
+        assert_eq!(srv.ultima_mensagem("nao-existe"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Marcar como lido só AVANÇA.
+    ///
+    /// Se recuasse, uma marcação atrasada (a app aberta duas vezes, um evento fora de ordem)
+    /// ressuscitava mensagens já lidas — e o sintoma seria «o não lido volta sozinho», que
+    /// não se liga a esta linha de código de maneira nenhuma.
+    #[test]
+    fn marcar_lido_nunca_recua() {
+        let dir = std::env::temp_dir().join(format!("bruma-recua-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: um só teste toca nesta variável, e antes de qualquer thread arrancar.
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = App::arrancar().expect("arrancar");
+
+        assert!(app.marcar_lido("s", "c", 100), "a primeira marca");
+        assert_eq!(app.lido_ate("s", "c"), 100);
+        assert!(!app.marcar_lido("s", "c", 50), "50 é para trás: não muda");
+        assert_eq!(app.lido_ate("s", "c"), 100, "e não pode ter recuado");
+        assert!(app.marcar_lido("s", "c", 150), "150 é para a frente");
+        assert_eq!(app.lido_ate("s", "c"), 150);
+        assert_eq!(app.lido_ate("s", "outro"), 0, "outro canal, outro contador");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Duas ordens de lock contrárias param os dois threads, para sempre, sem um erro.
     ///

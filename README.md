@@ -6,8 +6,8 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.15.1 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
-> uma lista de amigos e permissões de mensagens.**
+> **Estado: v0.16.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> uma lista de amigos, permissões de mensagens e por-ler com avisos.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
@@ -121,8 +121,13 @@ projectos morrem.
   sabes se aquela chave é de quem julgas. Numa app sem directório, é isto que substitui «o
   servidor garante que este é o João».
 - **Não é anonimato de rede.** Para isso precisas de VPN ou Tor por baixo.
-- **Não há anexos, imagens, editar, apagar, reacções, respostas, markdown, notificações nem
-  não-lidas.** Só texto simples, uma linha de cada vez.
+- **O aviso do sistema não leva o texto da mensagem**, a não ser que o ligues. Um aviso do
+  Windows não é a app: aparece no ecrã bloqueado, fica no histórico de notificações e é lido
+  por quem passar ao pé do computador. Por omissão diz quem e onde, nunca o quê.
+- **Não há avisos com a app fechada.** Não há servidor a receber por ti: se o Bruma não está
+  a correr, a mensagem espera na máquina de quem a escreveu.
+- **Não há anexos, imagens, editar, apagar, reacções, respostas nem markdown.** Só texto
+  simples, uma linha de cada vez.
 
 ## Espreitar por dentro
 

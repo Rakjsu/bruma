@@ -1,6 +1,6 @@
 [package]
 name = "bruma"
-version = "0.15.1"
+version = "0.16.0"
 edition.workspace = true
 publish = false
 
@@ -23,6 +23,8 @@ anyhow = "1"
 data-encoding = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# O aviso do sistema quando chega uma mensagem com a janela fora da frente.
+tauri-plugin-notification = "2"
 
 # Deteção do que está aberto, para a barra de "estás a jogar X".
 [target.'cfg(windows)'.dependencies]

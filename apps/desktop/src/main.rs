@@ -138,6 +138,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let nucleo = Arc::new(estado::App::arrancar()?);
             let ecra = Arc::new(comandos::Ecra::default());
@@ -193,6 +194,7 @@ fn main() {
             comandos::permissoes,
             comandos::bloquear,
             comandos::definir_quem_escreve,
+            comandos::marcar_lido,
             comandos::convites_de_teste,
             comandos::escapou_alguma_coisa,
             comandos::enviar,
