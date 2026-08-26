@@ -39,6 +39,13 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 let vista = null;        // o último estado vindo do Rust
 let servidorAtual = null;
 let canalAtual = null;
+/** Onde estamos: numa sala de um servidor, ou nas conversas privadas.
+ *
+ *  O `.rail__mark` do topo da barra deixa de ser um enfeite e passa a ser um destino — é o
+ *  mesmo sítio onde o Discord põe a casa. As três colunas da direita são as mesmas; só
+ *  muda o que vai dentro delas. */
+let modo = 'servidor';
+let conversaAtual = null;
 let ligados = 0;
 
 /* ---------- identicons: a chave pública desenhada ---------- */
@@ -103,12 +110,13 @@ function chaveCurta(k) {
 /* ---------- desenhar ---------- */
 
 function desenharRail() {
+  $('#btn-privado').classList.toggle('is-active', modo === 'privado');
   const rail = $('#rail-servidores');
   rail.textContent = '';
   for (const s of vista.servidores) {
     const b = elemento('button', 'rail__pill', s.nome.slice(0, 2).toUpperCase());
     b.dataset.tip = s.nome;
-    if (s.id === servidorAtual) b.classList.add('is-active');
+    if (modo === 'servidor' && s.id === servidorAtual) b.classList.add('is-active');
     b.onclick = () => escolherServidor(s.id);
     rail.append(b);
   }
@@ -118,9 +126,71 @@ function servidor() {
   return vista.servidores.find(s => s.id === servidorAtual) || null;
 }
 
+function conversa() {
+  return (vista.conversas || []).find(c => c.id === conversaAtual) || null;
+}
+
+/** Para onde vai o que se escreve na caixa.
+ *
+ *  A caixa lia as globais `servidorAtual`/`canalAtual` directamente, e por isso só sabia
+ *  escrever num canal de servidor. Aqui pergunta-se ao modo — que é a única coisa que
+ *  distingue os dois casos — em vez de duplicar o handler. */
+function destinoDeEscrita() {
+  if (modo === 'privado') {
+    const c = conversa();
+    return c ? { servidor: c.id, canal: c.canal } : null;
+  }
+  return servidorAtual && canalAtual
+    ? { servidor: servidorAtual, canal: canalAtual }
+    : null;
+}
+
+function irParaPrivado() {
+  modo = 'privado';
+  desenharTudo();
+}
+
+function escolherConversa(id) {
+  modo = 'privado';
+  conversaAtual = id;
+  desenharTudo();
+}
+
+function desenharConversas() {
+  const lista = $('#lista-canais');
+  const g = elemento('div', 'group');
+  g.append(elemento('div', 'group__label', 'Conversas'));
+  lista.append(g);
+
+  const cs = vista.conversas || [];
+  if (!cs.length) {
+    const nada = elemento('div', 'vazio');
+    nada.append(elemento('p', null, 'Ainda não tens conversas.'));
+    nada.append(elemento('p', 'nota',
+      'Abre uma pela lista de membros de um servidor: clique direito numa pessoa, '
+      + '"Mensagem privada".'));
+    lista.append(nada);
+    return;
+  }
+  for (const c of cs) {
+    const l = elemento('div', 'member');
+    if (c.id === conversaAtual) l.classList.add('is-active');
+    l.dataset.chave = c.com;
+    const av = elemento('span', 'ident');
+    pintar(av, c.com);
+    const txt = elemento('span');
+    txt.append(elemento('b', null, c.nome));
+    txt.append(elemento('i', null, chaveCurta(c.com)));
+    l.append(av, txt);
+    l.onclick = () => escolherConversa(c.id);
+    lista.append(l);
+  }
+}
+
 function desenharCanais() {
   const lista = $('#lista-canais');
   lista.textContent = '';
+  if (modo === 'privado') return desenharConversas();
   const s = servidor();
   if (!s) return;
 
@@ -176,6 +246,9 @@ function desenharCanais() {
 function desenharMembros() {
   const lista = $('#lista-membros');
   lista.textContent = '';
+  // Numa conversa não há membros: são duas pessoas, e a outra está no topo.
+  $('#bloco-membros').hidden = modo === 'privado';
+  if (modo === 'privado') return;
   const s = servidor();
   if (!s) return;
   $('#contagem-membros').textContent =
@@ -195,6 +268,7 @@ function desenharMembros() {
 }
 
 async function desenharMensagens() {
+  if (modo === 'privado') return desenharMensagensPrivadas();
   const stream = $('#stream');
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
@@ -249,29 +323,81 @@ async function desenharMensagens() {
 
   let anterior = null;
   for (const m of msgs) {
-    const seguida = anterior && anterior.autor === m.autor && m.ts_ms - anterior.ts_ms < 5 * 60_000;
-    const art = elemento('article', seguida ? 'msg msg--cont' : 'msg');
-    if (!seguida) {
-      const av = elemento('span', 'ident ident--lg');
-      pintar(av, m.autor);
-      art.append(av);
-    }
-    const corpo = elemento('div', 'msg__body');
-    if (!seguida) {
-      const cab = elemento('div', 'msg__head');
-      cab.append(elemento('b', null, m.autor_nome));
-      cab.append(elemento('time', null, horaCurta(m.ts_ms)));
-      corpo.append(cab);
-    }
-    corpo.append(elemento('p', null, m.texto));
-    art.append(corpo);
-    stream.append(art);
+    stream.append(umaMensagem(m, anterior));
+    anterior = m;
+  }
+  stream.scrollTop = stream.scrollHeight;
+}
+
+/** Uma mensagem desenhada, num canal ou numa conversa.
+ *
+ *  Está à parte porque as duas vistas TÊM de desenhar igual. Duplicar isto era garantir que
+ *  um dia divergiam — e a diferença apareceria como "as mensagens privadas estão estranhas",
+ *  sem ninguém saber porquê. */
+function umaMensagem(m, anterior) {
+  const seguida = anterior && anterior.autor === m.autor && m.ts_ms - anterior.ts_ms < 5 * 60_000;
+  const art = elemento('article', seguida ? 'msg msg--cont' : 'msg');
+  if (!seguida) {
+    const av = elemento('span', 'ident ident--lg');
+    pintar(av, m.autor);
+    art.append(av);
+  }
+  const corpo = elemento('div', 'msg__body');
+  if (!seguida) {
+    const cab = elemento('div', 'msg__head');
+    cab.append(elemento('b', null, m.autor_nome));
+    cab.append(elemento('time', null, horaCurta(m.ts_ms)));
+    corpo.append(cab);
+  }
+  corpo.append(elemento('p', null, m.texto));
+  art.append(corpo);
+  return art;
+}
+
+async function desenharMensagensPrivadas() {
+  const stream = $('#stream');
+  const c = conversa();
+  $('#vista-voz').hidden = true;
+  stream.hidden = false;
+  stream.textContent = '';
+
+  if (!c) {
+    $('#composer').hidden = true;
+    const v = elemento('div', 'vazio');
+    v.append(elemento('p', null, 'Escolhe uma conversa.'));
+    v.append(elemento('p', 'nota',
+      'Não há convite para começar uma: as duas chaves chegam. Clique direito numa pessoa '
+      + 'na lista de membros de um servidor.'));
+    stream.append(v);
+    return;
+  }
+
+  $('#composer').hidden = false;
+  $('#entrada').placeholder = `Mensagem para ${c.nome}`;
+  const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
+  let anterior = null;
+  for (const m of msgs) {
+    stream.append(umaMensagem(m, anterior));
     anterior = m;
   }
   stream.scrollTop = stream.scrollHeight;
 }
 
 function desenharTopo() {
+  if (modo === 'privado') {
+    const c = conversa();
+    $('#nome-servidor').textContent = 'Mensagens privadas';
+    $('#nome-canal').textContent = c ? c.nome : '—';
+    // Uma conversa não é um canal: a arroba diz que do outro lado está uma pessoa, e não
+    // uma sala onde qualquer um entra.
+    $('#glifo-canal').textContent = '@';
+    // Não há convite para uma conversa, e é de propósito: o que a abre são as duas chaves,
+    // e não um segredo que se possa reencaminhar a um terceiro.
+    $('#btn-convite').style.display = 'none';
+    $('#rotulo-peers').textContent = ligados === 1 ? '1 ligado' : `${ligados} ligados`;
+    $('#chip-peers').querySelector('.dot').className = ligados > 0 ? 'dot dot--ok' : 'dot';
+    return;
+  }
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
   $('#nome-servidor').textContent = s ? s.nome : '—';
@@ -288,14 +414,21 @@ async function desenharTudo() {
   $('#minha-chave').textContent = chaveCurta(vista.chave);
   pintar($('#meu-avatar'), vista.chave);
 
-  if (!vista.servidores.some(s => s.id === servidorAtual)) {
-    servidorAtual = vista.servidores[0] ? vista.servidores[0].id : null;
-    canalAtual = null;
-  }
-  const s = servidor();
-  if (s && !s.canais.some(c => c.id === canalAtual)) {
-    const primeiro = s.canais.find(c => c.tipo === 'texto') || s.canais[0];
-    canalAtual = primeiro ? primeiro.id : null;
+  // A auto-selecção corre SÓ no modo servidor. No modo privado `servidorAtual` é nulo de
+  // propósito, e isto atirava-nos de volta para um servidor a cada `servidor-mudou` — que
+  // acontece a cada mensagem que chega.
+  if (modo === 'servidor') {
+    if (!vista.servidores.some(s => s.id === servidorAtual)) {
+      servidorAtual = vista.servidores[0] ? vista.servidores[0].id : null;
+      canalAtual = null;
+    }
+    const s = servidor();
+    if (s && !s.canais.some(c => c.id === canalAtual)) {
+      const primeiro = s.canais.find(c => c.tipo === 'texto') || s.canais[0];
+      canalAtual = primeiro ? primeiro.id : null;
+    }
+  } else if (!conversa()) {
+    conversaAtual = (vista.conversas || [])[0] ? vista.conversas[0].id : null;
   }
 
   desenharRail();
@@ -307,6 +440,7 @@ async function desenharTudo() {
 }
 
 function escolherServidor(id) {
+  modo = 'servidor';
   servidorAtual = id;
   canalAtual = null;
   desenharTudo();
@@ -387,6 +521,7 @@ $('#copiar-convite').onclick = async () => {
 };
 
 $('#btn-perfil').onclick = () => abrirDefinicoes();
+$('#btn-privado').onclick = () => irParaPrivado();
 
 /* ==========================================================================
    Definições, em ecrã inteiro.
@@ -921,8 +1056,10 @@ $('#entrada').addEventListener('keydown', async ev => {
   if (ev.key !== 'Enter' || !ev.target.value.trim()) return;
   const texto = ev.target.value;
   ev.target.value = '';
+  const destino = destinoDeEscrita();
+  if (!destino) return;
   try {
-    await invoke('enviar', { servidor: servidorAtual, canal: canalAtual, texto });
+    await invoke('enviar', { ...destino, texto });
     await desenharMensagens();
   } catch (e) { console.error(e); }
 });
@@ -1651,6 +1788,24 @@ document.addEventListener('contextmenu', ev => {
   if (membro && membro.dataset.chave) {
     const chave = membro.dataset.chave;
     itens.push({ rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(chave) });
+    // Uma linha, e serve os três sítios que mostram pessoas — a lista de membros, quem está
+    // na chamada e as fotinhas — porque todos põem a chave no `data-chave`.
+    if (chave !== vista.chave) {
+      itens.push({
+        rotulo: 'Mensagem privada',
+        accao: async () => {
+          try {
+            const id = await invoke('abrir_conversa', { peer: chave });
+            await desenharTudo();
+            escolherConversa(id);
+          } catch (e) {
+            // Falta a chave de conversa dele: ainda não estiveram ligados desde que os dois
+            // actualizaram. Dizer porquê vale mais do que não acontecer nada.
+            alert(String(e));
+          }
+        },
+      });
+    }
   }
   if (canal && canal.dataset.canal) {
     const id = canal.dataset.canal;
@@ -2387,9 +2542,15 @@ function actualizarEspectadores() {
 
 function nomeDoPeer(peer) {
   if (peer === voz.eu) return 'tu';
-  const s = servidor();
-  const m = s && s.membros.find(x => x.chave === peer);
-  return m ? m.nome : `${peer.slice(0, 6)}…`;
+  // Varre TODOS os servidores, e não só o que está aberto. Numa conversa privada não há
+  // servidor aberto de onde tirar o nome, e mesmo num servidor a pessoa pode ser conhecida
+  // de outra sala.
+  for (const s of (vista && vista.servidores) || []) {
+    const m = s.membros.find(x => x.chave === peer);
+    if (m) return m.nome;
+  }
+  const c = ((vista && vista.conversas) || []).find(x => x.com === peer);
+  return c ? c.nome : `${peer.slice(0, 6)}…`;
 }
 
 /** Um painel da grelha da chamada.
@@ -4319,6 +4480,51 @@ function pararDeAssistir() {
       Object.assign(voz, { eu: antes.eu, canal: antes.canal });
       servidorAtual = antes.srv; canalAtual = antes.cnl;
       desenharVoz();
+    }
+
+    // ---- o modo privado -------------------------------------------------------
+    //
+    // O que se mede aqui e sobretudo uma coisa: que ficar no modo privado AGUENTA. O
+    // `desenharTudo` tinha uma auto-seleccao que salta para o primeiro servidor quando o
+    // actual nao existe -- e no modo privado o actual e nulo de proposito. Cada mensagem
+    // que chega dispara um `servidor-mudou`, portanto isso atirava a pessoa de volta para
+    // um servidor de segundo a segundo, sem nada a explicar porque.
+    {
+      const antes = { modo, servidor: servidorAtual };
+      irParaPrivado();
+      await new Promise(r => setTimeout(r, 200));
+      const railActivo = $('#btn-privado').classList.contains('is-active');
+      const membrosEscondidos = $('#bloco-membros').hidden;
+      const semConvite = $('#btn-convite').style.display === 'none';
+      const arroba = $('#glifo-canal').textContent;
+      const listaTem = $('#lista-canais').textContent.trim().length;
+
+      // E agora o que acontece a cada mensagem que chega. O que muda nao e o `modo` --
+      // nada lhe toca -- e sim o `servidorAtual`, que a auto-seleccao repunha no primeiro
+      // servidor por baixo dos panos. Nao se via nada no imediato, e depois voltar a um
+      // servidor levava a pessoa para o primeiro em vez de para onde ela estava.
+      //
+      // Mede-se ISSO, e nao o `modo`: a primeira versao desta medicao passava com e sem a
+      // correccao, ou seja, nao media nada.
+      servidorAtual = null;
+      await desenharTudo();
+      await new Promise(r => setTimeout(r, 150));
+      await desenharTudo();
+      const aguentou = modo === 'privado' && servidorAtual === null;
+
+      diz(`ui privado: modo=${modo} rail-activo=${railActivo}`
+        + ` membros-escondidos=${membrosEscondidos} sem-convite=${semConvite}`
+        + ` glifo="${arroba}" lista=${listaTem > 0} conversas=${(vista.conversas || []).length}`
+        + ` nao-mexeu-no-servidor=${aguentou}`);
+
+      // A caixa de escrita tem de saber para onde escreve -- ou dizer que nao sabe.
+      const destinoPrivado = destinoDeEscrita();
+      escolherServidor(antes.servidor);
+      await new Promise(r => setTimeout(r, 150));
+      const destinoServidor = destinoDeEscrita();
+      diz(`ui privado destino: sem-conversa=${JSON.stringify(destinoPrivado)}`
+        + ` no-servidor=${destinoServidor ? 'canal ' + String(destinoServidor.canal).slice(0, 6) : 'nenhum'}`
+        + ` voltou-a-servidor=${modo === 'servidor'}`);
     }
 
     // ---- as Definicoes, todas as seccoes --------------------------------------
