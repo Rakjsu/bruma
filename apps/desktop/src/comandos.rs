@@ -20,11 +20,25 @@ pub struct VistaServidor {
 }
 
 #[derive(Serialize)]
+pub struct VistaConversa {
+    pub id: String,
+    /// A chave da outra pessoa. Uma conversa é sempre entre duas.
+    pub com: String,
+    pub nome: String,
+    /// O canal onde as mensagens desta conversa vivem.
+    ///
+    /// Vai daqui para a interface em vez de ser repetido lá: uma constante escrita nos dois
+    /// lados é uma constante que um dia deixa de ser a mesma nos dois lados.
+    pub canal: String,
+}
+
+#[derive(Serialize)]
 pub struct Vista {
     /// A chave pública é o ID. É também o endereço na rede — não há dois identificadores.
     pub chave: String,
     pub nome: String,
     pub servidores: Vec<VistaServidor>,
+    pub conversas: Vec<VistaConversa>,
 }
 
 /// Os comandos devolvem `Result<_, String>` porque o Tauri precisa de algo serializável, e
@@ -38,11 +52,23 @@ fn erro(e: impl std::fmt::Display) -> String {
 #[tauri::command]
 pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     let servidores = app.servidores.lock().map_err(erro)?;
-    let vistas = servidores
-        .values()
-        .map(|s| {
-            let e = s.estado();
-            VistaServidor {
+
+    // Servidores e conversas vivem no mesmo mapa e são a mesma coisa por baixo. Aqui
+    // separam-se, porque na interface não são a mesma coisa de todo: um servidor tem
+    // canais, membros e um nome que alguém escolheu; uma conversa é uma pessoa.
+    let mut vistas = Vec::new();
+    let mut conversas = Vec::new();
+    let mut nomes: std::collections::BTreeMap<String, String> = Default::default();
+
+    for s in servidores.values() {
+        let e = s.estado();
+        for m in &e.membros {
+            nomes
+                .entry(m.chave.clone())
+                .or_insert_with(|| m.nome.clone());
+        }
+        match &s.com {
+            None => vistas.push(VistaServidor {
                 id: s.id.clone(),
                 nome: if e.nome.is_empty() {
                     "sem nome".into()
@@ -51,14 +77,80 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                 },
                 canais: e.canais,
                 membros: e.membros,
+            }),
+            Some(com) => conversas.push((s.id.clone(), com.clone())),
+        }
+    }
+
+    // O nome resolve-se depois de ver TODOS os servidores: numa conversa não há servidor
+    // aberto de onde o tirar, e a pessoa pode ser de uma sala que não é a que está à frente.
+    let conversas = conversas
+        .into_iter()
+        .map(|(id, com)| {
+            let nome = nomes
+                .get(&com)
+                .cloned()
+                .unwrap_or_else(|| format!("{}…", &com[..6.min(com.len())]));
+            VistaConversa {
+                id,
+                com,
+                nome,
+                canal: modelo::CANAL_DA_CONVERSA.into(),
             }
         })
         .collect();
+
     Ok(Vista {
         chave: app.minha_chave(),
         nome: app.nome.lock().map_err(erro)?.clone(),
         servidores: vistas,
+        conversas,
     })
+}
+
+/// Abre a conversa privada com alguém, ou devolve a que já existe.
+///
+/// Não há convite: o id e a chave saem das duas identidades. O que pode faltar é a chave de
+/// conversa da outra pessoa, e nesse caso a resposta diz porquê — é preciso terem estado
+/// ligados uma vez, e isso acontece sozinho assim que ambos estiverem online.
+#[tauri::command]
+pub fn abrir_conversa(
+    peer: String,
+    app: State<Arc<App>>,
+    rede: State<Arc<Rede>>,
+    janela: AppHandle,
+) -> R<String> {
+    let peer = peer.trim().to_string();
+    let id = app.abrir_conversa(&peer).map_err(erro)?;
+
+    // Apresentar-me, como se faz ao criar um servidor ou ao entrar num. Sem isto o outro
+    // lado vê as minhas mensagens assinadas por uma chave sem nome — a `MensagemVista`
+    // tira o nome dos membros do log, e num log acabado de nascer não há membros nenhuns.
+    //
+    // A condição é «nunca escrevi aqui», e não «a conversa é nova». Foi o meu primeiro
+    // engano: quando é o outro lado que abre a conversa, ela chega-me já criada, eu saltava
+    // a apresentação, e ficava a aparecer-lhe como uma chave sem nome — só de um dos lados,
+    // que é o tipo de assimetria que passa despercebida.
+    let minha = app.minha_chave();
+    let ja_me_apresentei = {
+        let s = app.servidores.lock().map_err(erro)?;
+        s.get(&id).is_some_and(|x| x.log.escreveu(&minha))
+    };
+    if ja_me_apresentei {
+        return Ok(id);
+    }
+
+    let meu_nome = app.nome.lock().map_err(erro)?.clone();
+    let mut s = app.servidores.lock().map_err(erro)?;
+    if let Some(srv) = s.get_mut(&id) {
+        let entrada = srv
+            .escrever(&app.ident.signing, &Carga::Apresentar { nome: meu_nome })
+            .map_err(erro)?;
+        rede.difundir(&id, entrada);
+    }
+    drop(s);
+    let _ = janela.emit("servidor-mudou", &id);
+    Ok(id)
 }
 
 #[tauri::command]
@@ -116,6 +208,7 @@ pub fn criar_servidor(
         chave,
         log,
         peers: Vec::new(),
+        com: None, // um servidor, nao uma conversa
     };
 
     // Um servidor recém-criado sem canais é uma sala vazia sem portas. Cria-se o mínimo
@@ -247,6 +340,7 @@ pub async fn entrar_com_convite(
             chave,
             log,
             peers: vec![convite.anfitriao.clone()],
+            com: None, // um servidor, nao uma conversa
         };
         // Apresentar-se é o que faz a pessoa aparecer na lista de membros dos outros.
         let meu_nome = app.nome.lock().map_err(erro)?.clone();

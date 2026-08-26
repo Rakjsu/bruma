@@ -10,6 +10,7 @@
 //! provar a identidade dentro do protocolo.
 
 use anyhow::{anyhow, bail, Result};
+use data_encoding::HEXLOWER;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,18 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub enum Msg {
     Ola {
         nome: String,
+        /// A minha chave de conversa (x25519) e a prova de que é minha.
+        ///
+        /// Vão como CAMPOS de uma variante que já existia, e não numa variante nova: o
+        /// `serde` ignora campos que não conhece, e o `default` cobre o sentido contrário.
+        /// Uma variante nova, essa, derrubaria a ligação com qualquer versão anterior.
+        ///
+        /// São `Option` porque uma versão antiga não os manda — e então simplesmente não há
+        /// conversa privada com essa pessoa até ela actualizar.
+        #[serde(default)]
+        x_pub: Option<String>,
+        #[serde(default)]
+        prekey_sig: Option<String>,
     },
     /// Tudo o que tenho deste servidor. Quem não o tiver ignora.
     Sync {
@@ -667,7 +680,15 @@ async fn sessao(
     guarda.tarefas.push(ouvinte);
 
     let meu_nome = app.nome.lock().unwrap().clone();
-    escrever(&mut envia, &Msg::Ola { nome: meu_nome }).await?;
+    escrever(
+        &mut envia,
+        &Msg::Ola {
+            nome: meu_nome,
+            x_pub: Some(HEXLOWER.encode(app.ident.x_public().as_bytes())),
+            prekey_sig: Some(HEXLOWER.encode(&app.ident.prekey_signature())),
+        },
+    )
+    .await?;
 
     // A subscrição vem ANTES da fotografia do log, e não depois de a mandar.
     //
@@ -753,8 +774,23 @@ async fn sessao(
                         crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
                     }
                 }
-                Ok(Quadro::Controlo(Msg::Ola { nome })) => {
+                Ok(Quadro::Controlo(Msg::Ola {
+                    nome,
+                    x_pub,
+                    prekey_sig,
+                })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
+                    // A chave de conversa dele, guardada para se poder abrir a conversa
+                    // mais tarde sem ele estar online. Verificada antes de guardada — sem
+                    // isso, qualquer um anunciava a prekey de outro e lia-lhe as conversas.
+                    if let (Some(x), Some(sig)) = (x_pub, prekey_sig) {
+                        if let Err(e) = leitura_app.guardar_prekey(&peer_leitura, &x, &sig) {
+                            eprintln!(
+                                "[rede] a chave de conversa de {} não confere: {e}",
+                                &peer_leitura[..8.min(peer_leitura.len())]
+                            );
+                        }
+                    }
                 }
                 // Uma mensagem de uma versão mais nova do que esta. Ignora-se e segue-se:
                 // o que não se conhece não pode ser tratado, mas também não é razão para
@@ -992,6 +1028,38 @@ fn aplicar(
     peer: &str,
     rede: &Arc<Rede>,
 ) {
+    // «Não temos este servidor» tem duas leituras, e só uma delas é «não é para nós».
+    //
+    // A outra é: ele acabou de abrir a nossa conversa e escreveu-me. Aí eu ainda não tenho
+    // o log, e deitar fora era perder a primeira mensagem — e todas as seguintes, para
+    // sempre, sem um erro em lado nenhum.
+    //
+    // O id distingue os dois casos sozinho, sem precisar de acreditar em ninguém: ele sai
+    // das DUAS chaves públicas, portanto só um `Sync` vindo deste par pode trazer o id da
+    // conversa deste par. Um estranho pode calcular o id dele comigo — e o que isso
+    // significa é «alguém quis falar comigo», que é para o que serve.
+    if !app.servidores.lock().unwrap().contains_key(servidor) {
+        let minha = app.minha_chave();
+        let nosso = match (crate::estado::hex32(&minha), crate::estado::hex32(peer)) {
+            (Ok(a), Ok(b)) => Some(HEXLOWER.encode(&spike_common::crypto::id_da_conversa(&a, &b))),
+            _ => None,
+        };
+        if nosso.as_deref() != Some(servidor) {
+            return;
+        }
+        if let Err(e) = app.abrir_conversa(peer) {
+            eprintln!(
+                "[rede] {} quis falar comigo e não consegui abrir a conversa: {e}",
+                &peer[..8.min(peer.len())]
+            );
+            return;
+        }
+        eprintln!(
+            "[rede] {} abriu uma conversa comigo",
+            &peer[..8.min(peer.len())]
+        );
+    }
+
     let (novas, aprendi) = {
         let mut s = app.servidores.lock().unwrap();
         let Some(srv) = s.get_mut(servidor) else {

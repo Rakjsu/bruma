@@ -11,6 +11,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
+const CTX_CONVERSA: &[u8] = b"bruma/conversa/v1";
 const CTX_X25519: &[u8] = b"bruma/spike1/x25519/v1";
 const CTX_SESSION: &[u8] = b"bruma/spike1/session/v1";
 const CTX_BIND: &[u8] = b"bruma/spike1/prekey-binding/v1";
@@ -63,6 +64,26 @@ fn bind_msg(xpub: &[u8; 32]) -> Vec<u8> {
 pub fn verify_prekey(id: &VerifyingKey, xpub: &[u8; 32], sig: &[u8; 64]) -> Result<()> {
     id.verify(&bind_msg(xpub), &Signature::from_bytes(sig))
         .map_err(|_| anyhow!("assinatura da prekey não corresponde à identidade do peer"))
+}
+
+/// O identificador da conversa entre duas identidades.
+///
+/// Determinístico e simétrico: as duas máquinas chegam ao mesmo id **sem trocarem uma
+/// palavra sobre isso**. É o que dispensa qualquer convite — e, ao contrário do convite de
+/// servidor, não há aqui segredo nenhum para transportar, portanto não há nada que se possa
+/// reencaminhar a um terceiro.
+///
+/// Ordenam-se as duas chaves pelo mesmo motivo que em `session_key`: quem abre a conversa
+/// primeiro não pode mudar o resultado.
+pub fn id_da_conversa(a: &[u8; 32], b: &[u8; 32]) -> [u8; 16] {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = blake3::Hasher::new();
+    h.update(CTX_CONVERSA);
+    h.update(lo);
+    h.update(hi);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
 }
 
 /// ECDH + HKDF. O sal ordena as duas identidades para os dois lados derivarem a MESMA chave.
@@ -182,6 +203,44 @@ pub fn open(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod testes_palavras {
     use super::*;
+
+    /// Os dois lados TEM de chegar ao mesmo id, e a ordem nao pode contar.
+    ///
+    /// Se contasse, cada um abria a sua conversa, escrevia no seu log, e nenhum via o do
+    /// outro -- dois monologos em vez de uma conversa, sem um unico erro pelo caminho.
+    #[test]
+    fn o_id_da_conversa_e_o_mesmo_dos_dois_lados() {
+        let a = [7u8; 32];
+        let b = [200u8; 32];
+        assert_eq!(
+            id_da_conversa(&a, &b),
+            id_da_conversa(&b, &a),
+            "a ordem contou"
+        );
+
+        // E pares diferentes tem de dar ids diferentes -- senao duas conversas partilhavam
+        // o mesmo log.
+        let c = [9u8; 32];
+        assert_ne!(id_da_conversa(&a, &b), id_da_conversa(&a, &c));
+        assert_ne!(id_da_conversa(&a, &b), id_da_conversa(&b, &c));
+    }
+
+    /// A chave da conversa tambem: mesma dos dois lados, e diferente para cada par.
+    #[test]
+    fn a_chave_da_conversa_e_a_mesma_dos_dois_lados() {
+        let ia = Identity::from_seed(&[1u8; 32]);
+        let ib = Identity::from_seed(&[2u8; 32]);
+        let ea = ia.verifying().to_bytes();
+        let eb = ib.verifying().to_bytes();
+        let ka = session_key(&ia.x_secret, &ib.x_public(), &ea, &eb);
+        let kb = session_key(&ib.x_secret, &ia.x_public(), &eb, &ea);
+        assert_eq!(ka, kb, "os dois lados derivaram chaves diferentes");
+
+        let ic = Identity::from_seed(&[3u8; 32]);
+        let ec = ic.verifying().to_bytes();
+        let kc = session_key(&ia.x_secret, &ic.x_public(), &ea, &ec);
+        assert_ne!(ka, kc, "duas conversas diferentes com a mesma chave");
+    }
 
     #[test]
     fn as_palavras_devolvem_a_mesma_semente() {

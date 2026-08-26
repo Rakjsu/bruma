@@ -3821,6 +3821,12 @@ function pararDeAssistir() {
   const esperar = ms => new Promise(r => setTimeout(r, ms));
 
   try {
+    // Um nome, para a resolucao de nomes ser mesmo exercitada. Sem isto as duas instancias
+    // ficam sem nome, tudo aparece como chave truncada, e o teste passava sem provar nada
+    // sobre o caminho que leva o nome de uma pessoa ate a mensagem dela.
+    await invoke('definir_nome', { nome: modo === '' ? 'Anfitriao' : 'Convidado' })
+      .catch(e => diz(`par nao consegui dar-me um nome: ${e}`));
+
     let servidorId;
     if (modo === '') {
       servidorId = await invoke('criar_servidor', { nome: 'par' });
@@ -3927,8 +3933,48 @@ function pararDeAssistir() {
 
     // Deixar correr, e depois contar. O que interessa é `recebidos`: prova que o datagrama
     // saiu de uma instância e chegou ao descodificador da outra.
+    let conversa = null;
     for (let volta = 1; volta <= 6; volta++) {
       await esperar(5000);
+
+      // A CONVERSA PRIVADA. Os dois lados abrem-na sem combinar nada -- o id sai das duas
+      // chaves publicas e a chave sai do Diffie-Hellman entre elas. Se as derivacoes nao
+      // forem simetricas, cada um escreve no seu log e nenhum ve o do outro: dois monologos
+      // em vez de uma conversa, e sem um unico erro pelo caminho.
+      if (volta === 3 && !conversa) {
+        const outro = [...voz.presentes.keys()].find(k => k !== voz.eu);
+        if (outro) {
+          try {
+            const id = await invoke('abrir_conversa', { peer: outro });
+            const st = await invoke('estado');
+            const c = st.conversas.find(x => x.id === id);
+            conversa = c || { id, canal: 'conversa', nome: '?' };
+            diz(`par conversa: id=${id} com=${outro.slice(0, 6)} nome="${conversa.nome}"`);
+            await invoke('enviar', {
+              servidor: id,
+              canal: conversa.canal,
+              texto: `privado de ${voz.eu.slice(0, 6)}`,
+            });
+          } catch (e) {
+            diz(`par conversa FALHOU a abrir: ${e}`);
+          }
+        }
+      }
+
+      // E no fim: os dois lados tem de ver as DUAS mensagens, com nome e nao com
+      // "desconhecido" -- se so virem a propria, a sincronizacao da conversa nao anda.
+      if (volta === 6 && conversa) {
+        const msgs = await invoke('mensagens', {
+          servidor: conversa.id,
+          canal: conversa.canal,
+        }).catch(e => { diz(`par conversa FALHOU a ler: ${e}`); return []; });
+        const st = await invoke('estado');
+        diz(`par conversa mensagens: ${msgs.length}/2`
+          + ` [${msgs.map(m => `${m.autor_nome}: ${m.texto}`).join(' | ')}]`
+          + ` conversas-na-vista=${st.conversas.length}`
+          + ` servidores-na-vista=${st.servidores.length}`);
+      }
+
       const gente = [...voz.presentes.keys()];
       const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
       const resumo = estado.map(e =>

@@ -185,6 +185,7 @@ fn main() {
             comandos::apagar_canal,
             comandos::criar_convite,
             comandos::entrar_com_convite,
+            comandos::abrir_conversa,
             comandos::enviar,
             comandos::mensagens,
             comandos::presenca_de_voz,

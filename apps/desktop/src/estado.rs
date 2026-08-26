@@ -66,6 +66,13 @@ pub struct ServidorGuardado {
     /// Peers já conhecidos, para reconectar sem precisar do convite outra vez.
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Com quem, se isto for uma conversa privada em vez de um servidor.
+    ///
+    /// É a única diferença guardada. Por baixo uma conversa é o mesmo que um servidor — o
+    /// mesmo log assinado, a mesma cifra, o mesmo caminho de sincronização — e é isso que a
+    /// torna barata: nada no que já existe precisa de saber que aquilo é uma conversa.
+    #[serde(default)]
+    pub com: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,6 +81,13 @@ pub struct Indice {
     pub servidores: Vec<ServidorGuardado>,
     #[serde(default)]
     pub nome: String,
+    /// A chave x25519 de cada pessoa com quem já falámos, para se poder abrir uma conversa
+    /// sem esperar que ela esteja online outra vez.
+    ///
+    /// Não é um segredo: é a metade pública. Guarda-se aqui porque este ficheiro já é
+    /// cifrado, e porque quem sabe com quem eu tenho prekeys sabe com quem eu falo.
+    #[serde(default)]
+    pub prekeys: BTreeMap<String, String>,
 }
 
 pub struct Servidor {
@@ -81,6 +95,7 @@ pub struct Servidor {
     pub chave: [u8; 32],
     pub log: blog::Log,
     pub peers: Vec<String>,
+    pub com: Option<String>,
 }
 
 impl Servidor {
@@ -139,6 +154,7 @@ pub struct App {
     pub semente: [u8; 32],
     pub nome: Mutex<String>,
     pub servidores: Mutex<BTreeMap<String, Servidor>>,
+    pub prekeys: Mutex<BTreeMap<String, String>>,
 }
 
 impl App {
@@ -194,6 +210,7 @@ impl App {
                     chave,
                     log,
                     peers: s.peers.clone(),
+                    com: s.com.clone(),
                 },
             );
         }
@@ -203,6 +220,7 @@ impl App {
             semente,
             nome: Mutex::new(indice.nome),
             servidores: Mutex::new(servidores),
+            prekeys: Mutex::new(indice.prekeys),
         };
 
         // A CONVERSÃO ACONTECE AGORA, e não "na próxima gravação".
@@ -233,6 +251,87 @@ impl App {
         HEXLOWER.encode(self.ident.verifying().as_bytes())
     }
 
+    /// Guarda a chave de conversa de alguém, aprendida quando nos ligámos.
+    ///
+    /// Só a metade pública, e verificada: o `verify_prekey` prova que aquela chave x25519
+    /// foi anunciada por quem diz ser dono dela. Sem essa verificação, qualquer um anunciava
+    /// a prekey de outro e ficava a ler as conversas dele.
+    pub fn guardar_prekey(&self, peer: &str, x_pub: &str, sig: &str) -> Result<()> {
+        let dono = ed25519_dalek::VerifyingKey::from_bytes(&hex32(peer)?)
+            .map_err(|_| anyhow!("chave de identidade inválida"))?;
+        let xb = hex32(x_pub)?;
+        let sb: [u8; 64] = HEXLOWER
+            .decode(sig.as_bytes())
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| anyhow!("assinatura da prekey mal formada"))?;
+        crypto::verify_prekey(&dono, &xb, &sb)?;
+
+        let mut m = self.prekeys.lock().unwrap();
+        if m.get(peer).map(|v| v.as_str()) == Some(x_pub) {
+            return Ok(()); // já a tínhamos, e é a mesma
+        }
+        m.insert(peer.to_string(), x_pub.to_string());
+        drop(m);
+        self.gravar_indice()
+    }
+
+    /// Abre — ou reabre — a conversa privada com alguém.
+    ///
+    /// Não há convite e não há segredo a transportar: o id sai das duas chaves públicas e a
+    /// chave sai do Diffie-Hellman entre elas. Os dois lados chegam ao mesmo sozinhos, e é
+    /// por isso que uma conversa não se pode reencaminhar a terceiros como um convite.
+    ///
+    /// Por baixo é um servidor como os outros — o mesmo log assinado, a mesma cifra, o mesmo
+    /// caminho de sincronização. A única diferença guardada é o `com`.
+    pub fn abrir_conversa(&self, peer: &str) -> Result<String> {
+        let minha = self.minha_chave();
+        if peer == minha {
+            bail!("essa chave é a tua");
+        }
+        let eu = hex32(&minha)?;
+        let ele = hex32(peer)?;
+        let id = HEXLOWER.encode(&crypto::id_da_conversa(&eu, &ele));
+
+        if self.servidores.lock().unwrap().contains_key(&id) {
+            return Ok(id); // já existe; abrir duas vezes é o mesmo que abrir uma
+        }
+
+        let x_hex = self
+            .prekeys
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "ainda não sei a chave de conversa desta pessoa — é preciso terem estado                      ligados pelo menos uma vez"
+                )
+            })?;
+        let chave = crypto::session_key(
+            &self.ident.x_secret,
+            &x25519_dalek::PublicKey::from(hex32(&x_hex)?),
+            &eu,
+            &ele,
+        );
+
+        let log = blog::Log::load(caminho_do_log(&id))?;
+        self.servidores.lock().unwrap().insert(
+            id.clone(),
+            Servidor {
+                id: id.clone(),
+                chave,
+                log,
+                // O outro é o único par desta conversa, e já é conhecido desde o início:
+                // não há aqui o passo de "dar-se a conhecer" que os servidores têm.
+                peers: vec![peer.to_string()],
+                com: Some(peer.to_string()),
+            },
+        );
+        self.gravar_indice()?;
+        Ok(id)
+    }
+
     pub fn gravar_indice(&self) -> Result<()> {
         let servidores = self.servidores.lock().unwrap();
         let indice = Indice {
@@ -243,8 +342,10 @@ impl App {
                     id: s.id.clone(),
                     chave: HEXLOWER.encode(&s.chave),
                     peers: s.peers.clone(),
+                    com: s.com.clone(),
                 })
                 .collect(),
+            prekeys: self.prekeys.lock().unwrap().clone(),
         };
         // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
         let claro = serde_json::to_vec(&indice)?;

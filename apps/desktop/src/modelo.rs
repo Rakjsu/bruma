@@ -166,6 +166,13 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
 }
 
 /// Extrai as mensagens de um canal, já ordenadas como vieram.
+/// O canal de uma conversa privada.
+///
+/// Uma conversa não tem canais — não há onde os criar nem quem os crie. Mas o caminho das
+/// mensagens é o mesmo dos servidores e pede um canal, por isso usa-se um id fixo. Fixo e
+/// não sorteado, para os dois lados chegarem lá sem combinar nada, como o id da conversa.
+pub const CANAL_DA_CONVERSA: &str = "conversa";
+
 pub fn mensagens_do_canal(
     entradas: &[Aplicavel],
     ids: &[String],
