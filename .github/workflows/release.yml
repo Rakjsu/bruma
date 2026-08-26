@@ -100,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo clippy -p bruma -p instalador -p spike-common --all-targets -- -D warnings
+          cargo clippy -p bruma -p instalador -p spike-common -p verificar-assinatura --all-targets -- -D warnings
           cargo test -p bruma -p spike-common
 
       - name: Compilar, assinar e publicar
@@ -229,6 +229,34 @@ jobs:
           # O NSIS reformou-se: sai da pagina para ninguem o descarregar por engano.
           gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe" --yes
           gh release delete-asset $tag "Bruma_${ver}_x64-setup.exe.sig" --yes
+
+      # O portao que faltava, e o que tinha a pior forma de falhar.
+      #
+      # Os outros portoes olham para nomes de ficheiros e numeros de versao. Nenhum deles
+      # podia apanhar a unica coisa de que depende a actualizacao automatica funcionar: que a
+      # assinatura publicada se verifica com a chave publica que vai DENTRO da app.
+      #
+      # Rodar a chave privada sem rodar a `pubkey` do tauri.conf.json (ou ao contrario)
+      # publica uma versao com aspecto perfeito -- os ficheiros la estao, o latest.json aponta
+      # para o sitio certo -- e deixa toda a gente sem actualizacoes, para sempre, sem um
+      # unico erro visivel. Cada versao seguinte agrava, porque ninguem da por nada.
+      #
+      # Descarregam-se os ficheiros DA RELEASE (ainda rascunho, por isso via `gh`) em vez de
+      # se usarem os que estao aqui ao lado: o que interessa provar e o que o updater vai
+      # buscar, e nao o que o runner tem em disco.
+      - name: A assinatura verifica com a chave que vai na app?
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          rm -rf prova-assinatura && mkdir prova-assinatura
+          gh release download "$tag" -p 'Instalar-Bruma.exe' -p 'latest.json' -D prova-assinatura --clobber
+          cargo run -q -p verificar-assinatura -- \
+            prova-assinatura/Instalar-Bruma.exe \
+            prova-assinatura/latest.json \
+            apps/desktop/tauri.conf.json
 
       # O ULTIMO passo, e so agora: a partir daqui o updater de toda a gente ve isto.
       - name: Publicar a release
