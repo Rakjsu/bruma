@@ -1239,13 +1239,23 @@ mod testes {
     /// Duas ordens de lock contrárias param os dois threads, para sempre, sem um erro.
     ///
     /// Este é o género de avaria que não aparece em nenhum registo: a app fica quieta, e a
-    /// única prova é o tempo a passar. Por isso o teste tem um cronómetro — se as duas voltas
-    /// não acabarem dentro do prazo, é porque se prenderam.
+    /// única prova é o tempo a passar.
     ///
-    /// Só se prende com a política em Amigos ou Salas, que são as que fazem o
-    /// `pode_escrever_me` pedir um segundo lock.
+    /// # Porque é que NÃO tem um prazo fixo
+    ///
+    /// A primeira versão dava 30 segundos para 4000 voltas acabarem. Passava aqui e falhou
+    /// no runner — e não por estar presa: por o `gravar_indice` ter passado a fazer
+    /// `sync_data`, que custa **18 vezes mais** por escrita. Um prazo fixo mede a velocidade
+    /// da máquina e chama-lhe deadlock; o CI ficou vermelho a apontar para o sítio errado.
+    ///
+    /// Um deadlock é **ausência de progresso**, e é isso que se mede: cada volta incrementa
+    /// um contador, e o que faz o teste falhar é o contador deixar de mexer. Numa máquina
+    /// lenta demora mais e passa na mesma; presa, falha em segundos, seja qual for a
+    /// máquina.
     #[test]
     fn duas_ordens_de_lock_nao_se_prendem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let dir = std::env::temp_dir().join(format!("bruma-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: um só teste toca nesta variável, e antes de qualquer thread arrancar.
@@ -1254,36 +1264,52 @@ mod testes {
         let app = Arc::new(App::arrancar().expect("arrancar"));
         *app.quem_escreve.lock().unwrap() = QuemEscreve::Salas;
 
-        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
-        let voltas = 4000;
+        let voltas = 600;
+        let feitas = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
 
         let a = Arc::clone(&app);
-        let t1 = tx.clone();
+        let ca = Arc::clone(&feitas);
         std::thread::spawn(move || {
             for _ in 0..voltas {
                 let _ = a.pode_escrever_me("aa");
+                ca[0].fetch_add(1, Ordering::Relaxed);
             }
-            let _ = t1.send("escrever");
         });
 
         let b = Arc::clone(&app);
+        let cb = Arc::clone(&feitas);
         std::thread::spawn(move || {
             for _ in 0..voltas {
                 let _ = b.gravar_indice();
+                cb[1].fetch_add(1, Ordering::Relaxed);
             }
-            let _ = tx.send("gravar");
         });
 
-        let prazo = std::time::Duration::from_secs(30);
-        let mut acabaram = Vec::new();
-        for _ in 0..2 {
-            match rx.recv_timeout(prazo) {
-                Ok(quem) => acabaram.push(quem),
-                Err(_) => panic!(
-                    "prendeu-se: só {} de 2 acabaram em {prazo:?} — ordens de lock contrárias",
-                    acabaram.len()
-                ),
+        // Enquanto os contadores mexerem, espera-se. Quando pararem sem terem acabado, é
+        // porque se prenderam.
+        let paragem = std::time::Duration::from_secs(20);
+        let mut ultimo = (0, 0);
+        let mut parado_desde = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let agora = (
+                feitas[0].load(Ordering::Relaxed),
+                feitas[1].load(Ordering::Relaxed),
+            );
+            if agora.0 >= voltas && agora.1 >= voltas {
+                break;
             }
+            if agora != ultimo {
+                ultimo = agora;
+                parado_desde = std::time::Instant::now();
+                continue;
+            }
+            assert!(
+                parado_desde.elapsed() < paragem,
+                "prendeu-se: {} e {} voltas de {voltas}, sem mexer há {paragem:?} —                  ordens de lock contrárias",
+                agora.0,
+                agora.1
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
