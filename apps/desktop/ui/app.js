@@ -1479,16 +1479,69 @@ $('#ok-nome').onclick = async () => {
   } catch (e) { erroEm('erro-nome', String(e)); }
 };
 
+/** O tecto de uma mensagem, em caracteres.
+ *
+ *  O mesmo numero que o Rust impoe, e escrito aqui SO para o contador poder avisar antes de
+ *  se carregar em Enter. Quem manda e o Rust: uma verificacao que so existe na interface e
+ *  uma sugestao, porque o comando pode ser chamado de outro sitio.
+ *
+ *  Existe porque uma mensagem entra no log de toda a gente e nao se apaga. Sem tecto, uma
+ *  colagem distraida de cinco megabytes fica no disco dos dois para sempre, a ser
+ *  sincronizada em cada ligacao.
+ */
+const MAX_TEXTO = 4000;
+
+/** Faz o campo crescer com o texto, ate ao tecto do CSS. */
+function ajustarEntrada(el) {
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight}px`;
+}
+
+function atualizarConta(el) {
+  const conta = $('#conta-texto');
+  if (!conta) return;
+  const falta = MAX_TEXTO - el.value.length;
+  // So aparece perto do fim. Um contador sempre visivel num campo de conversa e ruido.
+  if (falta > 300) { conta.textContent = ''; conta.className = 'composer__conta'; return; }
+  conta.textContent = String(falta);
+  conta.className = 'composer__conta ' + (falta < 0 ? 'passou' : 'perto');
+}
+
+$('#entrada').addEventListener('input', ev => {
+  ajustarEntrada(ev.target);
+  atualizarConta(ev.target);
+});
+
 $('#entrada').addEventListener('keydown', async ev => {
-  if (ev.key !== 'Enter' || !ev.target.value.trim()) return;
+  // SHIFT+ENTER faz uma linha nova; ENTER envia.
+  //
+  // E nao o contrario, apesar de o campo ser agora multi-linha: numa conversa escreve-se
+  // sobretudo uma linha de cada vez, e obrigar a um atalho para o caso comum e trocar o
+  // frequente pelo raro.
+  if (ev.key !== 'Enter' || ev.shiftKey) return;
+  ev.preventDefault();
   const texto = ev.target.value;
+  if (!texto.trim()) return;
+  if (texto.length > MAX_TEXTO) {
+    // Nao se corta o texto de ninguem em silencio: fica no campo, e o contador diz porque.
+    atualizarConta(ev.target);
+    return;
+  }
   ev.target.value = '';
+  ajustarEntrada(ev.target);
+  atualizarConta(ev.target);
   const destino = destinoDeEscrita();
   if (!destino) return;
   try {
     await invoke('enviar', { ...destino, texto });
     await desenharMensagens();
-  } catch (e) { console.error(e); }
+  } catch (e) {
+    // O texto volta para o campo: perder o que se escreveu por causa de um erro de rede e
+    // pior do que o erro.
+    ev.target.value = texto;
+    ajustarEntrada(ev.target);
+    console.error(e);
+  }
 });
 
 /* ==========================================================================
@@ -5528,6 +5581,55 @@ function pararDeAssistir() {
       + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+
+    // ---- mensagens de varias linhas --------------------------------------------
+    //
+    // O que se mede NAO e o texto sobreviver a ida e volta -- isso e JSON, e passaria mesmo
+    // com o desenho errado. Mede-se o que se VE: em HTML uma nova linha e apenas um espaco,
+    // portanto sem `white-space: pre-wrap` a mensagem chegava certa e mostrava-se toda
+    // seguida. E mede-se o TECTO no Rust, porque uma verificacao so na interface e uma
+    // sugestao: chama-se o comando directamente, sem passar pelo guarda do JS.
+    {
+      const alvo = (vista.servidores || [])[0];
+      const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      if (!alvo || !canal) {
+        diz('ui varias linhas: sem servidor/canal para medir');
+      } else {
+        const chave = { servidor: alvo.id, canal: canal.id };
+        const tresLinhas = 'primeira' + String.fromCharCode(10)
+          + 'segunda' + String.fromCharCode(10) + 'terceira';
+        await invoke('enviar', { ...chave, texto: tresLinhas }).catch(() => {});
+        const msgs = await invoke('mensagens', chave).catch(() => []);
+        const guardada = (msgs[msgs.length - 1] || {}).texto === tresLinhas;
+
+        // E o DESENHO. Uma linha de altura contra tres.
+        escolherServidor(alvo.id);
+        escolherCanal(canal.id);
+        await new Promise(r => setTimeout(r, 400));
+        const ps = [...document.querySelectorAll('#stream .msg p')];
+        const ultimo = ps[ps.length - 1];
+        const estilo = ultimo && getComputedStyle(ultimo);
+        const alturaLinha = estilo ? parseFloat(estilo.lineHeight) || 20 : 20;
+        const altura = ultimo ? ultimo.getBoundingClientRect().height : 0;
+
+        // O tecto, sem passar pelo guarda do JS.
+        let recusou = false;
+        try {
+          await invoke('enviar', { ...chave, texto: 'x'.repeat(MAX_TEXTO + 1) });
+        } catch (e) { recusou = true; }
+        let aceitouNoLimite = false;
+        try {
+          await invoke('enviar', { ...chave, texto: 'y'.repeat(MAX_TEXTO) });
+          aceitouNoLimite = true;
+        } catch (e) { /* fica falso */ }
+
+        diz(`ui varias linhas: guardada=${guardada}`
+          + ` pre-wrap=${estilo ? estilo.whiteSpace : 'sem-elemento'}`
+          + ` altura=${Math.round(altura)}px linha=${Math.round(alturaLinha)}px`
+          + ` desenha-tres-linhas=${altura > alturaLinha * 2.4}`
+          + ` rust-recusou-acima=${recusou} rust-aceitou-no-limite=${aceitouNoLimite}`);
+      }
+    }
 
     // ---- ler com a janela atras nao conta como ler -----------------------------
     //

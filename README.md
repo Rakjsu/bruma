@@ -6,7 +6,7 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.16.3 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.17.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos, permissões de mensagens e por-ler com avisos.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
@@ -130,8 +130,12 @@ projectos morrem.
   mensagem com uma data absurda marcava o canal como lido para sempre.
 - **Não há avisos com a app fechada.** Não há servidor a receber por ti: se o Bruma não está
   a correr, a mensagem espera na máquina de quem a escreveu.
-- **Não há anexos, imagens, editar, apagar, reacções, respostas nem markdown.** Só texto
-  simples, uma linha de cada vez.
+- **Uma mensagem tem no máximo 4000 caracteres.** Não é uma limitação técnica: é que uma
+  mensagem entra no log dos dois lados, vai para o disco, e é sincronizada em cada ligação —
+  para sempre, porque não há apagar. Sem tecto, uma colagem distraída ficava lá, e o custo era
+  de quem a recebe.
+- **Não há anexos, imagens, editar, apagar, reacções, respostas nem markdown.** Texto simples
+  — em várias linhas, com Shift+Enter.
 
 ## Espreitar por dentro
 

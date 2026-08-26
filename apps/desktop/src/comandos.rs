@@ -49,6 +49,14 @@ pub struct Vista {
 /// porque a mensagem tem de ser legível para quem está a usar a app, não um `Debug` de erro.
 type R<T> = Result<T, String>;
 
+/// O tecto de uma mensagem, em caracteres. Ver [`enviar`].
+///
+/// O mesmo número está no `app.js` como `MAX_TEXTO`, para o contador poder avisar antes de se
+/// carregar em Enter. Dois sítios com o mesmo número é uma coisa que diverge — e a divergência
+/// aqui é benigna nos dois sentidos: se o JS ficar maior, o Rust recusa e a interface mostra o
+/// erro; se ficar menor, avisa cedo demais. Nenhum dos dois deixa passar o que não devia.
+pub const MAX_TEXTO: usize = 4000;
+
 fn erro(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -696,6 +704,24 @@ pub fn enviar(
     let texto = texto.trim().to_string();
     if texto.is_empty() {
         return Ok(());
+    }
+    // O TECTO DE UMA MENSAGEM.
+    //
+    // Uma mensagem entra no log, vai para o disco dos dois lados, e é sincronizada em cada
+    // ligação — para sempre. Não há apagar. Sem tecto, uma colagem distraída de cinco
+    // megabytes fica lá, e o custo é de quem a recebe, que não escolheu nada.
+    //
+    // Aqui e não só na interface: uma verificação que só existe no JS é uma sugestão. E em
+    // CARACTERES e não em bytes, porque é o que a pessoa vê no contador — contar bytes daria
+    // um limite que encolhe quando se escreve com acentos, e ninguém percebia porquê.
+    //
+    // Isto não impede um par com software modificado de escrever mais: o que se guarda é o
+    // que decifra, e o tamanho não é uma prova de nada. Está dito no README.
+    if texto.chars().count() > MAX_TEXTO {
+        return Err(format!(
+            "essa mensagem tem {} caracteres e o limite é {MAX_TEXTO}",
+            texto.chars().count()
+        ));
     }
     let entrada = {
         let mut servidores = app.servidores.lock().map_err(erro)?;

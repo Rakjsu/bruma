@@ -331,7 +331,16 @@ html, body {
 .msg__head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 1px; }
 .msg__head b { font: 600 14.5px/1.3 var(--ui); color: #e9f1f6; }
 .msg__head time { font: 400 11px/1 var(--mono); color: var(--dim); }
-.msg p { margin: 0; color: #cbd6df; }
+/* `pre-wrap` e o que faz as mudancas de linha aparecerem: em HTML, uma nova linha dentro de
+   texto e apenas um espaco. Sem isto, escrever em varias linhas guardava-as no log e
+   mostrava-as todas seguidas -- a mensagem chegava certa e via-se errada.
+   O `overflow-wrap` e o par obrigatorio: com `pre-wrap`, uma palavra sem espacos (um link
+   longo, uma chave) estica a coluna e empurra a conversa para fora do ecra. */
+.msg p {
+  margin: 0; color: #cbd6df;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 
 .attach {
   display: inline-flex; align-items: center; gap: 11px;
@@ -358,7 +367,9 @@ html, body {
 
 .composer { padding: 4px 20px 14px; }
 .composer__box {
-  display: flex; align-items: center; gap: 6px;
+  /* `flex-end` e nao `center`: com o campo a crescer para varias linhas, o cadeado e o +
+     ficavam a meio da altura, longe da linha onde se escreve. */
+  display: flex; align-items: flex-end; gap: 6px;
   background: var(--raise);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
@@ -367,13 +378,29 @@ html, body {
 }
 .composer__box:focus-within { border-color: var(--mist-mid); box-shadow: 0 0 0 3px rgba(143, 188, 212, .07); }
 .ico--plus { font-size: 19px; color: var(--dim); }
-.composer input {
+.composer textarea {
   flex: 1; min-width: 0;
   background: transparent; border: 0; outline: 0;
-  color: var(--text); font: 400 14.5px/1 var(--body);
-  padding: 11px 2px;
+  color: var(--text); font: 400 14.5px/1.45 var(--body);
+  padding: 10px 2px;
+  /* Cresce com o texto ate um tecto, e so entao rola. Sem tecto, uma mensagem longa
+     empurrava a conversa toda para fora do ecra enquanto se escrevia. */
+  resize: none; overflow-y: auto;
+  max-height: 40vh;
+  font-family: var(--body);
 }
-.composer input::placeholder { color: var(--dim); }
+.composer textarea::placeholder { color: var(--dim); }
+
+/* Quanto falta para o limite. So aparece perto do fim -- um contador sempre visivel e
+   ruido, e num campo de conversa e ate um pouco hostil. */
+.composer__conta {
+  align-self: flex-end;
+  padding: 0 2px 12px;
+  font: 500 11px/1 var(--ui);
+  color: var(--dim);
+}
+.composer__conta.perto { color: var(--amber); }
+.composer__conta.passou { color: var(--rose); }
 .composer__lock { color: var(--mint); opacity: .75; display: grid; place-items: center; }
 .composer__lock svg { fill: currentColor; stroke: currentColor; stroke-width: 1.1; }
 .composer__note { padding: 7px 4px 0; font-size: 11px; color: var(--dim); }
