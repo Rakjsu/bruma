@@ -72,6 +72,16 @@ pub enum Saida {
     Entrada(String, blog::Entry),
     Presenca(String, Option<String>),
     /// Dirigido a UM peer. As outras sessoes ignoram.
+    /// «Toma o meu log deste servidor», a UM par.
+    ///
+    /// Existe porque o sync deixou de ser voluntariado. Quando alguém se dá a conhecer num
+    /// servidor que também é meu, respondo-lhe com o que tenho — e é isto que mantém o
+    /// convite a funcionar: quem entra fala primeiro, e é a resposta que lhe traz o
+    /// histórico. Nunca vai ao fio como variante nova; converte-se num `Msg::Sync` normal.
+    SyncPara {
+        para: String,
+        servidor: String,
+    },
     Sinal {
         para: String,
         servidor: String,
@@ -190,6 +200,23 @@ impl Rede {
             let app = app.clone();
             let janela = janela.clone();
             tokio::spawn(async move { vigiar_ligacoes(rede, app, janela).await });
+        }
+
+        // O ESTRANHO. Liga-se a alguém com quem não partilha servidor nenhum e conta o que
+        // lhe chega — que é a única forma de medir o que sai daqui para quem não devia
+        // receber nada. Uma pessoa mal-intencionada só precisa do `EndpointId`, que vai em
+        // qualquer convite que eu tenha criado; a bandeira só torna isso reproduzível.
+        if let Ok(alvo) = std::env::var("BRUMA_ESTRANHO") {
+            let rede = rede.clone();
+            let app = app.clone();
+            let janela = janela.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                match ligar(&rede, &app, &janela, alvo.trim()).await {
+                    Ok(()) => eprintln!("[estranho] liguei-me a {}", &alvo[..8.min(alvo.len())]),
+                    Err(e) => eprintln!("[estranho] não consegui ligar: {e}"),
+                }
+            });
         }
 
         Ok(rede)
@@ -616,11 +643,22 @@ async fn sessao(
     // lá está. Entre perder e repetir, repete-se.
     let mut sub = rede.tx.subscribe();
 
-    // Manda tudo o que temos. Quem não tiver o servidor ignora — é mais simples e mais
-    // robusto do que negociar primeiro quem tem o quê.
+    // Manda o que é DELE, e não tudo o que tenho.
+    //
+    // Isto era «manda tudo o que temos; quem não tiver o servidor ignora», com o argumento
+    // de ser mais simples do que negociar. Era mais simples e entregava a qualquer par
+    // ligado o histórico cifrado de todos os meus servidores. O conteúdo ia protegido, mas
+    // o id do servidor, as chaves de quem escreveu, as horas e o volume iam em claro — ou
+    // seja, qualquer conhecido ficava a saber em que salas eu estou, com quem, e quando.
+    //
+    // A regra passa a ser: **não voluntariar, retribuir.** Só se manda o log dos servidores
+    // onde este par já é conhecido; quem chega de novo dá-se a conhecer primeiro e recebe a
+    // resposta em `aplicar` (ver `Saida::SyncPara`). O convite continua a funcionar porque
+    // quem entra tem o anfitrião na lista e fala primeiro.
     let pacotes: Vec<(String, Vec<blog::Entry>)> = {
         let s = app.servidores.lock().unwrap();
         s.values()
+            .filter(|srv| srv.peers.iter().any(|p| p == &peer))
             .map(|srv| (srv.id.clone(), srv.log.ordered()))
             .collect()
     };
@@ -684,12 +722,20 @@ async fn sessao(
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Sync { servidor, entradas })) => {
+                    if std::env::var("BRUMA_ESTRANHO").is_ok() {
+                        eprintln!(
+                            "[estranho] recebi um SYNC do servidor {} com {} entradas",
+                            &servidor[..8.min(servidor.len())],
+                            entradas.len()
+                        );
+                    }
                     aplicar(
                         &leitura_app,
                         &leitura_janela,
                         &servidor,
                         entradas,
                         &peer_leitura,
+                        &rede_leitura,
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Nova { servidor, entrada })) => {
@@ -699,6 +745,7 @@ async fn sessao(
                         &servidor,
                         vec![entrada],
                         &peer_leitura,
+                        &rede_leitura,
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Presenca { servidor, canal })) => {
@@ -731,12 +778,39 @@ async fn sessao(
             got = sub.recv() => match got {
                 Ok(saida) => {
                     let quadro = match saida {
+                        // Uma entrada nova só vai a quem participa NESTE servidor. Antes
+                        // ia a toda a gente ligada, com o id do servidor à frente: quem
+                        // não tinha a chave não lia o conteúdo, mas ficava a saber que eu
+                        // acabara de escrever, onde, e a que horas.
                         Saida::Entrada(servidor, entrada) => {
-                            Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
+                            if participa(&app, &servidor, &peer) {
+                                Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
+                            } else {
+                                None
+                            }
                         }
+                        // A presença diz em que sala de voz estou. Mesma regra: só a quem
+                        // é dessa casa.
                         Saida::Presenca(servidor, canal) => {
-                            Some(Quadro::Controlo(Msg::Presenca { servidor, canal }))
+                            if participa(&app, &servidor, &peer) {
+                                Some(Quadro::Controlo(Msg::Presenca { servidor, canal }))
+                            } else {
+                                None
+                            }
                         }
+                        // A resposta a quem se deu a conhecer: o log deste servidor, e só
+                        // para ele.
+                        Saida::SyncPara { para, servidor } if para == peer => {
+                            let entradas = app
+                                .servidores
+                                .lock()
+                                .ok()
+                                .and_then(|s| s.get(&servidor).map(|srv| srv.log.ordered()));
+                            entradas.map(|entradas| {
+                                Quadro::Controlo(Msg::Sync { servidor, entradas })
+                            })
+                        }
+                        Saida::SyncPara { .. } => None,
                         // Sinalizacao e video sao dirigidos: as outras sessoes deixam passar.
                         Saida::Sinal { para, servidor, canal, dados } if para == peer => {
                             Some(Quadro::Controlo(Msg::Sinal { servidor, canal, dados }))
@@ -790,26 +864,59 @@ async fn sessao(
 }
 
 /// Junta entradas recebidas ao servidor certo e avisa a interface se algo mudou.
+/// Se este par conta como participante deste servidor.
+///
+/// É o critério que decide o que sai daqui para ele. Antes não havia critério nenhum: o
+/// histórico de TODOS os servidores ia para QUALQUER par ligado, e cada mensagem escrita
+/// era difundida a toda a gente com o id do servidor à frente. O conteúdo ia cifrado, mas
+/// os ids, os autores e as horas iam em claro — ou seja, qualquer conhecido ficava a saber
+/// em que salas eu estou, com quem, e quando falo.
+fn participa(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
+    app.servidores
+        .lock()
+        .map(|s| {
+            s.get(servidor)
+                .is_some_and(|srv| srv.peers.iter().any(|p| p == peer))
+        })
+        .unwrap_or(false)
+}
+
 fn aplicar(
     app: &Arc<App>,
     janela: &AppHandle,
     servidor: &str,
     entradas: Vec<blog::Entry>,
     peer: &str,
+    rede: &Arc<Rede>,
 ) {
-    let novas = {
+    let (novas, aprendi) = {
         let mut s = app.servidores.lock().unwrap();
         let Some(srv) = s.get_mut(servidor) else {
             return; // não temos este servidor: não é erro, é só não ser para nós
         };
-        if !srv.peers.iter().any(|p| p == peer) {
+        let aprendi = !srv.peers.iter().any(|p| p == peer);
+        if aprendi {
             srv.peers.push(peer.to_string());
         }
-        srv.log.merge(entradas).unwrap_or(0)
+        (srv.log.merge(entradas).unwrap_or(0), aprendi)
     };
-    if novas > 0 {
+    // Gravar TAMBÉM quando só se aprendeu um par. Antes só se gravava se viessem entradas
+    // novas, e por isso um par que sincronizasse sem trazer nada ficava só em memória e
+    // perdia-se ao fechar a app.
+    if novas > 0 || aprendi {
         let _ = app.gravar_indice();
+    }
+    if novas > 0 {
         let _ = janela.emit("servidor-mudou", servidor);
+    }
+    // Ele deu-se a conhecer neste servidor: agora é participante, e recebe o que eu tenho.
+    // É esta resposta — e não um sync voluntariado a toda a gente — que traz o histórico a
+    // quem acabou de entrar por convite.
+    if aprendi {
+        let _ = rede.tx.send(Saida::SyncPara {
+            para: peer.to_string(),
+            servidor: servidor.to_string(),
+        });
     }
 }
 
