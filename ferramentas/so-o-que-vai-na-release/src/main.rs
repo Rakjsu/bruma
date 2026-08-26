@@ -32,15 +32,42 @@ use anyhow::{bail, Result};
 /// Cada um destes ou salta um guarda, ou escreve estado permanente, ou fabrica cargas de
 /// ataque. Acrescentar um andaime novo é acrescentar uma linha aqui.
 const ANDAIMES: &[&str] = &[
+    // Simular um estranho, bloquear a meio, forjar amizade.
     "BRUMA_ESTRANHO",
     "BRUMA_ESTRANHO_SALA",
     "BRUMA_ESTRANHO_ACTO",
     "BRUMA_BLOQUEIA",
     "BRUMA_BLOQUEIA_TARDE",
     "BRUMA_AMIGO",
+    // Partir a app de proposito, para o codigo que trata da avaria ser exercitado.
+    // Estas nove escaparam a primeira versao desta lista -- eu escrevi-a de memoria em vez
+    // de a tirar de um `grep`, que e exactamente o erro que esta ferramenta existe para
+    // apanhar. Ver `ferramentas/so-o-que-vai-na-release` no README de commits.
+    "BRUMA_SESSAO_MORRE",
+    "BRUMA_SYNC_LENTO",
+    "BRUMA_SO_VIGIA",
+    "BRUMA_SEM_TRAVAO",
+    "BRUMA_CODIFICADOR_MORRE",
+    "BRUMA_FALHA_CAPTURA",
+    "BRUMA_SOM_MORRE",
+    "BRUMA_SO_NOS",
+    "BRUMA_ECO_ANTIGO",
+    // Comandos que so servem para medir.
     "convites_de_teste",
     "escapou_alguma_coisa",
+    "autoteste_pedido",
+    "autoteste_par",
+    "medir_ui_pedido",
 ];
+
+/// As que FICAM, e porque.
+///
+/// `BRUMA_DADOS` escolhe a pasta de dados e `BRUMA_REGISTO` o nivel de registo. Sao
+/// diagnostico legitimo, estao documentados no README, e servem a quem instalou a app quando
+/// alguma coisa corre mal. Estao aqui para a distincao ficar escrita e nao ter de ser
+/// relembrada: a pergunta nao e "e uma variavel de ambiente?" mas "isto parte alguma coisa ou
+/// escreve estado que a pessoa nao pediu?".
+const DIAGNOSTICO_LEGITIMO: &[&str] = &["BRUMA_DADOS", "BRUMA_REGISTO"];
 
 /// E estes TÊM de lá estar.
 ///
@@ -87,11 +114,17 @@ fn main() -> Result<()> {
         );
     }
 
+    let diagnostico: Vec<&str> = DIAGNOSTICO_LEGITIMO
+        .iter()
+        .copied()
+        .filter(|a| contem(a))
+        .collect();
     println!(
-        "release limpa: {} bytes, nenhum dos {} andaimes, e os {} marcos estão lá",
+        "release limpa: {} bytes | {} andaimes procurados, nenhum encontrado | {} marcos presentes | diagnóstico que fica: {:?}",
         bytes.len(),
         ANDAIMES.len(),
-        TEM_DE_ESTAR.len()
+        TEM_DE_ESTAR.len(),
+        diagnostico
     );
     Ok(())
 }

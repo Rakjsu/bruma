@@ -40,6 +40,10 @@ let vista = null;        // o último estado vindo do Rust
 // Os amigos, em cache, para o `nomeDoPeer` poder preferir o nome LOCAL sem ser assíncrono.
 // A lista nunca sai desta máquina — tê-la aqui não a expõe a nada.
 let amigos = [];
+// Declarado aqui em cima, e não a meio do ficheiro, porque o `escreverMensagens` e o
+// `talvezAvisar` passaram a lê-lo: com `let` declarado depois, uma chamada antes da linha da
+// declaração dá ReferenceError em vez de `undefined`, e a app parava sem nada legível.
+let janelaComFoco = document.hasFocus();
 let servidorAtual = null;
 let canalAtual = null;
 /** Onde estamos: numa sala de um servidor, ou nas conversas privadas.
@@ -396,24 +400,77 @@ async function desenharMensagens() {
  *  A marcação de lido é feita DEPOIS de desenhar, e com o valor ANTERIOR na mão: se se
  *  marcasse primeiro, a linha aparecia sempre no fim — que é o mesmo que não aparecer.
  */
+// Onde ficou a linha de «novas mensagens» do canal que está à frente.
+//
+// Sem isto, cada `servidor-mudou` voltava a chamar `marcar_lido` e a linha desaparecia: à
+// segunda passagem já não havia nada por ler, portanto não havia onde a pôr. Chegava uma
+// mensagem e o sítio onde a leitura tinha parado sumia-se — que é precisamente quando ele
+// faz falta.
+let marcaDaVista = { onde: null, antes: 0 };
+// Só para medição: o valor de `marcar` do último pedido feito ao Rust.
+let ultimoMarcarPedido = null;
+
 async function escreverMensagens(stream, msgs, servidorId, canalId) {
-  const antes = await invoke('marcar_lido', { servidor: servidorId, canal: canalId })
-    .catch(() => 0);
+  const onde = `${servidorId}/${canalId}`;
+  if (marcaDaVista.onde !== onde) marcaDaVista = { onde, antes: null };
+
+  // MARCAR COMO LIDO SÓ COM A JANELA À FRENTE.
+  //
+  // O redesenho corre a cada mensagem que chega, esteja eu a olhar ou não. Marcar sempre
+  // fazia a app dar por vista uma mensagem que ninguém viu — e, pior, o aviso do sistema
+  // nunca chegava a existir: quando o `talvezAvisar` olhava, a contagem já tinha voltado a
+  // zero. O caso em que um aviso serve para alguma coisa era exactamente o caso que ele não
+  // cobria.
+  // `janelaComFoco` e nao `document.hasFocus()`: a app ja tem a sua nocao de foco, mantida
+  // pelos ouvintes de focus/blur e ja usada para decidir se um aviso de voz aparece. Duas
+  // fontes de verdade sobre a mesma coisa e a receita para divergirem — e esta e testavel,
+  // porque se lhe pode mexer.
+  const aFrente = janelaComFoco;
+  // O que foi PEDIDO, para a medição poder ver a decisão.
+  //
+  // Medir o efeito não serve aqui: numa instância só, todas as mensagens são minhas e as
+  // minhas nunca contam como por ler — portanto a marca não avança de qualquer maneira, e a
+  // medição passava com e sem a correcção. Já lhe chamei uma medição e ela era uma opinião.
+  ultimoMarcarPedido = aFrente;
+  const antes = await invoke('marcar_lido', {
+    servidor: servidorId, canal: canalId, marcar: aFrente,
+  }).catch(() => null);
+
+  // A linha fixa-se na PRIMEIRA vez que se olha para este canal, e fica.
+  if (marcaDaVista.antes === null && antes !== null) marcaDaVista.antes = antes;
+  const corte = marcaDaVista.antes || 0;
+
+  // Estava eu no fim antes de redesenhar? Se estava a ler mais acima, saltar para o fim
+  // seria a app a puxar-me a página das mãos de cada vez que alguém escreve.
+  const estavaNoFim = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 40;
+
   stream.textContent = '';
   let anterior = null;
   let linhaPosta = false;
   for (const m of msgs) {
     // A minha própria mensagem nunca puxa a linha: eu sei o que escrevi.
-    if (!linhaPosta && antes > 0 && m.ts_ms > antes && m.autor !== vista.chave) {
+    if (!linhaPosta && corte > 0 && m.ts_ms > corte && m.autor !== vista.chave) {
       stream.append(elemento('div', 'novas-aqui', 'novas mensagens'));
       linhaPosta = true;
+      // E a primeira a seguir à linha leva cabeçalho completo, senão fica agarrada por cima
+      // dela como se fosse continuação de quem falou antes.
+      anterior = null;
     }
-    stream.append(umaMensagem(m, linhaPosta && !anterior ? null : anterior));
+    stream.append(umaMensagem(m, anterior));
     anterior = m;
   }
-  stream.scrollTop = stream.scrollHeight;
-  // O contador na barra tem de desaparecer agora, e não só no redesenho seguinte.
-  if (antes >= 0) await refrescarBolhas();
+  if (estavaNoFim || marcaDaVista.antes === antes) stream.scrollTop = stream.scrollHeight;
+
+  if (aFrente) {
+    // O contador na barra tem de desaparecer agora, e não só no redesenho seguinte. E a
+    // fotografia dos avisos também: sem isto ela ficava com a contagem antiga, e a rajada
+    // seguinte não parecia uma subida — ficava em silêncio.
+    if (porLerAnterior) {
+      porLerAnterior.delete(`s:${onde}`);
+      porLerAnterior.delete(`c:${servidorId}`);
+    }
+    await refrescarBolhas();
+  }
 }
 
 /** Volta a pedir o estado só para as contagens, sem redesenhar a conversa a meio da
@@ -2030,7 +2087,34 @@ function fotoDoPorLer(v) {
  */
 function corpoDoAviso(onde, texto) {
   if (avisosComTexto() && texto) return texto;
-  return `Tens mensagens novas em ${onde}.`;
+  return `Tens mensagens novas em ${umaLinha(onde, 60)}.`;
+}
+
+/** Uma linha só, e curta.
+ *
+ *  O CORPO do aviso tinha o cinto de segurança do `avisosComTexto`. O TÍTULO não tinha nada
+ *  — e o título é o nome que a outra pessoa escolheu para si própria ou para a sala, texto
+ *  livre que ela controla. Alguém que se chame a si próprio com três parágrafos põe três
+ *  parágrafos no ecrã bloqueado de quem o tem na lista, com a opção «mostrar texto»
+ *  desligada e a app a prometer que não mostra texto.
+ *
+ *  Uma linha e 40 caracteres fazem aquilo parecer o que é: um nome.
+ */
+function umaLinha(t, max) {
+  // Sem literal de regex: qualquer coisa que passe por escapagem de camadas acaba com
+  // uma nova linha REAL dentro da expressao, e a app fica sem carregar. Aqui olha-se
+  // para os codigos, que nao tem escapes nenhuns.
+  let limpo = '';
+  let espaco = false;
+  for (const c of String(t == null ? '' : t)) {
+    const n = c.codePointAt(0);
+    // Controlo (nova linha, tabulacao, e o resto do bloco C0/C1) vira um espaco so.
+    if (n < 32 || (n >= 127 && n < 160)) { espaco = limpo.length > 0; continue; }
+    if (espaco) { limpo += ' '; espaco = false; }
+    limpo += c;
+  }
+  limpo = limpo.trim();
+  return limpo.length > max ? limpo.slice(0, max - 1) + '…' : limpo;
 }
 
 /** O texto da última mensagem que não é minha, para o aviso — só quando foi pedido. */
@@ -2053,17 +2137,36 @@ let porLerAnterior = null;
  * pela mesma mensagem: o `servidor-mudou` dispara tambem quando sou EU a escrever, quando
  * chega historico antigo, e varias vezes durante um sync.
  */
+/** Regista o que ja estava por ler, sem avisar de nada.
+ *
+ *  Tem de ser chamado no ARRANQUE. Estava a ser feito dentro do `talvezAvisar`, que so corre
+ *  no `servidor-mudou` — portanto a fotografia de base era tirada na PRIMEIRA mensagem que
+ *  chegasse, e essa nunca avisava. Numa app de mensagens, a primeira mensagem de cada sessao
+ *  e exactamente aquela de que se quer saber.
+ */
+function fotografarPorLer() {
+  porLerAnterior = fotoDoPorLer(vista);
+}
+
 async function talvezAvisar() {
   const agora = fotoDoPorLer(vista);
   if (porLerAnterior === null) { porLerAnterior = agora; return; }
-  const focada = document.hasFocus();
+  // ESCREVER A FOTOGRAFIA PRIMEIRO.
+  //
+  // Entre ler o `porLerAnterior` e escrevê-lo havia dois `await` (ir buscar o texto, mandar
+  // o aviso) que devolvem o controlo ao ciclo de eventos. O `listen` do Tauri não serializa
+  // nada: uma segunda mensagem a chegar no meio entrava aqui com o mapa AINDA por
+  // actualizar, via a mesma subida outra vez, e avisava duas vezes pela mesma mensagem.
+  const anterior = porLerAnterior;
+  porLerAnterior = agora;
+
+  const focada = janelaComFoco;
   for (const [k, v] of agora) {
-    const antes = porLerAnterior.get(k);
+    const antes = anterior.get(k);
     if (v.n <= (antes ? antes.n : 0) || focada) continue;
     const t = avisosComTexto() ? await ultimoTexto(v.servidor, v.canal) : null;
-    await avisar(v.quem, corpoDoAviso(v.onde, t));
+    await avisar(umaLinha(v.quem, 40), corpoDoAviso(v.onde, t));
   }
-  porLerAnterior = agora;
 }
 
 listen('servidor-mudou', async ev => {
@@ -3169,7 +3272,6 @@ function qualidadeDe(quem) {
 let gentePorBaixoOculta = false;
 
 /** Se a janela do Bruma tem o foco — ver a pausa da pré-visualização no palco. */
-let janelaComFoco = document.hasFocus();
 window.addEventListener('focus', () => { janelaComFoco = true; if (voz.aVer) desenharVoz(); });
 window.addEventListener('blur', () => { janelaComFoco = false; if (voz.aVer) desenharVoz(); });
 
@@ -4081,6 +4183,11 @@ function pararDeAssistir() {
 (async () => {
   voz.eu = await invoke('meu_endereco').catch(() => null);
   await desenharTudo();
+  // A fotografia do que JÁ estava por ler, agora e não na primeira mensagem que chegar.
+  // Estava a ser tirada dentro do `talvezAvisar`, que só corre no `servidor-mudou` — logo a
+  // primeira mensagem de cada sessão servia de base e nunca avisava. Numa app de mensagens,
+  // a primeira mensagem de uma sessão é exactamente aquela de que se quer saber.
+  fotografarPorLer();
   if (!vista.nome) {
     abrir('veu-bemvindo');
     $('#in-nome').focus();
@@ -4650,6 +4757,15 @@ function pararDeAssistir() {
         // consegue ver aqui e o caminho todo: a mensagem do outro atravessa a rede, entra no
         // meu log, e o contador sobe -- e depois desce quando eu abro a conversa.
         const porLerAntes = (st.conversas.find(c => c.id === conversa.id) || {}).nao_lidos;
+
+        // `marcar: false` SO LE. Aqui ha mesmo uma mensagem por ler, vinda da outra
+        // instancia, portanto isto discrimina: sem o modo so-ler, a contagem caia a zero.
+        await invoke('marcar_lido', {
+          servidor: conversa.id, canal: conversa.canal, marcar: false,
+        }).catch(() => -1);
+        const stSoLer = await invoke('estado');
+        const depoisDeSoLer = (stSoLer.conversas.find(c => c.id === conversa.id) || {}).nao_lidos;
+
         const antesDeMarcar = await invoke('marcar_lido', {
           servidor: conversa.id, canal: conversa.canal,
         }).catch(() => -1);
@@ -4658,7 +4774,8 @@ function pararDeAssistir() {
         // E as bolhas que a interface DESENHOU, e nao so os numeros: um contador certo com
         // uma bolha que ninguem pintou nao serve para nada.
         const bolhasAgora = document.querySelectorAll('.bolha').length;
-        diz(`par nao lido: antes=${porLerAntes} depois-de-abrir=${porLerDepois}`
+        diz(`par nao lido: antes=${porLerAntes} so-ler-nao-mexeu=${depoisDeSoLer}`
+          + ` depois-de-abrir=${porLerDepois}`
           + ` marca-devolveu-anterior=${antesDeMarcar >= 0} bolhas-no-ecra=${bolhasAgora}`);
       }
 
@@ -5411,6 +5528,60 @@ function pararDeAssistir() {
       + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+
+    // ---- ler com a janela atras nao conta como ler -----------------------------
+    //
+    // O redesenho corre a cada mensagem que chega, esteja eu a olhar ou nao. Marcar sempre
+    // como lido fazia a app dar por vista uma mensagem que ninguem viu -- e, pior, o aviso
+    // do sistema nunca chegava a existir: quando o `talvezAvisar` olhava, a contagem ja
+    // tinha voltado a zero. O caso em que um aviso serve era exactamente o que nao cobria.
+    {
+      const alvo = (vista.servidores || [])[0];
+      const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      if (!alvo || !canal) {
+        diz('ui ler com a janela atras: sem servidor/canal para medir');
+      } else {
+        const chave = { servidor: alvo.id, canal: canal.id };
+        const guardado = janelaComFoco;
+
+        const base = await invoke('marcar_lido', { ...chave, marcar: false }).catch(() => -1);
+
+        // ESCOLHER O CANAL PRIMEIRO.
+        //
+        // Eu escolhia um servidor e um canal para a medicao e depois chamava
+        // `desenharMensagens()`, que desenha o que esta ACTUAL -- que a esta altura do
+        // guiao podia ser o modo privado, e nesse caso nem sequer passa pelo
+        // `escreverMensagens`. A medicao dizia `null` e eu ia culpar a correccao.
+        fecharDefinicoes();
+        // E ter la ALGUMA COISA: com o canal vazio, o `desenharMensagens` desenha o estado
+        // "ainda nao ha nada aqui" e volta ANTES do `escreverMensagens`. A medicao dizia
+        // `null` e nao era a correccao que estava em causa -- era o caminho nunca ter sido
+        // percorrido. Terceira vez hoje que um teste nao chega ao codigo que julga medir.
+        await invoke('enviar', {
+          servidor: alvo.id, canal: canal.id, texto: 'para haver o que redesenhar',
+        }).catch(() => {});
+        escolherServidor(alvo.id);
+        escolherCanal(canal.id);
+        await new Promise(r => setTimeout(r, 400));
+
+        // A DECISAO: o redesenho pede para marcar exactamente quando a janela esta a frente.
+        janelaComFoco = false;
+        ultimoMarcarPedido = null;
+        await desenharMensagens();
+        const pediuComJanelaAtras = ultimoMarcarPedido;
+
+        janelaComFoco = true;
+        ultimoMarcarPedido = null;
+        await desenharMensagens();
+        const pediuComJanelaAFrente = ultimoMarcarPedido;
+
+        janelaComFoco = guardado;
+        diz(`ui ler com a janela atras: leu-base=${base >= 0}`
+          + ` atras-pediu=${pediuComJanelaAtras}`
+          + ` a-frente-pediu=${pediuComJanelaAFrente}`
+          + ` decide-pelo-foco=${pediuComJanelaAtras === false && pediuComJanelaAFrente === true}`);
+      }
+    }
 
     // ---- o que o aviso do sistema deixa sair -----------------------------------
     //

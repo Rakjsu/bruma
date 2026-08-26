@@ -189,6 +189,26 @@ pub struct Servidor {
     provados: std::collections::BTreeSet<String>,
 }
 
+/// Quanto é que o relógio de outra pessoa pode estar adiantado antes de eu deixar de
+/// acreditar nele — só para efeitos de «por ler».
+///
+/// O `ts_ms` de uma entrada é escolhido por quem a escreve: o `merge` verifica a assinatura,
+/// que é feita com a chave do próprio autor. Não há aqui nada que impeça o ano 9999.
+///
+/// **Aparar para «agora» não chega, e foi o meu primeiro instinto.** Com um tecto móvel, a
+/// entrada forjada vale sempre «agora» — portanto está sempre à frente da última marca de
+/// leitura, e o vermelho volta a acender a cada redesenho. Trocava um vermelho preso por um
+/// vermelho intermitente.
+///
+/// O que é estável é EXCLUIR: a entrada não conta e não mexe na marca, hoje e daqui a um ano.
+/// Continua a aparecer no canal — não se esconde nada, só se deixa de a usar para decidir o
+/// que está por ler.
+///
+/// Um dia é muito mais do que qualquer desvio real entre duas máquinas, e o custo de errar
+/// para este lado é pequeno: uma mensagem de alguém com o relógio um dia adiantado não
+/// acende a bolha. Está dito no painel.
+const DESVIO_TOLERADO_MS: i64 = 24 * 60 * 60 * 1000;
+
 impl Servidor {
     /// O único caminho para construir um `Servidor`.
     ///
@@ -267,20 +287,103 @@ impl Servidor {
     ///
     /// Uma passagem só pelo log, e não uma por canal: com dez canais, uma por canal seria
     /// decifrar tudo dez vezes.
+    ///
+    /// `contaveis` é a lista de canais que a pessoa CONSEGUE abrir. Sem ela, contava-se tudo
+    /// o que aparecesse no log — e havia três maneiras de ficar com uma bolha vermelha que
+    /// nunca mais se apaga:
+    ///
+    /// - o **chat da sala** escreve mensagens reais dentro do canal de VOZ, e um canal de voz
+    ///   não se abre como texto: a marca de leitura nunca avança;
+    /// - um canal **apagado** (e qualquer membro pode apagar canais) leva com ele a única
+    ///   forma de o abrir, mas as mensagens ficam no log;
+    /// - um canal **inventado** por quem escreve — o id da carga não é verificado contra
+    ///   nada — dava a qualquer membro a capacidade de me pôr um vermelho permanente na
+    ///   barra, e de mandar o nome que quisesse para o aviso do sistema.
+    ///
+    /// Contar só o que se pode abrir fecha os três de uma vez, na origem.
+    /// Só os testes lhe chamam — o caminho da app usa o  com as
+    /// entradas que já decifrou.  e não : a primeira diz
+    /// o que isto é, a segunda só cala o compilador.
+    #[cfg(test)]
     pub fn nao_lidos(
         &self,
         eu: &str,
         lido: &BTreeMap<String, i64>,
+        contaveis: &std::collections::BTreeSet<String>,
     ) -> BTreeMap<String, (usize, i64)> {
+        // Uma casca sobre a implementação única. O caminho quente (`estado`) já traz as
+        // entradas decifradas e chama o outro directamente; isto existe para quem só quer a
+        // contagem — hoje, os testes. Duas cópias da mesma regra são uma regra que um dia
+        // deixa de ser a mesma, e a regra aqui é «o que conta como por ler».
+        let (aps, _) = self.aplicaveis();
+        self.por_ler_das_entradas(&aps, eu, lido, contaveis)
+    }
+
+    /// A hora da mensagem mais recente de um canal que NÃO é minha.
+    ///
+    /// O `eu` não é um detalhe de simetria com o `nao_lidos`: sem ele, escrever uma mensagem
+    /// fazia a marca de leitura avançar, e cada avanço reescreve o índice inteiro, cifrado,
+    /// no disco. Uma conversa activa passava a dar uma reescrita completa por cada coisa que
+    /// eu digo — que o comando de enviar nunca fazia — e cada uma dessas escritas é uma
+    /// janela onde uma falha de energia custa as chaves todas.
+    ///
+    /// E não muda nada no que se vê: as minhas nunca contaram como por ler.
+    ///
+    /// Um `ts_ms` demasiado à frente é IGNORADO — ver [`DESVIO_TOLERADO_MS`]. Sem isso, uma
+    /// única mensagem com o ano 9999 marcava o canal como lido para sempre: tudo o que
+    /// viesse depois nascia já «lido», em silêncio.
+    pub fn ultima_mensagem(&self, canal: &str, eu: &str) -> i64 {
+        let limite = agora_ms() as i64 + DESVIO_TOLERADO_MS;
+        self.aplicaveis()
+            .0
+            .iter()
+            .filter_map(|a| match &a.carga {
+                Carga::Mensagem { canal: c, .. } if c == canal && a.autor != eu => {
+                    let ts = a.ts_ms.min(i64::MAX as u64) as i64;
+                    (ts <= limite).then_some(ts)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// O estado e o que falta ler, de UMA passagem pelo log.
+    ///
+    /// Chamar `estado()` e depois `nao_lidos()` decifra o log inteiro duas vezes, e o comando
+    /// que os usa segura o lock de todos os servidores durante as duas. Foi o que eu fiz ao
+    /// acrescentar o por-ler: dobrei o custo do caminho mais quente da app — corre a cada
+    /// redesenho e a cada mensagem que chega — sem reparar.
+    ///
+    /// O custo continua linear no histórico, que é um problema conhecido e maior do que este.
+    /// O que aqui se corrige é ter passado a ser o dobro.
+    pub fn estado_e_entradas(&self) -> (EstadoDoServidor, Vec<Aplicavel>) {
+        let (aps, _) = self.aplicaveis();
+        let estado = modelo::reconstruir(&aps);
+        (estado, aps)
+    }
+
+    /// A contagem, a partir de entradas JÁ decifradas.
+    pub fn por_ler_das_entradas(
+        &self,
+        aps: &[Aplicavel],
+        eu: &str,
+        lido: &BTreeMap<String, i64>,
+        contaveis: &std::collections::BTreeSet<String>,
+    ) -> BTreeMap<String, (usize, i64)> {
+        let limite = agora_ms() as i64 + DESVIO_TOLERADO_MS;
         let mut fora: BTreeMap<String, (usize, i64)> = BTreeMap::new();
-        for a in self.aplicaveis().0 {
+        for a in aps {
             let Carga::Mensagem { canal, .. } = &a.carga else {
                 continue;
             };
-            if a.autor == eu {
+            if a.autor == eu || !contaveis.contains(canal) {
                 continue;
             }
-            let ts = a.ts_ms as i64;
+            let ts = a.ts_ms.min(i64::MAX as u64) as i64;
+            if ts > limite {
+                continue;
+            }
             let ate = lido
                 .get(&App::chave_de_leitura(&self.id, canal))
                 .copied()
@@ -292,19 +395,6 @@ impl Servidor {
             }
         }
         fora
-    }
-
-    /// A hora da mensagem mais recente de um canal, para se poder marcar como lido «até aqui».
-    pub fn ultima_mensagem(&self, canal: &str) -> i64 {
-        self.aplicaveis()
-            .0
-            .iter()
-            .filter_map(|a| match &a.carga {
-                Carga::Mensagem { canal: c, .. } if c == canal => Some(a.ts_ms as i64),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
     }
 
     pub fn estado(&self) -> EstadoDoServidor {
@@ -792,10 +882,29 @@ impl App {
             nonce: HEXLOWER.encode(&nonce),
             dados: HEXLOWER.encode(&dados),
         };
-        std::fs::write(
-            raiz().join("indice.json"),
-            serde_json::to_string_pretty(&cofre)?,
-        )?;
+        // TEMPORARIO, SYNC, RENAME -- e nao um `fs::write`.
+        //
+        // O `fs::write` abre com truncate: durante um instante o ficheiro tem tamanho zero e
+        // o conteudo novo ainda nao la esta. Um corte de energia nessa janela deixa o
+        // indice.json truncado, e o `ler_indice` nao tem recuperacao nenhuma -- poe o
+        // ficheiro de lado e arranca com um indice VAZIO. Isso e perder as chaves de todos os
+        // servidores de uma vez; os logs continuam no disco e passam a ser indecifraveis.
+        //
+        // A defesa ja existia no ficheiro do lado: o `Log::reescrever` do spike-common faz
+        // exactamente isto, e ate tem o comentario a explicar porque. Eu li esse comentario
+        // quando escrevi o log e nao o apliquei aqui -- no unico ficheiro cuja perda nao se
+        // recupera.
+        //
+        // Enquanto o novo nao estiver inteiro e sincronizado, o antigo continua a ser o bom.
+        let destino = raiz().join("indice.json");
+        let temporario = destino.with_extension("novo");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&temporario)?;
+            f.write_all(serde_json::to_string_pretty(&cofre)?.as_bytes())?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&temporario, &destino)?;
         Ok(())
     }
 }
@@ -981,9 +1090,16 @@ mod testes {
         let ate = escreve(&mut srv, &outro, "outro", "noutro canal");
         escreve(&mut srv, &eu, "geral", "estou");
 
+        // Os canais que existem. Um canal fora desta lista não pode ser aberto, portanto
+        // uma bolha nele nunca se apagava.
+        let contaveis: std::collections::BTreeSet<String> =
+            ["geral".to_string(), "outro".to_string()]
+                .into_iter()
+                .collect();
+
         // Nada lido ainda: as duas dele no geral, a dele no outro, e a MINHA não conta.
         let vazio = BTreeMap::new();
-        let c = srv.nao_lidos(&minha, &vazio);
+        let c = srv.nao_lidos(&minha, &vazio, &contaveis);
         assert_eq!(c.get("geral").map(|(n, _)| *n), Some(2), "as dele no geral");
         assert_eq!(c.get("outro").map(|(n, _)| *n), Some(1), "a dele no outro");
         assert_eq!(c.len(), 2, "a minha não podia contar");
@@ -991,7 +1107,7 @@ mod testes {
         // Lido até à última do outro canal: o geral fica limpo, o outro também.
         let mut lido = BTreeMap::new();
         lido.insert(App::chave_de_leitura(&srv.id, "geral"), ate);
-        let c = srv.nao_lidos(&minha, &lido);
+        let c = srv.nao_lidos(&minha, &lido, &contaveis);
         assert_eq!(c.get("geral"), None, "o geral tinha de ficar limpo");
         assert_eq!(
             c.get("outro").map(|(n, _)| *n),
@@ -1001,7 +1117,7 @@ mod testes {
 
         // Uma nova dele DEPOIS de eu ter lido volta a contar.
         escreve(&mut srv, &outro, "geral", "voltei");
-        let c = srv.nao_lidos(&minha, &lido);
+        let c = srv.nao_lidos(&minha, &lido, &contaveis);
         assert_eq!(
             c.get("geral").map(|(n, _)| *n),
             Some(1),
@@ -1010,8 +1126,88 @@ mod testes {
 
         // E o `ultima_mensagem` tem de dar a mais recente, senão marcar como lido deixava
         // sempre uma por ler e o contador nunca chegava a zero.
-        assert!(srv.ultima_mensagem("geral") > ate);
-        assert_eq!(srv.ultima_mensagem("nao-existe"), 0);
+        assert!(srv.ultima_mensagem("geral", &minha) > ate);
+        assert_eq!(srv.ultima_mensagem("nao-existe", &minha), 0);
+
+        // UM CANAL QUE NÃO SE PODE ABRIR NÃO CONTA.
+        //
+        // Três maneiras de ficar com um vermelho preso para sempre: o chat da sala escreve
+        // no canal de VOZ, um canal apagado leva a única forma de o abrir, e o id do canal
+        // numa carga não é verificado contra nada — qualquer membro inventa um.
+        escreve(&mut srv, &outro, "canal-inventado", "não me podes abrir");
+        let c = srv.nao_lidos(&minha, &vazio, &contaveis);
+        assert_eq!(
+            c.get("canal-inventado"),
+            None,
+            "um canal que não existe não conta"
+        );
+        // O `ultima_mensagem` DEVOLVE o carimbo dessa entrada, e está certo assim: o guarda
+        // é o `contaveis` do `nao_lidos`, e o `marcar_lido` só é chamado com canais que a
+        // interface mostra. Pôr aqui um segundo guarda seria a mesma regra em dois sítios —
+        // e duas cópias de uma regra são uma regra que um dia deixa de ser a mesma.
+        assert!(srv.ultima_mensagem("canal-inventado", &minha) > 0);
+
+        // O RELÓGIO É DE QUEM ESCREVE, E NINGUÉM PROMETEU QUE É HONESTO.
+        //
+        // Sem tecto, uma mensagem com o ano 9999 marcava o canal como lido até esse futuro:
+        // tudo o que viesse depois nascia já lido, em silêncio e para sempre.
+        // Forja-se com o `append_local` directamente porque o `escrever` usa o relógio
+        // desta máquina: um teste que não consegue mentir na hora não põe esta defesa à
+        // prova.
+        let mil_anos = agora_ms() + 1000u64 * 60 * 60 * 24 * 365 * 1000;
+        let forjada = {
+            let carga = Carga::Mensagem {
+                canal: "geral".into(),
+                texto: "sou do futuro".into(),
+            };
+            let claro = serde_json::to_vec(&carga).unwrap();
+            let (nonce, ct) = crypto::seal(&srv.chave, &claro).unwrap();
+            let mut solto = blog::Log::load(dir.join("forja.json")).unwrap();
+            solto
+                .append_local(&outro.signing, nonce, ct, mil_anos)
+                .unwrap()
+        };
+        assert_eq!(
+            srv.merge_verificado(vec![forjada]).unwrap(),
+            1,
+            "tinha de entrar"
+        );
+
+        let marca = srv.ultima_mensagem("geral", &minha);
+        assert!(
+            marca <= agora_ms() as i64 + 5_000,
+            "a marca foi para o futuro: {marca}"
+        );
+        assert_eq!(
+            srv.nao_lidos(&minha, &vazio, &contaveis)
+                .get("geral")
+                .map(|(n, _)| *n),
+            Some(3),
+            "a forjada nao pode contar: sao as 3 legitimas dele"
+        );
+
+        // E o efeito que interessa: marcar como lido agora não pode calar o que vier a
+        // seguir. Sem o tecto, este contador ficaria a zero para sempre.
+        let mut lido2 = BTreeMap::new();
+        lido2.insert(App::chave_de_leitura(&srv.id, "geral"), marca);
+        escreve(&mut srv, &outro, "geral", "e eu venho depois");
+        assert_eq!(
+            srv.nao_lidos(&minha, &lido2, &contaveis)
+                .get("geral")
+                .map(|(n, _)| *n),
+            Some(1),
+            "a mensagem legítima a seguir tinha de contar"
+        );
+
+        // E as MINHAS não fazem a marca avançar: sem isto, escrever uma mensagem reescrevia
+        // o índice inteiro no disco, e cada escrita dessas é uma janela de perda.
+        let antes_de_eu_falar = srv.ultima_mensagem("geral", &minha);
+        escreve(&mut srv, &eu, "geral", "sou eu a falar");
+        assert_eq!(
+            srv.ultima_mensagem("geral", &minha),
+            antes_de_eu_falar,
+            "a minha mensagem não pode mexer na marca de leitura"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

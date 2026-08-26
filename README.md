@@ -6,7 +6,7 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.16.1 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.16.2 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos, permissões de mensagens e por-ler com avisos.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
@@ -124,6 +124,10 @@ projectos morrem.
 - **O aviso do sistema não leva o texto da mensagem**, a não ser que o ligues. Um aviso do
   Windows não é a app: aparece no ecrã bloqueado, fica no histórico de notificações e é lido
   por quem passar ao pé do computador. Por omissão diz quem e onde, nunca o quê.
+- **Um relógio muito adiantado esconde as mensagens da contagem.** O carimbo de hora de uma
+  mensagem é escolhido por quem a escreve, e não há aqui relógio comum. Uma mensagem que diga
+  vir de mais de um dia no futuro aparece no canal mas não acende a bolha — sem isso, uma só
+  mensagem com uma data absurda marcava o canal como lido para sempre.
 - **Não há avisos com a app fechada.** Não há servidor a receber por ti: se o Bruma não está
   a correr, a mensagem espera na máquina de quem a escreveu.
 - **Não há anexos, imagens, editar, apagar, reacções, respostas nem markdown.** Só texto

@@ -400,7 +400,13 @@ html, body {
   transition: background .15s;
 }
 .member:hover { background: rgba(255, 255, 255, .035); }
-.member span:last-child { display: flex; flex-direction: column; min-width: 0; }
+/* NAO `span:last-child`.
+   A linha de um membro e <span.ident> + <span> com o nome e a chave empilhados. Quando se
+   acrescentou a bolha no fim, foi ELA que passou a ser o ultimo span: apanhava o
+   `flex-direction:column`, e o span do texto perdia-o -- o nome e a chave passavam a correr
+   lado a lado e a linha crescia. Nomear o que se quer, em vez de contar posicoes, e o que
+   sobrevive a acrescentar-se um elemento no fim. */
+.member > span:not(.ident):not(.bolha) { display: flex; flex-direction: column; min-width: 0; }
 .member b { font: 500 13.5px/1.3 var(--ui); color: var(--text); }
 .member i { font: 400 10.5px/1.3 var(--body); font-style: normal; color: var(--dim); }
 .member.is-off { opacity: .42; }
@@ -448,7 +454,11 @@ html, body {
    vez de uma lista corrida com títulos pelo meio. */
 .abas {
   display: flex; gap: 4px; padding: 4px; margin: 2px 0 12px;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  /* Estava `var(--bg)`, que nao existe: a declaracao era invalida e o fundo ficava
+     transparente. Fica transparente EXPLICITAMENTE -- e o aspecto que sempre teve, e agora
+     e uma escolha em vez de um engano a espera de alguem definir `--bg` e mudar o desenho
+     de um sitio que ninguem estava a olhar. */
+  background: transparent; border: 1px solid var(--line); border-radius: 10px;
 }
 .aba {
   flex: 1; padding: 9px 0; border: 0; border-radius: 7px; cursor: pointer;
@@ -1319,21 +1329,32 @@ body.ghost .app { transition: filter .8s var(--ease); }
   color: #fff;
   font: 700 11px/17px var(--ui);
   text-align: center;
-  box-shadow: 0 0 0 2px var(--bg);
+  /* SEM `box-shadow` AQUI, e a razao interessa.
+     A primeira versao tinha `box-shadow: 0 0 0 2px var(--bg)` -- e `--bg` NAO EXISTE nesta
+     folha. Uma variavel indefinida sem valor de recurso torna a declaracao INVALIDA: o anel
+     nunca chegou a ser desenhado e nada o dizia. As variaveis de fundo daqui chamam-se
+     --rail, --sidebar e --chat.
+     E como o anel tem de ser da cor do que esta POR BAIXO, ele nao pode viver aqui: vive em
+     cada sitio onde a bolha aparece. */
   flex: 0 0 auto;
 }
 
 /* O invólucro existe porque o `.rail__pill` é redondo com o canto arredondado a animar:
  * uma bolha lá dentro ficava cortada na borda. */
 .rail__slot { position: relative; display: grid; place-items: center; }
-.rail__slot .bolha { position: absolute; right: -3px; bottom: -2px; }
+.rail__slot .bolha { position: absolute; right: -3px; bottom: -2px; box-shadow: 0 0 0 2px var(--rail); }
 
 #btn-privado { position: relative; }
-#btn-privado .bolha { position: absolute; right: -3px; bottom: -2px; }
+#btn-privado .bolha { position: absolute; right: -3px; bottom: -2px; box-shadow: 0 0 0 2px var(--rail); }
 
 .chan.tem-novas { color: #fff; font-weight: 600; }
 .chan.tem-novas .chan__glyph { color: var(--mist); }
-.chan .bolha, .member .bolha { margin-left: auto; }
+/* SO A BOLHA leva `margin-left:auto`. Com duas margens automaticas na mesma linha flex, o
+   espaco livre e repartido pelas duas — e o `.chan__x` (o × de apagar canal), que ja tinha a
+   sua, saltava para o meio do nome. A bolha fica encostada a direita e o × ao lado dela. */
+.member .bolha { margin-left: auto; box-shadow: 0 0 0 2px var(--sidebar); }
+.chan .bolha { margin-left: 0; box-shadow: 0 0 0 2px var(--sidebar); }
+.chan__x { margin-left: auto; }
 .member.tem-novas b { color: #fff; font-weight: 700; }
 
 /* A linha de «novas mensagens». Corta a conversa ao meio, onde a leitura parou. */

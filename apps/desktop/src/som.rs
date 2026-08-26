@@ -303,7 +303,7 @@ mod win {
             // Existe para o diagnóstico poder distinguir "os parâmetros não chegam" de
             // "chegam e a exclusão não faz o que eu penso" — com INCLUDE, se o nosso tom
             // aparecer, os parâmetros chegam de certeza.
-            ProcessLoopbackMode: if std::env::var("BRUMA_SO_NOS").is_ok() {
+            ProcessLoopbackMode: if crate::bandeiras::so_nos() {
                 PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
             } else {
                 PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
@@ -343,7 +343,7 @@ mod win {
     unsafe fn abrir_cliente() -> Result<Aberto> {
         // `BRUMA_ECO_ANTIGO=1` força o caminho de endpoint. É o CONTROLO do teste: se
         // nem ele ouvir o que a app toca, o problema está no teste e não na exclusão.
-        if std::env::var("BRUMA_ECO_ANTIGO").is_ok() {
+        if crate::bandeiras::eco_antigo() {
             eprintln!("[som] a usar o loopback de endpoint, a pedido");
         } else {
             match tentar_sem_eco() {
@@ -588,9 +588,7 @@ mod win {
             // O dispositivo de som não morre a pedido, e um ramo que nunca corre é um
             // ramo por verificar — sobretudo este, que durante versões transformou uma
             // avaria em silêncio perfeito.
-            let morre_aos = std::env::var("BRUMA_SOM_MORRE")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok());
+            let morre_aos = crate::bandeiras::som_morre_aos();
 
             while !parar.load(Ordering::Relaxed) {
                 if let Some(s) = morre_aos {

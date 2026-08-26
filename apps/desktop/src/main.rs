@@ -5,6 +5,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bandeiras;
 mod comandos;
 mod ecra;
 mod estado;
@@ -116,7 +117,6 @@ macro_rules! handler_com {
             comandos::meu_endereco,
             comandos::saude,
             comandos::capacidades,
-            comandos::autoteste_pedido,
             comandos::autoteste_fps,
             comandos::autoteste_altura,
             comandos::autoteste_fonte,
@@ -131,8 +131,6 @@ macro_rules! handler_com {
             comandos::receber_voz,
             comandos::enviar_voz,
             comandos::qualidade,
-            comandos::autoteste_par,
-            comandos::medir_ui_pedido,
             comandos::comecar_a_partilhar,
             comandos::parar_de_partilhar,
             fontes::fontes_de_partilha,
@@ -154,7 +152,23 @@ macro_rules! handler_com {
 /// release, e a lista de comandos é uma superfície que se mantém curta de propósito.
 #[cfg(debug_assertions)]
 fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
-    handler_com![comandos::convites_de_teste, comandos::escapou_alguma_coisa]
+    handler_com![
+        comandos::convites_de_teste,
+        comandos::escapou_alguma_coisa,
+        // E os três que LIGAM os guiões de medição.
+        //
+        // `bruma.exe --medir-ui` numa instalação a sério fazia o guião correr na pasta de
+        // dados de quem instalou: acrescentar amigos, bloquear pessoas, mudar a política de
+        // quem pode escrever. Um andaime que escreve estado permanente na máquina de outra
+        // pessoa não é uma ferramenta, é uma armadilha — e eu tinha acabado de tirar os
+        // outros e deixado estes.
+        //
+        // Todas as chamadas do lado do JS já têm `.catch`, portanto sem os comandos o guião
+        // simplesmente não arranca. Não é preciso mexer na interface.
+        comandos::autoteste_pedido,
+        comandos::autoteste_par,
+        comandos::medir_ui_pedido
+    ]
 }
 
 #[cfg(not(debug_assertions))]

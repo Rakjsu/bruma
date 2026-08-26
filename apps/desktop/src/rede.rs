@@ -775,7 +775,7 @@ async fn sessao(
     // Uma sessão que morre ENTRE o registo e o stream é o caminho que deixava um par
     // inalcançável para sempre. Nesta máquina não acontece — a rede local não soluça —
     // por isso força-se, que é a única forma de o ramo deixar de estar por verificar.
-    if std::env::var("BRUMA_SESSAO_MORRE").is_ok() {
+    if crate::bandeiras::sessao_morre() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static JA: AtomicBool = AtomicBool::new(false);
         if !JA.swap(true, Ordering::Relaxed) {
@@ -901,9 +901,7 @@ async fn sessao(
         // Um sync real de milhares de mensagens demora; nesta maquina e instantaneo, e a
         // janela em que uma mensagem nova se podia perder fecharia sozinha sem nada provar.
         // Alarga-se de proposito para o teste de par a poder medir.
-        if let Ok(ms) = std::env::var("BRUMA_SYNC_LENTO")
-            .and_then(|v| v.parse::<u64>().map_err(|_| std::env::VarError::NotPresent))
-        {
+        if let Some(ms) = crate::bandeiras::sync_lento_ms() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
         escrever(&mut envia, &Msg::Sync { servidor, entradas }).await?;

@@ -193,7 +193,7 @@ mod win {
             // `BRUMA_SO_VIGIA=1` finge um ecrã parado: o tratador deixa de reagir ao sinal
             // e a paragem passa a depender SÓ do vigia. É a única forma de correr aqui o
             // caminho que, lá fora, acontece com uma janela minimizada.
-            if self.parar.load(Ordering::Relaxed) && std::env::var("BRUMA_SO_VIGIA").is_err() {
+            if self.parar.load(Ordering::Relaxed) && !crate::bandeiras::so_vigia() {
                 // O veredicto da CAPTURA. O relógio da média fica do lado do codificador,
                 // que o imprime quando fecha — aqui já não se lhe pode perguntar nada.
                 let s = self.inicio.elapsed().as_secs_f64().max(0.001);
@@ -383,7 +383,7 @@ mod win {
             // `BRUMA_SEM_TRAVAO=1` finge um Windows sem esta API. Existe porque o ramo do
             // Windows antigo NUNCA corre na máquina onde isto se escreve, e um ramo que
             // nunca corre é um ramo por verificar — foi assim que este bug entrou.
-            if std::env::var("BRUMA_SEM_TRAVAO").is_ok() {
+            if crate::bandeiras::sem_travao() {
                 eprintln!("[ecrã] a fingir um Windows sem travão de ritmo, a pedido");
                 return false;
             }
@@ -473,10 +473,7 @@ mod win {
             // `BRUMA_CODIFICADOR_MORRE=20` faz o codificador desistir ao vigésimo frame.
             // É a única forma de correr aqui o caminho da morte a meio — o mesmo motivo das
             // outras bandeiras: um ramo que nunca corre é um ramo por verificar.
-            let morre_ao: u64 = std::env::var("BRUMA_CODIFICADOR_MORRE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let morre_ao: u64 = crate::bandeiras::codificador_morre_ao().unwrap_or(0);
             let mut feitos = 0u64;
             while let Ok(t) = recebe.recv() {
                 feitos += 1;
@@ -621,7 +618,7 @@ mod win {
             // ter respondido `Ok`. É o único caminho de falha que não se consegue provocar
             // de fora, e era exactamente o que ficava invisível: sem consola em release, a
             // interface dizia "estás a partilhar" para sempre.
-            let controlo = if std::env::var("BRUMA_FALHA_CAPTURA").is_ok() {
+            let controlo = if crate::bandeiras::falha_captura() {
                 Err(windows_capture::capture::GraphicsCaptureApiError::FailedToJoinThread)
             } else {
                 controlo

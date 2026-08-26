@@ -69,13 +69,32 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     let mut nomes: std::collections::BTreeMap<String, String> = Default::default();
 
     for s in servidores.values() {
-        let e = s.estado();
+        let (e, entradas) = s.estado_e_entradas();
         for m in &e.membros {
             nomes
                 .entry(m.chave.clone())
                 .or_insert_with(|| m.nome.clone());
         }
-        let por_ler = s.nao_lidos(&eu, &lido);
+        // Os canais que esta pessoa consegue mesmo abrir. Numa conversa há um só, e é
+        // sintético; num servidor são os de TEXTO que existem agora.
+        //
+        // Há aqui um ovo e uma galinha: os canais saem do estado, e o estado sai da mesma
+        // passagem que a contagem. Resolve-se pedindo o estado uma vez e derivando as duas
+        // coisas dele — que é o que o `estado_e_por_ler` faz. Antes eram duas decifragens
+        // completas do log por servidor, com o lock de TODOS os servidores preso durante as
+        // duas; o por-ler tinha dobrado o custo do caminho mais quente da app.
+        let contaveis: std::collections::BTreeSet<String> = if s.com.is_some() {
+            [modelo::CANAL_DA_CONVERSA.to_string()]
+                .into_iter()
+                .collect()
+        } else {
+            e.canais
+                .iter()
+                .filter(|c| matches!(c.tipo, modelo::TipoCanal::Texto))
+                .map(|c| c.id.clone())
+                .collect()
+        };
+        let por_ler = s.por_ler_das_entradas(&entradas, &eu, &lido, &contaveis);
         match &s.com {
             None => vistas.push(VistaServidor {
                 id: s.id.clone(),
@@ -312,12 +331,27 @@ pub fn escapou_alguma_coisa(app: State<Arc<App>>) -> R<String> {
 /// desenhar a linha de «novas mensagens» no sítio certo. Se devolvesse o valor novo, a linha
 /// aparecia sempre no fim e não servia para nada.
 #[tauri::command]
-pub fn marcar_lido(servidor: String, canal: String, app: State<Arc<App>>) -> R<i64> {
+pub fn marcar_lido(
+    servidor: String,
+    canal: String,
+    marcar: Option<bool>,
+    app: State<Arc<App>>,
+) -> R<i64> {
     let antes = app.lido_ate(&servidor, &canal);
+    // `marcar: false` só quer saber até onde estava lido, sem mexer em nada.
+    //
+    // Existe porque marcar como lido tem de depender de a janela estar À FRENTE: uma
+    // mensagem que chega ao canal aberto enquanto eu estou noutra aplicação era marcada como
+    // lida pelo redesenho e nunca chegava a gerar aviso nenhum — a app dava-a por vista sem
+    // ninguém a ter visto. Mas a interface continua a precisar do valor para saber onde pôr
+    // a linha de «novas mensagens».
+    if marcar == Some(false) {
+        return Ok(antes);
+    }
     let ate = {
         let s = app.servidores.lock().map_err(erro)?;
         match s.get(&servidor) {
-            Some(srv) => srv.ultima_mensagem(&canal),
+            Some(srv) => srv.ultima_mensagem(&canal, &app.minha_chave()),
             None => return Ok(antes),
         }
     };
@@ -1025,6 +1059,7 @@ pub static ECRA: std::sync::OnceLock<Arc<Ecra>> = std::sync::OnceLock::new();
 /// Quantos segundos deve durar o autoteste, ou 0 se não foi pedido.
 /// `--autoteste` faz 6 segundos; `--autoteste=30` faz trinta — útil para ver se a memória
 /// se aguenta numa partilha longa, que é coisa que seis segundos nunca mostram.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn autoteste_pedido() -> u32 {
     for a in std::env::args() {
@@ -1252,6 +1287,7 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
 /// meio: a lista de quem está na sala, o datagrama a atravessar, e o pedaço a chegar ao
 /// descodificador do outro lado. Com duas instâncias emparelhadas isso passa a ser
 /// verificável sem ninguém a clicar em nada.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn autoteste_par() -> Option<String> {
     for a in std::env::args() {
@@ -1270,6 +1306,7 @@ pub fn autoteste_par() -> Option<String> {
 /// Existe porque fotografar a janela não serve para isto: o `PrintWindow` devolve a
 /// WebView2 incompleta, e trazê-la à frente a partir de outro processo é bloqueado pelo
 /// Windows. Perguntar ao DOM onde estão os elementos é exato e não depende de pixels.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn medir_ui_pedido() -> bool {
     std::env::args().any(|a| a == "--medir-ui")
