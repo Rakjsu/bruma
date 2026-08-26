@@ -804,18 +804,146 @@ const PAINEIS = {
     nome: 'Permissões de mensagens',
     grupo: 'Definições do utilizador',
     ico: '<path d="M3 3.4h10v7.2H6.4L3.4 13Z"/>',
-    vazia: true,
-    desenha: painel => {
+    desenha: async painel => {
       painel.append(elemento('h2', null, 'Permissões de mensagens'));
-      painel.append(aindaNaoHa('Não há sistema de permissões.',
-        'Qualquer membro de um servidor pode criar e apagar canais, e não há forma de '
-        + 'expulsar ninguém. E há uma razão para isto vir depois e não antes: o convite '
-        + 'carrega a chave que decifra o servidor e nunca expira — enquanto essa chave não '
-        + 'puder rodar, qualquer expulsão seria teatro, porque o expulso continuaria a '
-        + 'decifrar tudo o que fosse escrito a seguir.'));
+      painel.append(elemento('p', null,
+        'Não há directório: ninguém te encontra sem já ter a tua chave. Isto é sobre o que '
+        + 'acontece a quem já a tem.'));
+
+      const p = await invoke('permissoes')
+        .catch(() => ({ bloqueados: [], quem_escreve: 'todos' }));
+
+      const s1 = seccao('Quem me pode abrir uma conversa');
+      const opcoes = [
+        ['todos', 'Toda a gente que tenha a minha chave',
+          'Como sempre foi. Sem directório, isso já é um grupo pequeno: quem não a tem não '
+          + 'te alcança.'],
+        ['salas', 'Só quem partilha uma sala comigo, e os amigos',
+          'É o critério que o Discord usa — e aqui é exacto, porque partilhar uma sala '
+          + 'prova-se com a chave dela, e não com uma lista que alguém mantém.'],
+        ['amigos', 'Só quem eu pus na minha lista',
+          'O mais fechado. Uma pessoa nova tem de entrar primeiro na lista de amigos.'],
+      ];
+      for (const [valor, titulo, explica] of opcoes) {
+        const l = elemento('label', 'def__linha');
+        const r = document.createElement('input');
+        r.type = 'radio';
+        r.name = 'quem-escreve';
+        r.value = valor;
+        r.checked = p.quem_escreve === valor;
+        r.onchange = async () => {
+          await invoke('definir_quem_escreve', { politica: valor })
+            .catch(e => alert(String(e)));
+          await mostrarPainel('permissoes');
+        };
+        l.append(r);
+        const t = elemento('span');
+        t.append(elemento('b', null, titulo));
+        t.append(elemento('i', null, explica));
+        l.append(t);
+        s1.append(l);
+      }
+      s1.append(elemento('p', 'nota',
+        'Isto decide quem consegue COMEÇAR uma conversa contigo. Quem já tem uma aberta '
+        + 'continua a poder escrever nela — fechar essa porta é bloquear.'));
+      painel.append(s1);
+
+      const s2 = seccao('Bloqueados');
+      s2.append(elemento('p', 'nota',
+        'O bloqueio é LOCAL: deixas de aceitar o que ele manda, não o impedes de tentar. '
+        + 'Não há servidor no meio para o impedir por ti. Em compensação, ele não distingue '
+        + 'estar bloqueado de tu estares desligado — a ligação fecha-se sem uma palavra.'));
+
+      const linha = elemento('div', 'caixa__acoes');
+      linha.style.cssText = 'justify-content:flex-start;flex-wrap:wrap';
+      const inB = document.createElement('input');
+      inB.placeholder = 'a chave de quem queres recusar';
+      inB.style.cssText = 'flex:1 1 320px;min-width:0';
+      const btB = elemento('button', 'btn btn--perigo', 'Bloquear');
+      const notaB = elemento('span', 'nota');
+      btB.onclick = async () => {
+        try {
+          await invoke('bloquear', { chave: inB.value, sim: true });
+          inB.value = '';
+          await mostrarPainel('permissoes');
+        } catch (e) { notaB.textContent = String(e); }
+      };
+      linha.append(inB, btB, notaB);
+      s2.append(linha);
+
+      if (!p.bloqueados.length) {
+        s2.append(elemento('p', 'nota', 'Não bloqueaste ninguém.'));
+      } else {
+        for (const c of p.bloqueados) {
+          const l = elemento('div', 'member');
+          l.style.cssText = 'margin:4px 0;align-items:center';
+          const av = elemento('span', 'ident');
+          pintar(av, c);
+          const t = elemento('span');
+          t.append(elemento('b', null, nomeDoPeer(c)));
+          t.append(elemento('i', null, chaveCurta(c)));
+          const bt = elemento('button', 'btn', 'Desbloquear');
+          bt.onclick = async () => {
+            await invoke('bloquear', { chave: c, sim: false }).catch(e => alert(String(e)));
+            await mostrarPainel('permissoes');
+          };
+          l.append(av, t, bt);
+          s2.append(l);
+        }
+        s2.append(elemento('p', 'nota',
+          'Bloquear alguém tira-o também da lista de amigos: tê-lo nas duas seria a app a '
+          + 'dizer duas coisas contrárias sobre a mesma pessoa.'));
+      }
+      painel.append(s2);
+
+      const s3 = seccao('Ter a certeza de com quem falas');
+      s3.append(elemento('p', 'nota',
+        'Ninguém garante que uma chave é de quem julgas — não há servidor a dizer «este é o '
+        + 'João». Compara a chave com a pessoa por outro caminho, e marca-a como verificada '
+        + 'na lista de amigos.'));
+      const a3 = elemento('div', 'caixa__acoes');
+      a3.style.justifyContent = 'flex-start';
+      const ir = elemento('button', 'btn', 'Ver a lista de amigos');
+      ir.onclick = () => {
+        fecharDefinicoes();
+        conversaAtual = null;
+        irParaPrivado();
+      };
+      a3.append(ir);
+      s3.append(a3);
+      painel.append(s3);
+
+      const s4 = seccao('O que não existe aqui');
+      const nao = elemento('div', 'aviso');
+      nao.append(elemento('p', null,
+        'Filtros de conteúdo sensível e de spam: não há servidor a analisar nada — e não há '
+        + 'imagens. O que os substitui é a definição em cima: quem não te pode escrever, não '
+        + 'te escreve.'));
+      nao.append(elemento('p', null,
+        'Expulsar de um servidor: o convite carrega a chave que o decifra e nunca expira. '
+        + 'Enquanto essa chave não puder rodar, qualquer expulsão seria teatro — o expulso '
+        + 'continuaria a decifrar tudo o que fosse escrito a seguir.'));
+      nao.append(elemento('p', null,
+        'Amigos de amigos: obrigaria a mostrar a tua lista de amigos aos teus amigos. Ela '
+        + 'nunca sai desta máquina.'));
+      s4.append(nao);
+      painel.append(s4);
+
+      const s5 = seccao('O que uma conversa não esconde');
+      const custo = elemento('div', 'aviso');
+      custo.append(elemento('p', null,
+        'O teu IP, a quem se ligar directamente a ti — que é o caso normal, e o mais '
+        + 'rápido. Por relay não vê.'));
+      custo.append(elemento('p', null,
+        'Que falas com alguém, e quando: o relay vê que chaves falam entre si. Nunca vê o '
+        + 'conteúdo.'));
+      custo.append(elemento('p', null,
+        'O passado, a quem obtiver a tua semente: a chave de uma conversa sai de um '
+        + 'Diffie-Hellman entre duas chaves fixas, e não roda.'));
+      s5.append(custo);
+      painel.append(s5);
     },
   },
-
   notificacoes: {
     nome: 'Notificações',
     grupo: 'Definições do utilizador',
@@ -4655,6 +4783,48 @@ function pararDeAssistir() {
       diz(`ui privado destino: sem-conversa=${JSON.stringify(destinoPrivado)}`
         + ` no-servidor=${destinoServidor ? 'canal ' + String(destinoServidor.canal).slice(0, 6) : 'nenhum'}`
         + ` voltou-a-servidor=${modo === 'servidor'}`);
+    }
+
+    // ---- as permissoes ---------------------------------------------------------
+    //
+    // O que se mede e o EFEITO, e nao o botao. Uma definicao de privacidade que so muda um
+    // valor guardado e pior do que nao existir: promete uma coisa e nao a faz.
+    {
+      const alguem = 'bb'.repeat(32);
+      const inicio = await invoke('permissoes');
+
+      // Bloquear tem de aparecer na lista E tirar a pessoa dos amigos, senao a app fica a
+      // dizer duas coisas contrarias sobre a mesma pessoa.
+      await invoke('adicionar_amigo', { chave: alguem, nome: 'a bloquear' }).catch(() => {});
+      const eraAmigo = (await invoke('amigos')).some(x => x.chave === alguem);
+      await invoke('bloquear', { chave: alguem, sim: true }).catch(() => {});
+      const dep = await invoke('permissoes');
+      const ficouAmigo = (await invoke('amigos')).some(x => x.chave === alguem);
+
+      // A politica tem de ficar guardada, e so aceitar o que conhece.
+      await invoke('definir_quem_escreve', { politica: 'salas' }).catch(() => {});
+      const politica = (await invoke('permissoes')).quem_escreve;
+      let recusouLixo = false;
+      try {
+        await invoke('definir_quem_escreve', { politica: 'seja-o-que-for' });
+      } catch (e) { recusouLixo = true; }
+
+      // Desbloquear devolve ao princípio.
+      await invoke('bloquear', { chave: alguem, sim: false }).catch(() => {});
+      const limpo = !(await invoke('permissoes')).bloqueados.includes(alguem);
+
+      let recusouChaveMa = false;
+      try {
+        await invoke('bloquear', { chave: 'nao-e-chave', sim: true });
+      } catch (e) { recusouChaveMa = true; }
+
+      await invoke('definir_quem_escreve', { politica: inicio.quem_escreve }).catch(() => {});
+      await invoke('remover_amigo', { chave: alguem }).catch(() => {});
+
+      diz(`ui permissoes: bloqueou=${dep.bloqueados.includes(alguem)}`
+        + ` era-amigo=${eraAmigo} deixou-de-ser=${!ficouAmigo}`
+        + ` politica-guardada=${politica === 'salas'} recusou-politica-invalida=${recusouLixo}`
+        + ` desbloqueou=${limpo} recusou-chave-invalida=${recusouChaveMa}`);
     }
 
     // ---- os amigos ------------------------------------------------------------

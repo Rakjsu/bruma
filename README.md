@@ -6,8 +6,8 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.14.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas e
-> uma lista de amigos.**
+> **Estado: v0.15.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> uma lista de amigos e permissões de mensagens.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
@@ -99,9 +99,19 @@ projectos morrem.
   pôr-te na lista dele não lhe dá nada: essa lista não é tua e tu nem a vês.
 - **A lista vive nesta máquina, e só aqui.** As 24 palavras recuperam a identidade, não os
   amigos. Sem servidor, não há de onde os trazer de volta — guarda-a com o resto da pasta.
-- **Não há bloqueio.** Quem tiver a tua chave pública pode abrir uma conversa contigo. Não
-  existe directório onde te procurar — a chave tem de te ser dada — mas também não existe,
-  ainda, forma de dizer «este não».
+- **O bloqueio é local, e é bom saber o que isso quer dizer.** Bloquear alguém faz o Bruma
+  recusar tudo o que vier dele e fechar a ligação que estiver aberta na altura. Não o impede
+  de tentar — não há servidor no meio para o impedir por ti. Em compensação, ele não
+  distingue estar bloqueado de tu estares desligado: a ligação fecha-se sem uma palavra.
+- **Podes escolher quem te pode abrir uma conversa:** toda a gente que tenha a tua chave, só
+  quem partilha uma sala contigo (mais os amigos), ou só os amigos. «Partilha uma sala»
+  aqui é exacto, e não uma lista que alguém mantém: prova-se com uma entrada que **decifra**
+  com a chave dessa sala, coisa que só quem recebeu o convite consegue. Assinar uma entrada
+  não chega — qualquer pessoa assina o que quiser com a sua própria chave.
+- **Isto decide quem pode COMEÇAR.** Quem já tem uma conversa aberta continua a poder
+  escrever nela; fechar essa porta é bloquear.
+- **Não há filtros de conteúdo nem de spam.** Não há servidor a analisar nada, e nem sequer
+  há imagens. O que os substitui é a definição acima.
 - **A chave de um amigo pode ser marcada como verificada**, depois de a comparares com ele
   por outro caminho. Enquanto não estiver, sabes que falas com quem tem aquela chave; não
   sabes se aquela chave é de quem julgas. Numa app sem directório, é isto que substitui «o

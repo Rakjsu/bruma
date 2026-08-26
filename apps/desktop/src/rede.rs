@@ -219,6 +219,37 @@ impl Rede {
         // lhe chega — que é a única forma de medir o que sai daqui para quem não devia
         // receber nada. Uma pessoa mal-intencionada só precisa do `EndpointId`, que vai em
         // qualquer convite que eu tenha criado; a bandeira só torna isso reproduzível.
+        // Bloquear alguem A MEIO de uma sessao viva -- que e o caso que o bloqueio no
+        // arranque nunca poe a prova, porque nessa altura ainda nao ha sessao nenhuma para
+        // derrubar. Sem isto, a medicao dizia "esta na lista" e ficava-se por ai.
+        if let Ok(alvo) = std::env::var("BRUMA_BLOQUEIA_TARDE") {
+            let app = Arc::clone(&app);
+            let rede = Arc::clone(&rede);
+            tokio::spawn(async move {
+                let espera = std::env::var("BRUMA_BLOQUEIA_TARDE_MS")
+                    .ok()
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(25_000);
+                tokio::time::sleep(std::time::Duration::from_millis(espera)).await;
+                let viva_antes = rede
+                    .ligacoes
+                    .lock()
+                    .map(|l| l.contains_key(alvo.trim()))
+                    .unwrap_or(false);
+                let r = crate::comandos::aplicar_bloqueio(&app, &rede, alvo.trim(), true);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let viva_depois = rede
+                    .ligacoes
+                    .lock()
+                    .map(|l| l.contains_key(alvo.trim()))
+                    .unwrap_or(false);
+                eprintln!(
+                    "[bloqueio-tarde] bloqueou={} sessao-viva-antes={viva_antes} sessao-viva-depois={viva_depois}",
+                    r.is_ok()
+                );
+            });
+        }
+
         if let Ok(alvo) = std::env::var("BRUMA_ESTRANHO") {
             let rede = rede.clone();
             let app = app.clone();
@@ -234,49 +265,88 @@ impl Rede {
                 if let Ok(sala) = std::env::var("BRUMA_ESTRANHO_SALA") {
                     let (srv, canal) = sala.split_once('/').unwrap_or((sala.as_str(), "x"));
 
+                    // O ataque tem de ser em DOIS ACTOS, e foi o que me faltou perceber:
+                    // o `aprender_dos_logs` corre uma vez, no arranque da sessao, ANTES do
+                    // lixo chegar. Semear e colher na mesma ligacao nunca podia funcionar --
+                    // e eu ia concluir que a defesa aguentava.
+                    // Acto 1 semeia e sai. Acto 2 volta com a MESMA chave e colhe.
+                    let acto: u8 = std::env::var("BRUMA_ESTRANHO_ACTO")
+                        .ok()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(0);
+
                     // Abrir-lhe uma conversa: era isso que me punha nos peers de um "servidor"
                     // dele e me dava direitos de sala.
-                    match app.abrir_conversa(alvo.trim()) {
-                        Err(e) => eprintln!("[estranho] nao consegui abrir conversa: {e}"),
-                        Ok(id) => {
-                            // E ESCREVER nela. Abrir do meu lado nao chega -- e a mensagem
-                            // que faz a conversa nascer do lado dele, e era isso que me
-                            // punha nos peers de um "servidor" dele.
-                            let entrada = {
-                                let mut sv = app.servidores.lock().unwrap();
-                                sv.get_mut(&id).and_then(|srv| {
-                                    srv.escrever(
-                                        &app.ident.signing,
-                                        &crate::modelo::Carga::Mensagem {
-                                            canal: crate::modelo::CANAL_DA_CONVERSA.into(),
-                                            texto: "abre-me a porta".into(),
-                                        },
-                                    )
-                                    .ok()
-                                })
-                            };
-                            if let Some(e) = entrada {
-                                rede.difundir(&id, e);
-                                eprintln!("[estranho] abri e escrevi numa conversa com ele");
+                    if acto != 2 {
+                        match app.abrir_conversa(alvo.trim()) {
+                            Err(e) => eprintln!("[estranho] nao consegui abrir conversa: {e}"),
+                            Ok(id) => {
+                                // E ESCREVER nela. Abrir do meu lado nao chega -- e a mensagem
+                                // que faz a conversa nascer do lado dele, e era isso que me
+                                // punha nos peers de um "servidor" dele.
+                                let entrada = {
+                                    let mut sv = app.servidores.lock().unwrap();
+                                    sv.get_mut(&id).and_then(|srv| {
+                                        srv.escrever(
+                                            &app.ident.signing,
+                                            &crate::modelo::Carga::Mensagem {
+                                                canal: crate::modelo::CANAL_DA_CONVERSA.into(),
+                                                texto: "abre-me a porta".into(),
+                                            },
+                                        )
+                                        .ok()
+                                    })
+                                };
+                                if let Some(e) = entrada {
+                                    rede.difundir(&id, e);
+                                    eprintln!("[estranho] abri e escrevi numa conversa com ele");
+                                }
                             }
                         }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                        // O LIXO ASSINADO. Escrevo no meu proprio servidor -- a entrada fica
+                        // assinada por mim e cifrada com a MINHA chave, que ele nao tem. Depois
+                        // mando-lha com o id da sala DELE a frente. O `merge` so verifica a
+                        // assinatura, portanto ela entra no ficheiro do log dele com o meu
+                        // `author` em claro. Na ligacao seguinte, o `aprender_dos_logs` lia esse
+                        // `author` e adoptava-me.
+                        let lixo = {
+                            let mut sv = app.servidores.lock().unwrap();
+                            sv.values_mut().find(|x| x.com.is_none()).and_then(|srv| {
+                                srv.escrever(
+                                    &app.ident.signing,
+                                    &crate::modelo::Carga::Mensagem {
+                                        canal: "x".into(),
+                                        texto: "lixo".into(),
+                                    },
+                                )
+                                .ok()
+                            })
+                        };
+                        if let Some(e) = lixo {
+                            let _ = rede.tx.send(Saida::Entrada(srv.to_string(), e));
+                            eprintln!("[estranho] semeei lixo assinado por mim na sala dele");
+                            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    // Primeiro dizer o nome da sala dele, que era o que bastava para eu ficar
-                    // inscrito nos peers — e a partir daí passar por membro em tudo o resto.
-                    let _ = rede.tx.send(Saida::SyncPara {
-                        para: alvo.trim().to_string(),
-                        servidor: srv.to_string(),
-                    });
-                    eprintln!("[estranho] disse o nome da sala {srv} sem ter a chave dela");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if acto != 1 {
+                        // Primeiro dizer o nome da sala dele, que era o que bastava para eu ficar
+                        // inscrito nos peers — e a partir daí passar por membro em tudo o resto.
+                        let _ = rede.tx.send(Saida::SyncPara {
+                            para: alvo.trim().to_string(),
+                            servidor: srv.to_string(),
+                        });
+                        eprintln!("[estranho] disse o nome da sala {srv} sem ter a chave dela");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    // E agora forjar presença. Se a inscrição pegou, isto passa o porteiro.
-                    let _ = rede
-                        .tx
-                        .send(Saida::Presenca(srv.to_string(), Some(canal.to_string())));
-                    eprintln!("[estranho] forjei presença em {srv}/{canal}");
+                        // E agora forjar presença. Se a inscrição pegou, isto passa o porteiro.
+                        let _ = rede
+                            .tx
+                            .send(Saida::Presenca(srv.to_string(), Some(canal.to_string())));
+                        eprintln!("[estranho] forjei presença em {srv}/{canal}");
+                    }
                 }
 
                 // E injectar som nas colunas dele.
@@ -500,6 +570,11 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     let peer = &id.to_string();
     // Já ligado, ou a ligar: não se abre uma segunda. A reserva tem de acontecer AGORA e
     // não quando a ligação ficar pronta — ver o comentário de `a_ligar`.
+    // Não se disca para quem se bloqueou: o vigia lê a lista dos servidores, e um bloqueado
+    // pode continuar lá dentro.
+    if app.e_bloqueado(peer) {
+        return Ok(());
+    }
     if !reservar(&rede.ligacoes, &rede.a_ligar, peer) {
         return Ok(());
     }
@@ -600,6 +675,23 @@ async fn sessao(
     // O par sabe-se assim que a ligação existe, antes de haver stream nenhum. Registar
     // aqui — e não lá em baixo — é o que fecha a janela em que duas sessões coexistem.
     let peer = conn.remote_id().to_string();
+
+    // O BLOQUEIO É A PRIMEIRA COISA, antes de tudo o resto.
+    //
+    // Fecha-se a ligação sem uma palavra: sem `Ola`, sem nome, sem sequer o `peer-ligado`.
+    // Assim ele não consegue distinguir estar bloqueado de eu estar desligado — o que é mais
+    // do que o Discord dá, e é a única vantagem de não haver servidor a informá-lo.
+    //
+    // E fica aqui em cima e não mais abaixo porque um guarda que corre depois de já se ter
+    // dito «olá» já disse «olá».
+    if app.e_bloqueado(&peer) {
+        conn.close(0u32.into(), b"bloqueado");
+        if let Ok(mut fila) = rede.a_ligar.lock() {
+            fila.remove(&peer);
+        }
+        return Ok(());
+    }
+
     if let Ok(mut fila) = rede.a_ligar.lock() {
         fila.remove(&peer);
     }
@@ -936,7 +1028,13 @@ async fn sessao(
                         // não tinha a chave não lia o conteúdo, mas ficava a saber que eu
                         // acabara de escrever, onde, e a que horas.
                         Saida::Entrada(servidor, entrada) => {
-                            if participa(&app, &servidor, &peer) {
+                            // A mesma excepção do simulador de ataque que já existe para a
+                            // presença: sem ela o atacante é travado à SAÍDA, o alvo nunca
+                            // chega a ser posto à prova, e conclui-se que a defesa aguenta
+                            // quando o ataque nem saiu de casa. Foi o que me aconteceu três
+                            // vezes hoje.
+                            let ataque = std::env::var("BRUMA_ESTRANHO").is_ok();
+                            if ataque || participa(&app, &servidor, &peer) {
                                 Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
                             } else {
                                 None
@@ -1100,7 +1198,15 @@ fn aprender_dos_logs(app: &Arc<App>, peer: &str) {
         };
         let mut aprendi = false;
         for srv in s.values_mut() {
-            if srv.log.escreveu(peer) && !srv.peers.iter().any(|p| p == peer) {
+            // `escreveu` NÃO chega, e foi o meu engano: ele lê o campo `author`, que está
+            // em claro, e o `merge` só verifica a assinatura. Ou seja, qualquer pessoa
+            // anexa uma entrada de lixo assinada por si própria, volta a ligar-se, e este
+            // caminho punha-a nos `peers` — exactamente o que eu tinha acabado de fechar no
+            // `aplicar`. Fechei uma porta e deixei a gémea aberta ao lado.
+            //
+            // A prova é a mesma nos dois sítios: uma entrada que DECIFRA, o que exige a
+            // chave da sala.
+            if srv.autores_provados().contains(peer) && !srv.peers.iter().any(|p| p == peer) {
                 srv.peers.push(peer.to_string());
                 aprendi = true;
             }
@@ -1147,6 +1253,15 @@ fn aplicar(
             _ => None,
         };
         if nosso.as_deref() != Some(servidor) {
+            return;
+        }
+        // E ele tem de poder escrever-me. É aqui que a política vive: uma conversa nova é
+        // exactamente o momento em que alguém que eu não conheço me fala pela primeira vez.
+        if !app.pode_escrever_me(peer) {
+            eprintln!(
+                "[porteiro] {} quis abrir uma conversa e a tua definição não deixa",
+                &peer[..8.min(peer.len())]
+            );
             return;
         }
         if let Err(e) = app.abrir_conversa(peer) {

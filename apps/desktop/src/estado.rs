@@ -104,6 +104,23 @@ pub struct Amigo {
     pub verificado: bool,
 }
 
+/// Quem me pode abrir uma conversa.
+///
+/// Não é o mesmo que «quem me pode encontrar»: ninguém me encontra sem ter a minha chave,
+/// porque não há directório. Isto é sobre o que acontece a quem JÁ a tem.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuemEscreve {
+    /// Qualquer pessoa que tenha a minha chave. É o que sempre foi.
+    #[default]
+    Todos,
+    /// Só quem partilha uma sala comigo — o critério que o Discord usa e que aqui é exacto,
+    /// porque partilhar uma sala prova-se com a chave dela.
+    Salas,
+    /// Só quem eu pus na minha lista.
+    Amigos,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Indice {
     #[serde(default)]
@@ -119,6 +136,15 @@ pub struct Indice {
     pub prekeys: BTreeMap<String, String>,
     #[serde(default)]
     pub amigos: Vec<Amigo>,
+    /// Chaves de quem eu recuso. **O bloqueio é local**: eu deixo de aceitar o que ele
+    /// manda, não o impeço de tentar. Não há servidor no meio para o impedir por mim.
+    ///
+    /// Em compensação, ele não distingue estar bloqueado de eu estar offline — o que é mais
+    /// do que o Discord dá.
+    #[serde(default)]
+    pub bloqueados: Vec<String>,
+    #[serde(default)]
+    pub quem_escreve: QuemEscreve,
 }
 
 pub struct Servidor {
@@ -200,6 +226,8 @@ pub struct App {
     pub servidores: Mutex<BTreeMap<String, Servidor>>,
     pub prekeys: Mutex<BTreeMap<String, String>>,
     pub amigos: Mutex<Vec<Amigo>>,
+    pub bloqueados: Mutex<Vec<String>>,
+    pub quem_escreve: Mutex<QuemEscreve>,
 }
 
 impl App {
@@ -273,7 +301,19 @@ impl App {
             servidores: Mutex::new(servidores),
             prekeys: Mutex::new(indice.prekeys),
             amigos: Mutex::new(indice.amigos),
+            bloqueados: Mutex::new(indice.bloqueados),
+            quem_escreve: Mutex::new(indice.quem_escreve),
         };
+
+        if let Ok(chave) = std::env::var("BRUMA_BLOQUEIA") {
+            match app.bloquear(&chave, true) {
+                Ok(()) => eprintln!(
+                    "[bloqueio] {} recusado pela linha de comandos",
+                    &chave[..8.min(chave.len())]
+                ),
+                Err(e) => eprintln!("[bloqueio] não consegui bloquear: {e}"),
+            }
+        }
 
         if let Some(chave) = amigo_de_teste {
             match app.adicionar_amigo(&chave, "amigo de teste") {
@@ -336,6 +376,79 @@ impl App {
         m.insert(peer.to_string(), x_pub.to_string());
         drop(m);
         self.gravar_indice()
+    }
+
+    pub fn e_amigo(&self, chave: &str) -> bool {
+        self.amigos
+            .lock()
+            .map(|a| a.iter().any(|x| x.chave == chave))
+            .unwrap_or(false)
+    }
+
+    /// Se recuso tudo o que vem desta chave.
+    ///
+    /// Consultado à porta: uma ligação de alguém bloqueado fecha-se antes de dizer «olá», e
+    /// por isso ele não consegue distinguir isto de eu estar desligado.
+    pub fn e_bloqueado(&self, chave: &str) -> bool {
+        self.bloqueados
+            .lock()
+            .map(|b| b.iter().any(|x| x == chave))
+            .unwrap_or(false)
+    }
+
+    pub fn bloquear(&self, chave: &str, sim: bool) -> Result<()> {
+        let chave = chave.trim().to_lowercase();
+        hex32(&chave).map_err(|_| anyhow!("isso não é uma chave"))?;
+        if chave == self.minha_chave() {
+            bail!("essa chave é a tua");
+        }
+        {
+            let mut b = self.bloqueados.lock().unwrap();
+            b.retain(|x| x != &chave);
+            if sim {
+                b.push(chave.clone());
+            }
+        }
+        // Bloquear é também deixar de ser amigo. Ter alguém nas duas listas seria a app a
+        // dizer duas coisas contrárias sobre a mesma pessoa, e uma delas ia ganhar em
+        // silêncio.
+        if sim {
+            self.amigos.lock().unwrap().retain(|x| x.chave != chave);
+        }
+        self.gravar_indice()
+    }
+
+    /// Se esta pessoa pode abrir-me uma conversa, segundo a política escolhida.
+    pub fn pode_escrever_me(&self, chave: &str) -> bool {
+        if self.e_bloqueado(chave) {
+            return false;
+        }
+        // O valor COPIADO, e o lock largado antes de se pedir outro.
+        //
+        // Com `match *self.quem_escreve.lock()...` o guard sobrevive até ao fim do `match`,
+        // e lá dentro pedem-se `amigos` e `servidores`. O `gravar_indice` toma-os pela ordem
+        // contrária — e dois threads com ordens contrárias param os dois, para sempre, sem
+        // um erro em lado nenhum. A app congelava, e só com a política em Amigos ou Salas.
+        //
+        // Copiar e largar faz esta função nunca segurar mais do que um lock de cada vez, e
+        // aí não há ciclo possível seja qual for a ordem dos outros.
+        let politica = *self.quem_escreve.lock().unwrap();
+        match politica {
+            QuemEscreve::Todos => true,
+            QuemEscreve::Amigos => self.e_amigo(chave),
+            QuemEscreve::Salas => {
+                self.e_amigo(chave)
+                    || self
+                        .servidores
+                        .lock()
+                        .map(|s| {
+                            s.values()
+                                .filter(|srv| srv.com.is_none())
+                                .any(|srv| srv.peers.iter().any(|p| p == chave))
+                        })
+                        .unwrap_or(false)
+            }
+        }
     }
 
     /// Põe alguém na lista. Guardar o nome que EU lhe dou, e não o que ele diz chamar-se.
@@ -442,10 +555,12 @@ impl App {
     }
 
     pub fn gravar_indice(&self) -> Result<()> {
-        let servidores = self.servidores.lock().unwrap();
-        let indice = Indice {
-            nome: self.nome.lock().unwrap().clone(),
-            servidores: servidores
+        // Recolher primeiro, e largar. Isto segurava `servidores` durante a serialização, a
+        // cifra e a escrita no disco, enquanto ia pedindo os outros quatro — uma janela larga
+        // para outro thread ficar preso do outro lado.
+        let guardados: Vec<ServidorGuardado> = {
+            let servidores = self.servidores.lock().unwrap();
+            servidores
                 .values()
                 .map(|s| ServidorGuardado {
                     id: s.id.clone(),
@@ -453,9 +568,15 @@ impl App {
                     peers: s.peers.clone(),
                     com: s.com.clone(),
                 })
-                .collect(),
+                .collect()
+        };
+        let indice = Indice {
+            nome: self.nome.lock().unwrap().clone(),
+            servidores: guardados,
             prekeys: self.prekeys.lock().unwrap().clone(),
             amigos: self.amigos.lock().unwrap().clone(),
+            bloqueados: self.bloqueados.lock().unwrap().clone(),
+            quem_escreve: *self.quem_escreve.lock().unwrap(),
         };
         // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
         let claro = serde_json::to_vec(&indice)?;
@@ -581,4 +702,63 @@ pub fn nova_chave_de_servidor() -> Result<[u8; 32]> {
 
 pub fn caminho_do_log(id: &str) -> PathBuf {
     raiz().join("servidores").join(format!("{id}.json"))
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Duas ordens de lock contrárias param os dois threads, para sempre, sem um erro.
+    ///
+    /// Este é o género de avaria que não aparece em nenhum registo: a app fica quieta, e a
+    /// única prova é o tempo a passar. Por isso o teste tem um cronómetro — se as duas voltas
+    /// não acabarem dentro do prazo, é porque se prenderam.
+    ///
+    /// Só se prende com a política em Amigos ou Salas, que são as que fazem o
+    /// `pode_escrever_me` pedir um segundo lock.
+    #[test]
+    fn duas_ordens_de_lock_nao_se_prendem() {
+        let dir = std::env::temp_dir().join(format!("bruma-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: um só teste toca nesta variável, e antes de qualquer thread arrancar.
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+
+        let app = Arc::new(App::arrancar().expect("arrancar"));
+        *app.quem_escreve.lock().unwrap() = QuemEscreve::Salas;
+
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let voltas = 4000;
+
+        let a = Arc::clone(&app);
+        let t1 = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..voltas {
+                let _ = a.pode_escrever_me("aa");
+            }
+            let _ = t1.send("escrever");
+        });
+
+        let b = Arc::clone(&app);
+        std::thread::spawn(move || {
+            for _ in 0..voltas {
+                let _ = b.gravar_indice();
+            }
+            let _ = tx.send("gravar");
+        });
+
+        let prazo = std::time::Duration::from_secs(30);
+        let mut acabaram = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(prazo) {
+                Ok(quem) => acabaram.push(quem),
+                Err(_) => panic!(
+                    "prendeu-se: só {} de 2 acabaram em {prazo:?} — ordens de lock contrárias",
+                    acabaram.len()
+                ),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -135,6 +135,68 @@ pub fn marcar_verificado(chave: String, verificado: bool, app: State<Arc<App>>) 
         .map_err(erro)
 }
 
+/// Quem eu recuso, e a política de quem me pode escrever.
+#[tauri::command]
+pub fn permissoes(app: State<Arc<App>>) -> R<serde_json::Value> {
+    Ok(serde_json::json!({
+        "bloqueados": app.bloqueados.lock().map_err(erro)?.clone(),
+        "quem_escreve": *app.quem_escreve.lock().map_err(erro)?,
+    }))
+}
+
+/// Bloquear é também FECHAR o que já está aberto.
+///
+/// A primeira versão disto só escrevia na lista, e a lista só é consultada quando uma ligação
+/// NOVA chega. Com uma sessão já aberta — que é o caso normal, porque quem incomoda alguém
+/// costuma estar a falar com essa pessoa nesse momento — não acontecia nada: ele continuava a
+/// escrever, e o som dele continuava a sair nas colunas, até a ligação cair sozinha. O QUIC
+/// mantém-se vivo com keepalives; podia durar horas.
+///
+/// A interface dizia «bloqueado» e não estava. É o pior que uma definição de privacidade pode
+/// fazer: dar a sensação em vez da coisa.
+#[tauri::command]
+pub fn bloquear(chave: String, sim: bool, app: State<Arc<App>>, rede: State<Arc<Rede>>) -> R<()> {
+    aplicar_bloqueio(&app, &rede, &chave, sim).map_err(erro)
+}
+
+/// O bloqueio, fora do comando, para que a medição corra o MESMO código que o botão.
+///
+/// Se o teste chamasse só o `app.bloquear`, provava a lista e não o efeito — e o efeito é
+/// precisamente a parte que faltava: guardar a chave numa lista não fecha a sessão que já
+/// está aberta, e enquanto ela não fechar a pessoa continua a escrever e a pôr som nas
+/// colunas.
+pub fn aplicar_bloqueio(
+    app: &Arc<App>,
+    rede: &Arc<Rede>,
+    chave: &str,
+    sim: bool,
+) -> anyhow::Result<()> {
+    let chave = chave.trim().to_lowercase();
+    app.bloquear(&chave, sim)?;
+    if sim {
+        if let Ok(l) = rede.ligacoes.lock() {
+            if let Some((c, _)) = l.get(&chave) {
+                // O `Drop` do guarda da sessão trata do resto: aborta as tarefas, tira-o do
+                // mapa e avisa a interface. A sessão morre como morreria uma nova.
+                c.close(0u32.into(), b"bloqueado");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn definir_quem_escreve(politica: String, app: State<Arc<App>>) -> R<()> {
+    let p = match politica.as_str() {
+        "todos" => estado::QuemEscreve::Todos,
+        "salas" => estado::QuemEscreve::Salas,
+        "amigos" => estado::QuemEscreve::Amigos,
+        _ => return Err("não conheço essa definição".into()),
+    };
+    *app.quem_escreve.lock().map_err(erro)? = p;
+    app.gravar_indice().map_err(erro)
+}
+
 /// Abre a conversa privada com alguém, ou devolve a que já existe.
 ///
 /// Não há convite: o id e a chave saem das duas identidades. O que pode faltar é a chave de
