@@ -234,6 +234,35 @@ impl Rede {
                 if let Ok(sala) = std::env::var("BRUMA_ESTRANHO_SALA") {
                     let (srv, canal) = sala.split_once('/').unwrap_or((sala.as_str(), "x"));
 
+                    // Abrir-lhe uma conversa: era isso que me punha nos peers de um "servidor"
+                    // dele e me dava direitos de sala.
+                    match app.abrir_conversa(alvo.trim()) {
+                        Err(e) => eprintln!("[estranho] nao consegui abrir conversa: {e}"),
+                        Ok(id) => {
+                            // E ESCREVER nela. Abrir do meu lado nao chega -- e a mensagem
+                            // que faz a conversa nascer do lado dele, e era isso que me
+                            // punha nos peers de um "servidor" dele.
+                            let entrada = {
+                                let mut sv = app.servidores.lock().unwrap();
+                                sv.get_mut(&id).and_then(|srv| {
+                                    srv.escrever(
+                                        &app.ident.signing,
+                                        &crate::modelo::Carga::Mensagem {
+                                            canal: crate::modelo::CANAL_DA_CONVERSA.into(),
+                                            texto: "abre-me a porta".into(),
+                                        },
+                                    )
+                                    .ok()
+                                })
+                            };
+                            if let Some(e) = entrada {
+                                rede.difundir(&id, e);
+                                eprintln!("[estranho] abri e escrevi numa conversa com ele");
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
                     // Primeiro dizer o nome da sala dele, que era o que bastava para eu ficar
                     // inscrito nos peers — e a partir daí passar por membro em tudo o resto.
                     let _ = rede.tx.send(Saida::SyncPara {
@@ -1022,7 +1051,21 @@ fn peer_proprio(app: &Arc<App>) -> String {
 fn conhecido(app: &Arc<App>, peer: &str) -> bool {
     app.servidores
         .lock()
-        .map(|s| s.values().any(|srv| srv.peers.iter().any(|p| p == peer)))
+        .map(|s| {
+            s.values()
+                // Uma CONVERSA não conta. Ela é guardada como um servidor — é isso que a
+                // torna barata — mas não é uma sala partilhada: qualquer pessoa que tenha a
+                // minha chave pública abre uma comigo, e a minha chave é pública por
+                // desenho.
+                //
+                // Se contasse, a funcionalidade desfazia o porteiro construído para a
+                // proteger: bastava abrir-me uma conversa para ganhar o direito de me pôr
+                // som nas colunas e abrir descodificadores na minha máquina.
+                //
+                // O critério é partilhar uma SALA, e isso prova-se com a chave dela.
+                .filter(|srv| srv.com.is_none())
+                .any(|srv| srv.peers.iter().any(|p| p == peer))
+        })
         .unwrap_or(false)
 }
 
