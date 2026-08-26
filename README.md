@@ -6,7 +6,7 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.10.4 — texto, voz, partilha de ecrã com som, e câmara.**
+> **Estado: v0.13.0 — texto, voz, partilha de ecrã com som, câmara e conversas privadas.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
@@ -61,6 +61,10 @@ histórico de toda a gente fique acumulado à espera de ser pedido, vendido ou r
   com o som do sistema em AAC na mesma faixa, e traduzido para o dialecto que o navegador
   aceita. Só se envia a quem carregou em «Assistir».
 - **Câmara**: H.264 pela interface, várias ao mesmo tempo, pelo mesmo transporte do ecrã.
+- **Conversas privadas**: **não há convite**. O identificador da conversa sai das duas chaves
+  públicas (BLAKE3 sobre as duas, ordenadas) e a chave sai de um Diffie-Hellman x25519 entre
+  elas — os dois lados chegam ao mesmo sozinhos, sem trocar uma palavra sobre isso. Como não há
+  segredo a transportar, também não há nada que se possa reencaminhar a um terceiro.
 
 ## O que o Bruma **não** faz
 
@@ -82,7 +86,16 @@ projectos morrem.
   que é o caso normal e o desejável, porque é o mais rápido. Por relay não vê.
 - **O relay vê metadados**: que chaves falam entre si, quando e quanto. Nunca vê conteúdo.
 - **Se ninguém do canal estiver online, não há sincronização.** É o preço de não haver
-  servidor.
+  servidor. **Nas conversas privadas isto é mais apertado**: são duas pessoas, portanto uma
+  mensagem só chega quando os dois estiverem online ao mesmo tempo. Ela fica à espera na
+  máquina de quem escreveu, e vai quando puder — nada passa por terceiros, nem cifrado.
+- **Uma conversa privada também não tem *forward secrecy*.** A chave sai de um Diffie-Hellman
+  entre duas chaves fixas: quem obtiver a tua semente lê o passado todo. É a mesma limitação da
+  chave do servidor, e vale a pena repeti-la aqui porque é numa conversa privada que se espera
+  o contrário.
+- **Não há lista de amigos nem bloqueio.** Quem tiver a tua chave pública pode abrir uma
+  conversa contigo. Não existe directório onde te procurar — a chave tem de te ser dada — mas
+  também não existe forma de dizer «este não».
 - **Não é anonimato de rede.** Para isso precisas de VPN ou Tor por baixo.
 - **Não há anexos, imagens, editar, apagar, reacções, respostas, markdown, notificações nem
   não-lidas.** Só texto simples, uma linha de cada vez.
