@@ -411,6 +411,12 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                 continue;
             };
             let mut v: Vec<String> = s.values().flat_map(|x| x.peers.clone()).collect();
+            // E os amigos, que podem não partilhar sala nenhuma comigo. Sem isto, ter alguém
+            // na lista não servia de nada: nunca nos ligaríamos, e a conversa privada com
+            // quem não está num servidor meu nunca chegaria a acontecer.
+            if let Ok(a) = app.amigos.lock() {
+                v.extend(a.iter().map(|x| x.chave.clone()));
+            }
             v.sort();
             v.dedup();
             v
@@ -1049,6 +1055,18 @@ fn peer_proprio(app: &Arc<App>) -> String {
 }
 
 fn conhecido(app: &Arc<App>, peer: &str) -> bool {
+    // A AMIZADE NÃO ENTRA AQUI, e foi uma decisão tomada depois de a escrever.
+    //
+    // Pus `if e_amigo(peer) { return true }` no princípio desta função, com o argumento de
+    // que um amigo é alguém que eu escolhi. O argumento é bom e a consequência não: este
+    // porteiro decide quem me pode pôr som nas colunas em QUALQUER chamada, incluindo uma
+    // com colegas de um servidor onde o amigo não entra. Um datagrama de voz não leva sala
+    // nenhuma — é só uma chave e bytes.
+    //
+    // «Estou disposto a ligar-me a ti» não é «podes interromper qualquer conversa minha».
+    // E não se perde nada declarado: a amizade continua a dar ligação (é o vigia que disca)
+    // e conversa privada (que vai pelo `participa`, não por aqui). Voz fora de um servidor
+    // ainda não existe — quando existir, será com o consentimento de quem atende.
     app.servidores
         .lock()
         .map(|s| {

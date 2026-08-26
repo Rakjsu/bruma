@@ -75,6 +75,35 @@ pub struct ServidorGuardado {
     pub com: Option<String>,
 }
 
+/// Alguém que eu decidi conhecer.
+///
+/// # O que é uma amizade aqui, e o que não é
+///
+/// Não há servidor a mediar nada, portanto isto não é um estado partilhado entre duas
+/// pessoas: é uma **decisão minha, guardada na minha máquina**. Eu ter-te na lista quer dizer
+/// que eu estou disposto a ligar-me a ti — e ligar-me a ti mostra-te o meu IP quando a
+/// ligação é directa, que é o caso normal. Por isso é que a lista é minha e não é negociada:
+/// ninguém entra nela por me pedir.
+///
+/// O contrário também vale: alguém pôr-me na lista dele não lhe dá nada. O pedido que ele
+/// escreve é uma mensagem, e uma mensagem não abre portas.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Amigo {
+    /// A chave pública, que é ao mesmo tempo o endereço de rede.
+    pub chave: String,
+    /// O nome que EU lhe dei. Não é o que ele diz chamar-se — esse é auto-declarado e o
+    /// transporte não o prova. Este é o único que não se pode forjar, porque não viaja.
+    pub nome: String,
+    pub desde_ms: u64,
+    /// Se comparei a chave com ele por outro caminho — voz, papel, olhos nos olhos.
+    ///
+    /// Numa app sem directório, é isto que substitui «o servidor garante que este é o João».
+    /// Enquanto for falso, sabes que falas com quem tem aquela chave; não sabes se aquela
+    /// chave é de quem julgas.
+    #[serde(default)]
+    pub verificado: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Indice {
     #[serde(default)]
@@ -88,6 +117,8 @@ pub struct Indice {
     /// cifrado, e porque quem sabe com quem eu tenho prekeys sabe com quem eu falo.
     #[serde(default)]
     pub prekeys: BTreeMap<String, String>,
+    #[serde(default)]
+    pub amigos: Vec<Amigo>,
 }
 
 pub struct Servidor {
@@ -168,6 +199,7 @@ pub struct App {
     pub nome: Mutex<String>,
     pub servidores: Mutex<BTreeMap<String, Servidor>>,
     pub prekeys: Mutex<BTreeMap<String, String>>,
+    pub amigos: Mutex<Vec<Amigo>>,
 }
 
 impl App {
@@ -228,13 +260,30 @@ impl App {
             );
         }
 
+        // Um amigo posto pela linha de comandos, para se poder medir o que a amizade serve:
+        // falar com alguem com quem NAO se partilha servidor nenhum. Sem isto, o unico teste
+        // possivel seria entre duas pessoas do mesmo servidor -- onde a amizade nao muda nada
+        // e o teste passaria sem provar o que se afirma.
+        let amigo_de_teste = std::env::var("BRUMA_AMIGO").ok();
+
         let app = App {
             ident,
             semente,
             nome: Mutex::new(indice.nome),
             servidores: Mutex::new(servidores),
             prekeys: Mutex::new(indice.prekeys),
+            amigos: Mutex::new(indice.amigos),
         };
+
+        if let Some(chave) = amigo_de_teste {
+            match app.adicionar_amigo(&chave, "amigo de teste") {
+                Ok(()) => eprintln!(
+                    "[amigos] {} entrou na lista pela linha de comandos",
+                    &chave[..8.min(chave.len())]
+                ),
+                Err(e) => eprintln!("[amigos] não consegui pôr o amigo de teste: {e}"),
+            }
+        }
 
         // A CONVERSÃO ACONTECE AGORA, e não "na próxima gravação".
         //
@@ -286,6 +335,53 @@ impl App {
         }
         m.insert(peer.to_string(), x_pub.to_string());
         drop(m);
+        self.gravar_indice()
+    }
+
+    /// Põe alguém na lista. Guardar o nome que EU lhe dou, e não o que ele diz chamar-se.
+    pub fn adicionar_amigo(&self, chave: &str, nome: &str) -> Result<()> {
+        let chave = chave.trim().to_lowercase();
+        // Validar a chave AQUI e não mais tarde: uma entrada invalida na lista seria uma
+        // pessoa que o vigia tenta ligar para sempre e nunca alcança.
+        hex32(&chave)
+            .map_err(|_| anyhow!("isso não é uma chave: são 64 caracteres hexadecimais"))?;
+        if chave == self.minha_chave() {
+            bail!("essa chave é a tua");
+        }
+        let nome = nome.trim();
+        if nome.is_empty() {
+            bail!("dá-lhe um nome — é por ele que o vais reconhecer");
+        }
+        {
+            let mut a = self.amigos.lock().unwrap();
+            if let Some(ja) = a.iter_mut().find(|x| x.chave == chave) {
+                ja.nome = nome.to_string(); // renomear, e não duplicar
+            } else {
+                a.push(Amigo {
+                    chave,
+                    nome: nome.to_string(),
+                    desde_ms: agora_ms(),
+                    verificado: false,
+                });
+            }
+        }
+        self.gravar_indice()
+    }
+
+    pub fn remover_amigo(&self, chave: &str) -> Result<()> {
+        self.amigos.lock().unwrap().retain(|x| x.chave != chave);
+        self.gravar_indice()
+    }
+
+    /// Marca (ou desmarca) que a chave foi comparada por outro caminho.
+    pub fn marcar_verificado(&self, chave: &str, verificado: bool) -> Result<()> {
+        {
+            let mut a = self.amigos.lock().unwrap();
+            let Some(x) = a.iter_mut().find(|x| x.chave == chave) else {
+                bail!("essa pessoa não está na tua lista");
+            };
+            x.verificado = verificado;
+        }
         self.gravar_indice()
     }
 
@@ -359,6 +455,7 @@ impl App {
                 })
                 .collect(),
             prekeys: self.prekeys.lock().unwrap().clone(),
+            amigos: self.amigos.lock().unwrap().clone(),
         };
         // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
         let claro = serde_json::to_vec(&indice)?;

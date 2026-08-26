@@ -126,6 +126,21 @@ function servidor() {
   return vista.servidores.find(s => s.id === servidorAtual) || null;
 }
 
+/** Que conversa mostrar, dado o que estava escolhido e as que existem.
+ *
+ *  `null` é um estado ESTÁVEL, e não «nenhuma ainda»: quer dizer «estou na vista dos
+ *  Amigos». Sem essa distinção, clicar em «Amigos» punha isto a null e o redesenho seguinte
+ *  repunha logo a primeira conversa — a vista ficava inalcançável para quem já tivesse
+ *  falado com alguém, e com ela o único botão de remover alguém da lista.
+ *
+ *  Está à parte para se poder provar sem duas máquinas: é uma decisão, não um desenho.
+ */
+function qualConversa(atual, conversas) {
+  if (atual === null) return null;                       // Amigos, de propósito
+  if (conversas.some(c => c.id === atual)) return atual; // a escolhida ainda existe
+  return conversas[0] ? conversas[0].id : null;          // desapareceu: a primeira, ou Amigos
+}
+
 function conversa() {
   return (vista.conversas || []).find(c => c.id === conversaAtual) || null;
 }
@@ -158,6 +173,16 @@ function escolherConversa(id) {
 
 function desenharConversas() {
   const lista = $('#lista-canais');
+
+  // «Amigos» é o destino por omissão do modo privado, como no Discord. Sem conversa
+  // escolhida, é o que se vê.
+  const amg = elemento('div', 'chan');
+  if (conversaAtual === null) amg.classList.add('is-active');
+  amg.append(elemento('span', 'chan__glyph', '☺'));
+  amg.append(elemento('span', null, 'Amigos'));
+  amg.onclick = () => { conversaAtual = null; desenharTudo(); };
+  lista.append(amg);
+
   const g = elemento('div', 'group');
   g.append(elemento('div', 'group__label', 'Conversas'));
   lista.append(g);
@@ -363,12 +388,7 @@ async function desenharMensagensPrivadas() {
 
   if (!c) {
     $('#composer').hidden = true;
-    const v = elemento('div', 'vazio');
-    v.append(elemento('p', null, 'Escolhe uma conversa.'));
-    v.append(elemento('p', 'nota',
-      'Não há convite para começar uma: as duas chaves chegam. Clique direito numa pessoa '
-      + 'na lista de membros de um servidor.'));
-    stream.append(v);
+    await desenharAmigos(stream);
     return;
   }
 
@@ -381,6 +401,95 @@ async function desenharMensagensPrivadas() {
     anterior = m;
   }
   stream.scrollTop = stream.scrollHeight;
+}
+
+/** A lista de pessoas que EU decidi conhecer.
+ *
+ *  Não é um estado partilhado: é uma decisão minha, guardada aqui. Alguém pôr-me na lista
+ *  dele não me põe na minha — e é por isso que ninguém entra nesta por pedir. */
+async function desenharAmigos(stream) {
+  const lista = await invoke('amigos').catch(() => []);
+
+  const cab = elemento('div', 'vazio');
+  cab.style.textAlign = 'left';
+  cab.append(elemento('h3', null, 'Amigos'));
+  cab.append(elemento('p', 'nota',
+    'Não há directório onde te procurarem: quem não tiver a tua chave não te encontra. '
+    + 'Para adicionares alguém precisas da chave dele, e ele da tua.'));
+
+  // Adicionar por chave.
+  const form = elemento('div', 'caixa__acoes');
+  form.style.cssText = 'justify-content:flex-start;flex-wrap:wrap;margin-top:12px';
+  const inChave = document.createElement('input');
+  inChave.placeholder = 'a chave dele (64 caracteres)';
+  inChave.style.cssText = 'flex:1 1 320px;min-width:0';
+  const inNome = document.createElement('input');
+  inNome.placeholder = 'como lhe queres chamar';
+  inNome.style.cssText = 'flex:0 1 180px;min-width:0';
+  const bt = elemento('button', 'btn btn--primary', 'Adicionar');
+  const nota = elemento('span', 'nota');
+  bt.onclick = async () => {
+    try {
+      await invoke('adicionar_amigo', { chave: inChave.value, nome: inNome.value });
+      inChave.value = '';
+      inNome.value = '';
+      nota.textContent = '';
+      await desenharTudo();
+    } catch (e) { nota.textContent = String(e); }
+  };
+  form.append(inChave, inNome, bt, nota);
+  cab.append(form);
+  stream.append(cab);
+
+  if (!lista.length) {
+    const v = elemento('div', 'vazio');
+    v.append(elemento('p', null, 'Ainda não tens ninguém na lista.'));
+    v.append(elemento('p', 'nota',
+      'Podes também adicionar alguém pela lista de membros de um servidor: clique direito, '
+      + '"Adicionar aos amigos".'));
+    stream.append(v);
+    return;
+  }
+
+  for (const a of lista) {
+    const linha = elemento('div', 'member');
+    linha.dataset.chave = a.chave;
+    linha.style.cssText = 'margin:2px 8px;align-items:center';
+    const av = elemento('span', 'ident');
+    pintar(av, a.chave);
+    const txt = elemento('span');
+    txt.append(elemento('b', null, a.nome));
+    txt.append(elemento('i', null,
+      chaveCurta(a.chave) + (a.verificado ? ' · chave verificada' : ' · chave por verificar')));
+    linha.append(av, txt);
+
+    const acoes = elemento('span', 'caixa__acoes');
+    acoes.style.cssText = 'margin:0;gap:6px';
+    const falar = elemento('button', 'btn', 'Mensagem');
+    falar.onclick = async () => {
+      try {
+        const id = await invoke('abrir_conversa', { peer: a.chave });
+        await desenharTudo();
+        escolherConversa(id);
+      } catch (e) { alert(String(e)); }
+    };
+    // A verificação é o que substitui «o servidor garante que este é o João». Sem
+    // directório, é a única forma de saber que a chave é de quem julgas.
+    const ver = elemento('button', 'btn', a.verificado ? 'Desmarcar' : 'Verifiquei a chave');
+    ver.onclick = async () => {
+      await invoke('marcar_verificado', { chave: a.chave, verificado: !a.verificado })
+        .catch(e => alert(String(e)));
+      await desenharTudo();
+    };
+    const fora = elemento('button', 'btn btn--perigo', 'Remover');
+    fora.onclick = async () => {
+      await invoke('remover_amigo', { chave: a.chave }).catch(e => alert(String(e)));
+      await desenharTudo();
+    };
+    acoes.append(falar, ver, fora);
+    linha.append(acoes);
+    stream.append(linha);
+  }
 }
 
 function desenharTopo() {
@@ -427,8 +536,8 @@ async function desenharTudo() {
       const primeiro = s.canais.find(c => c.tipo === 'texto') || s.canais[0];
       canalAtual = primeiro ? primeiro.id : null;
     }
-  } else if (!conversa()) {
-    conversaAtual = (vista.conversas || [])[0] ? vista.conversas[0].id : null;
+  } else {
+    conversaAtual = qualConversa(conversaAtual, vista.conversas || []);
   }
 
   desenharRail();
@@ -1569,6 +1678,11 @@ function ajustarTodosOsVolumes() {
     if (bytes.length < 1 + n) return;
     const chave = new TextDecoder().decode(bytes.subarray(1, 1 + n));
     if (!voz.canal) return;                 // não estamos numa sala: ignora-se
+    // E tem de estar NESTA sala. O único filtro era «eu estou numa chamada» — não «quem
+    // manda também está». Um datagrama de voz não leva sala nenhuma consigo, é só uma chave
+    // e bytes, portanto quem passe o porteiro do Rust falava em qualquer conversa minha,
+    // mesmo sem lá estar. A lista de presentes é o que distingue quem está de quem não está.
+    if (voz.presentes.get(chave) !== voz.canal) return;
     const v = vozDe(chave);
     if (v.descodificador.state !== 'configured') return;
     try {
@@ -1791,6 +1905,17 @@ document.addEventListener('contextmenu', ev => {
     // Uma linha, e serve os três sítios que mostram pessoas — a lista de membros, quem está
     // na chamada e as fotinhas — porque todos põem a chave no `data-chave`.
     if (chave !== vista.chave) {
+      itens.push({
+        rotulo: 'Adicionar aos amigos',
+        accao: async () => {
+          const nome = prompt('Que nome lhe queres dar?', nomeDoPeer(chave));
+          if (!nome) return;
+          try {
+            await invoke('adicionar_amigo', { chave, nome });
+            await desenharTudo();
+          } catch (e) { alert(String(e)); }
+        },
+      });
       itens.push({
         rotulo: 'Mensagem privada',
         accao: async () => {
@@ -4530,6 +4655,125 @@ function pararDeAssistir() {
       diz(`ui privado destino: sem-conversa=${JSON.stringify(destinoPrivado)}`
         + ` no-servidor=${destinoServidor ? 'canal ' + String(destinoServidor.canal).slice(0, 6) : 'nenhum'}`
         + ` voltou-a-servidor=${modo === 'servidor'}`);
+    }
+
+    // ---- os amigos ------------------------------------------------------------
+    //
+    // Uma lista de amigos e uma DECISAO minha guardada na minha maquina, e o que se mede e
+    // que cada controlo faz mesmo o que diz -- nao que o botao existe.
+    {
+      const falso = 'aa'.repeat(32);
+      const antes = (await invoke('amigos')).length;
+      await invoke('adicionar_amigo', { chave: falso, nome: 'Alguem' }).catch(() => {});
+      const depois = await invoke('amigos');
+      const posto = depois.find(x => x.chave === falso);
+
+      // Adicionar duas vezes RENOMEIA, nao duplica -- senao a lista enche-se de repetidos.
+      await invoke('adicionar_amigo', { chave: falso, nome: 'Outro nome' }).catch(() => {});
+      const depois2 = await invoke('amigos');
+      const repetidos = depois2.filter(x => x.chave === falso).length;
+      const renomeou = (depois2.find(x => x.chave === falso) || {}).nome === 'Outro nome';
+
+      // A verificacao da chave tem de ficar guardada.
+      await invoke('marcar_verificado', { chave: falso, verificado: true }).catch(() => {});
+      const marcado = ((await invoke('amigos')).find(x => x.chave === falso) || {}).verificado;
+
+      // E o que tem de ser recusado.
+      const recusas = [];
+      for (const [c, n, porque] of [
+        [vista.chave, 'eu', 'a minha propria chave'],
+        ['nao-e-uma-chave', 'x', 'lixo'],
+        [falso, '   ', 'sem nome'],
+      ]) {
+        try {
+          await invoke('adicionar_amigo', { chave: c, nome: n });
+          recusas.push(`ACEITOU ${porque}`);
+        } catch (e) { /* recusou, como deve */ }
+      }
+
+      await invoke('remover_amigo', { chave: falso }).catch(() => {});
+      const sobrou = (await invoke('amigos')).some(x => x.chave === falso);
+
+      diz(`ui amigos: antes=${antes} pos=${!!posto} repetidos=${repetidos}`
+        + ` renomeou=${renomeou} verificado-guardado=${marcado === true}`
+        + ` removeu=${!sobrou} recusas-em-falta=${JSON.stringify(recusas)}`);
+    }
+
+    // ---- a decisao de que conversa mostrar -------------------------------------
+    //
+    // Isolada de proposito: a versao anterior deste teste precisava de DUAS maquinas ligadas
+    // e de uma conversa a existir, e por isso ora corria ora nao. Uma medicao que so as
+    // vezes corre nao distingue "passou" de "nao foi tentado".
+    {
+      const cs = [{ id: 'aaa' }, { id: 'bbb' }];
+      const casos = [
+        ['Amigos aguenta com conversas a existir', qualConversa(null, cs), null],
+        ['a escolhida mantem-se', qualConversa('bbb', cs), 'bbb'],
+        ['uma que desapareceu cai na primeira', qualConversa('zzz', cs), 'aaa'],
+        ['sem conversas nenhumas fica nos Amigos', qualConversa('zzz', []), null],
+      ];
+      const falhas = casos.filter(([, deu, devia]) => deu !== devia)
+        .map(([o, deu, devia]) => `${o}: deu ${deu}, devia ${devia}`);
+      diz(`ui conversa escolhida: ${casos.length - falhas.length}/${casos.length}`
+        + ` falhas=${JSON.stringify(falhas)}`);
+    }
+
+    // ---- o que a amizade SERVE ------------------------------------------------
+    //
+    // Falar com alguem com quem NAO se partilha servidor nenhum. Se isto nao funcionar, uma
+    // lista de amigos e so uma lista: bonita e inutil.
+    //
+    // So corre quando ha exactamente um amigo posto de fora (BRUMA_AMIGO), para nao mexer na
+    // lista de quem esta a usar a app.
+    {
+      const lista = await invoke('amigos').catch(() => []);
+      const teste = lista.filter(a => a.nome === 'amigo de teste');
+      if (teste.length === 1) {
+        const dele = teste[0].chave;
+        let id = null;
+        let erro = '';
+        // O `abrir_conversa` so consegue com a chave de conversa dele -- e essa so chega
+        // pelo `Ola`, ou seja, so se nos tivermos MESMO ligado. E por isso a prova.
+        for (let i = 0; i < 40 && !id; i++) {
+          await new Promise(r => setTimeout(r, 500));
+          id = await invoke('abrir_conversa', { peer: dele }).catch(e => { erro = String(e); return null; });
+        }
+        let msgs = [];
+        if (id) {
+          await invoke('enviar', { servidor: id, canal: 'conversa', texto: 'ola sem servidor' })
+            .catch(e => { erro = String(e); });
+          for (let i = 0; i < 20 && msgs.length < 2; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            msgs = await invoke('mensagens', { servidor: id, canal: 'conversa' }).catch(() => []);
+          }
+        }
+        const st = await invoke('estado');
+        // COM uma conversa a existir, a vista dos Amigos tem de continuar alcancavel -- era
+        // aqui que a auto-seleccao a roubava, e com ela o unico botao de Remover.
+        let porque = 'nao corri';
+        if (id) {
+          // O MODO tem de ser privado, senao isto mede o caminho dos servidores e diz que
+          // nao, por uma razao que nada tem a ver com o que se afirma. Ja me enganou tres
+          // vezes hoje -- por isso a medicao passa a dizer PORQUE falhou.
+          irParaPrivado();
+          await new Promise(r => setTimeout(r, 120));
+          conversaAtual = null;
+          await desenharTudo();
+          await new Promise(r => setTimeout(r, 120));
+          await desenharTudo();
+          const texto = $('#stream').textContent;
+          porque = modo !== 'privado' ? `modo=${modo}`
+            : conversaAtual !== null ? 'a auto-seleccao roubou a vista'
+              : !texto.includes('Amigos') ? 'a vista nao desenhou'
+                : !/Remover|Adicionar/.test(texto) ? 'sem os botoes de gerir'
+                  : 'sim';
+        }
+
+        diz(`ui amigos alcancavel com conversa: ${porque}`);
+        diz(`ui amigo sem servidor: ligou=${!!id} conversa=${id ? id.slice(0, 12) : '-'}`
+          + ` mensagens=${msgs.length} servidores=${st.servidores.length}`
+          + ` conversas=${st.conversas.length} erro="${erro.slice(0, 60)}"`);
+      }
     }
 
     // ---- as Definicoes, todas as seccoes --------------------------------------

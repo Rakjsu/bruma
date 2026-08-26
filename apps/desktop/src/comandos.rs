@@ -108,6 +108,33 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     })
 }
 
+/// A minha lista de pessoas conhecidas.
+#[tauri::command]
+pub fn amigos(app: State<Arc<App>>) -> R<Vec<estado::Amigo>> {
+    Ok(app.amigos.lock().map_err(erro)?.clone())
+}
+
+/// Põe alguém na lista — pela chave, que é a única forma de o alcançar.
+///
+/// Não há directório onde procurar ninguém, e isso é uma propriedade a manter e não uma
+/// lacuna: quem não tem a tua chave não te encontra, aconteça o que acontecer.
+#[tauri::command]
+pub fn adicionar_amigo(chave: String, nome: String, app: State<Arc<App>>) -> R<()> {
+    app.adicionar_amigo(&chave, &nome).map_err(erro)
+}
+
+#[tauri::command]
+pub fn remover_amigo(chave: String, app: State<Arc<App>>) -> R<()> {
+    app.remover_amigo(chave.trim()).map_err(erro)
+}
+
+/// Marca que comparaste a chave com a pessoa por outro caminho.
+#[tauri::command]
+pub fn marcar_verificado(chave: String, verificado: bool, app: State<Arc<App>>) -> R<()> {
+    app.marcar_verificado(chave.trim(), verificado)
+        .map_err(erro)
+}
+
 /// Abre a conversa privada com alguém, ou devolve a que já existe.
 ///
 /// Não há convite: o id e a chave saem das duas identidades. O que pode faltar é a chave de

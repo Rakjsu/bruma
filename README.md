@@ -6,7 +6,8 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.13.0 — texto, voz, partilha de ecrã com som, câmara e conversas privadas.**
+> **Estado: v0.14.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas e
+> uma lista de amigos.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
@@ -93,9 +94,18 @@ projectos morrem.
   entre duas chaves fixas: quem obtiver a tua semente lê o passado todo. É a mesma limitação da
   chave do servidor, e vale a pena repeti-la aqui porque é numa conversa privada que se espera
   o contrário.
-- **Não há lista de amigos nem bloqueio.** Quem tiver a tua chave pública pode abrir uma
-  conversa contigo. Não existe directório onde te procurar — a chave tem de te ser dada — mas
-  também não existe forma de dizer «este não».
+- **A lista de amigos é uma decisão tua, e não um acordo.** Ter alguém na lista quer dizer
+  que estás disposto a ligar-te a ele — e uma ligação directa mostra-lhe o teu IP. Alguém
+  pôr-te na lista dele não lhe dá nada: essa lista não é tua e tu nem a vês.
+- **A lista vive nesta máquina, e só aqui.** As 24 palavras recuperam a identidade, não os
+  amigos. Sem servidor, não há de onde os trazer de volta — guarda-a com o resto da pasta.
+- **Não há bloqueio.** Quem tiver a tua chave pública pode abrir uma conversa contigo. Não
+  existe directório onde te procurar — a chave tem de te ser dada — mas também não existe,
+  ainda, forma de dizer «este não».
+- **A chave de um amigo pode ser marcada como verificada**, depois de a comparares com ele
+  por outro caminho. Enquanto não estiver, sabes que falas com quem tem aquela chave; não
+  sabes se aquela chave é de quem julgas. Numa app sem directório, é isto que substitui «o
+  servidor garante que este é o João».
 - **Não é anonimato de rede.** Para isso precisas de VPN ou Tor por baixo.
 - **Não há anexos, imagens, editar, apagar, reacções, respostas, markdown, notificações nem
   não-lidas.** Só texto simples, uma linha de cada vez.
