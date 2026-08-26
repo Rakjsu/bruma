@@ -512,15 +512,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake2"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8978,9 +8969,8 @@ name = "verificar-assinatura"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake2",
- "data-encoding",
- "ed25519-dalek 2.2.0",
+ "base64 0.22.1",
+ "minisign-verify",
  "serde_json",
 ]
 

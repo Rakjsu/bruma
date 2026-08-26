@@ -69,15 +69,41 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) { "a release $tag ja existe"; exit 0 }
+
+          # SE JA EXISTE, TEM DE SER RASCUNHO -- e isto nao estava a ser conferido.
+          #
+          # Toda a proteccao deste workflow assenta em a release nascer rascunho: o
+          # `releases/latest` ignora rascunhos, portanto enquanto os portoes nao passarem
+          # ninguem a ve. Mas o `exit 0` daqui so olhava para "existe", e o proprio texto de
+          # recuperacao mandava cria-la A MAO com `gh release create` -- que a cria
+          # PUBLICADA. Seguindo a receita impressa por este passo, a release ficava visivel a
+          # toda a gente antes de um unico portao ter corrido, e o `--clobber` ia enchendo-a
+          # de ficheiros a medida que a compilacao avancava.
+          $rascunho = (gh release view $tag --json isDraft --jq '.isDraft' 2>$null)
+          if ($LASTEXITCODE -eq 0) {
+            if ($rascunho -ne 'true') {
+              Write-Error @"
+          A release $tag ja existe e NAO e rascunho.
+          Nao continuo: publicar por cima de uma release ja visivel poe ficheiros meio-feitos
+          nas maos de toda a gente, que e exactamente o que este workflow existe para evitar.
+          Torna-a rascunho e volta a correr:
+              gh release edit $tag --draft
+          "@
+              exit 1
+            }
+            "a release $tag ja existe e e rascunho"
+            exit 0
+          }
           gh release create $tag --title "Bruma $tag" --notes "Bruma $tag" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) {
             Write-Error @"
           Nao consegui criar a release $tag com o token das Actions.
-          Cria-a a mao e volta a correr este workflow:
-              gh release create $tag --title "Bruma $tag" --notes "Bruma $tag"
+          Cria-a a mao COMO RASCUNHO e volta a correr este workflow:
+              gh release create $tag --title "Bruma $tag" --notes "Bruma $tag" --draft
+          O `--draft` nao e opcional: sem ele a release fica visivel antes de qualquer portao
+          ter corrido, e o auto-update de toda a gente aponta para ficheiros meio-feitos.
           O envio dos ficheiros para uma release que ja existe costuma funcionar.
           "@
             exit 1

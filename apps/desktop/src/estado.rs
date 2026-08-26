@@ -73,6 +73,9 @@ pub struct ServidorGuardado {
     /// torna barata: nada no que já existe precisa de saber que aquilo é uma conversa.
     #[serde(default)]
     pub com: Option<String>,
+    /// Quem me deu o convite. Ver [`Servidor::convidou`].
+    #[serde(default)]
+    pub convidou: Option<String>,
 }
 
 /// Alguém que eu decidi conhecer.
@@ -151,11 +154,56 @@ pub struct Servidor {
     pub id: String,
     pub chave: [u8; 32],
     pub log: blog::Log,
+    /// Quem PROVOU pertencer aqui. Ver [`Servidor::autores_provados`].
     pub peers: Vec<String>,
+    /// Quem me deu o convite. **Não é o mesmo que pertencer.**
+    ///
+    /// Um convite é JSON em base32 sem assinatura nenhuma: quem o escreve põe lá o nome que
+    /// quiser no campo `anfitriao`. Estava a ir directo para os `peers` — a lista que decide
+    /// quem me pode pôr som nas colunas e forjar presença. Bastava alguém dar-me um convite
+    /// com a chave de um terceiro lá dentro para esse terceiro ganhar direitos de sala sobre
+    /// mim, sem nunca ter provado nada.
+    ///
+    /// Continua a servir para o que realmente precisa: discar-lhe e trocar o histórico
+    /// **daquela sala**. Assim que ele escrever uma entrada que DECIFRA, entra nos `peers`
+    /// pela porta da frente.
+    pub convidou: Option<String>,
     pub com: Option<String>,
+    /// Cache de `autores_provados`, refeita a cada `merge`/`escrever`.
+    ///
+    /// Sem isto, o `aprender_dos_logs` decifrava TODOS os logs — com o lock global preso —
+    /// a cada ligação de qualquer estranho. Era um caminho de negação de serviço aberto por
+    /// mim ao fechar outro.
+    provados: std::collections::BTreeSet<String>,
 }
 
 impl Servidor {
+    /// O único caminho para construir um `Servidor`.
+    ///
+    /// A cache `provados` é privada de propósito: se fosse pública, alguém a preencheria à
+    /// mão e o «provado» deixava de querer dizer alguma coisa. Aqui ela é sempre derivada do
+    /// log, com uma passagem de decifragem.
+    pub fn novo(
+        id: String,
+        chave: [u8; 32],
+        log: blog::Log,
+        peers: Vec<String>,
+        convidou: Option<String>,
+        com: Option<String>,
+    ) -> Self {
+        let mut s = Servidor {
+            id,
+            chave,
+            log,
+            peers,
+            convidou,
+            com,
+            provados: Default::default(),
+        };
+        s.recontar_provados();
+        s
+    }
+
     /// Decifra o que conseguir e devolve as entradas prontas a aplicar, pela ordem do log.
     ///
     /// O que não decifrar é **ignorado em silêncio, não rejeitado**: numa app onde a chave
@@ -196,8 +244,8 @@ impl Servidor {
     ///
     /// É este o conjunto que o porteiro da rede usa. Enquanto era «quem se ligou e disse o id»,
     /// bastava uma mensagem vazia para entrar.
-    pub fn autores_provados(&self) -> std::collections::BTreeSet<String> {
-        self.aplicaveis().0.into_iter().map(|a| a.autor).collect()
+    pub fn autores_provados(&self) -> &std::collections::BTreeSet<String> {
+        &self.provados
     }
 
     pub fn estado(&self) -> EstadoDoServidor {
@@ -215,7 +263,45 @@ impl Servidor {
     pub fn escrever(&mut self, signing: &SigningKey, carga: &Carga) -> Result<blog::Entry> {
         let claro = serde_json::to_vec(carga)?;
         let (nonce, ct) = crypto::seal(&self.chave, &claro)?;
-        self.log.append_local(signing, nonce, ct, agora_ms())
+        let e = self.log.append_local(signing, nonce, ct, agora_ms())?;
+        self.provados.insert(e.author.clone());
+        Ok(e)
+    }
+
+    /// Junta entradas ao log, guardando **só as que decifram**.
+    ///
+    /// O `blog::Log::merge` verifica a assinatura e mais nada — e a assinatura é feita com a
+    /// chave de quem escreve, portanto qualquer pessoa assina o que quiser. O resultado era
+    /// que um estranho anexava lixo ao meu ficheiro, para sempre, sem limite de tamanho, e
+    /// passava a constar como autor de uma sala onde nunca entrou.
+    ///
+    /// Numa sala, tudo o que é legítimo está cifrado com a chave dela. Uma entrada que não
+    /// decifra não é uma entrada daquela sala — é ruído que alguém me mandou guardar.
+    ///
+    /// QUANDO A ROTAÇÃO DE CHAVE EXISTIR, isto tem de passar a «decifra com alguma chave que
+    /// eu tenha, actual ou reformada». Hoje não há rotação — e é por isso que se pode ser
+    /// tão estrito. Fica escrito para não se descobrir tarde.
+    pub fn merge_verificado(&mut self, entradas: Vec<blog::Entry>) -> Result<usize> {
+        let boas: Vec<blog::Entry> = entradas
+            .into_iter()
+            .filter(|e| {
+                let (Ok(nonce), Ok(ct)) =
+                    (hex24(&e.nonce), HEXLOWER.decode(e.ciphertext.as_bytes()))
+                else {
+                    return false;
+                };
+                crypto::open(&self.chave, &nonce, &ct).is_ok()
+            })
+            .collect();
+        for e in &boas {
+            self.provados.insert(e.author.clone());
+        }
+        self.log.merge(boas)
+    }
+
+    /// Refaz a cache de quem provou. Só ao abrir a app, e uma vez por servidor.
+    fn recontar_provados(&mut self) {
+        self.provados = self.aplicaveis().0.into_iter().map(|a| a.autor).collect();
     }
 }
 
@@ -276,16 +362,19 @@ impl App {
                     continue;
                 }
             };
-            servidores.insert(
-                s.id.clone(),
-                Servidor {
-                    id: s.id.clone(),
-                    chave,
-                    log,
-                    peers: s.peers.clone(),
-                    com: s.com.clone(),
-                },
-            );
+            let mut srv = Servidor {
+                id: s.id.clone(),
+                chave,
+                log,
+                peers: s.peers.clone(),
+                convidou: s.convidou.clone(),
+                com: s.com.clone(),
+                provados: Default::default(),
+            };
+            // Uma passagem por servidor, aqui e só aqui. A partir daqui a cache mantém-se
+            // sozinha no `merge_verificado` e no `escrever`.
+            srv.recontar_provados();
+            servidores.insert(s.id.clone(), srv);
         }
 
         // Um amigo posto pela linha de comandos, para se poder medir o que a amizade serve:
@@ -538,18 +627,21 @@ impl App {
         )?;
 
         let log = blog::Log::load(caminho_do_log(&id))?;
-        self.servidores.lock().unwrap().insert(
-            id.clone(),
-            Servidor {
+        self.servidores.lock().unwrap().insert(id.clone(), {
+            let mut srv = Servidor {
                 id: id.clone(),
                 chave,
                 log,
                 // O outro é o único par desta conversa, e já é conhecido desde o início:
                 // não há aqui o passo de "dar-se a conhecer" que os servidores têm.
                 peers: vec![peer.to_string()],
+                convidou: None,
                 com: Some(peer.to_string()),
-            },
-        );
+                provados: Default::default(),
+            };
+            srv.recontar_provados();
+            srv
+        });
         self.gravar_indice()?;
         Ok(id)
     }
@@ -567,6 +659,7 @@ impl App {
                     chave: HEXLOWER.encode(&s.chave),
                     peers: s.peers.clone(),
                     com: s.com.clone(),
+                    convidou: s.convidou.clone(),
                 })
                 .collect()
         };
@@ -698,6 +791,34 @@ pub fn nova_chave_de_servidor() -> Result<[u8; 32]> {
     let mut k = [0u8; 32];
     getrandom::getrandom(&mut k).map_err(|e| anyhow!("rng: {e}"))?;
     Ok(k)
+}
+
+/// Um id de servidor é um nome de ficheiro, e tem de ser tratado como tal.
+///
+/// O id vinha de um **convite**, que é JSON em base32 sem assinatura nenhuma — quem escreve
+/// o convite escolhe o que lá está. E ia directo para
+/// `raiz().join("servidores").join(format!("{id}.json"))`. O `PathBuf::join` com um caminho
+/// ABSOLUTO deita fora o prefixo e fica só com o absoluto: um convite com
+/// `servidor = "C:/Users/x/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/z"`
+/// fazia a app criar e escrever um ficheiro na pasta de arranque do Windows. Com `..` chegava
+/// ao mesmo sítio pelo caminho longo.
+///
+/// Os ids que a app gera são 32 caracteres hex. Aceitar exactamente isso — e não «tentar
+/// limpar» o que vier — é a única forma que não tem casos esquecidos: não há aqui uma lista
+/// de coisas proibidas, há uma lista de coisas permitidas.
+pub fn id_de_servidor_valido(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Uma chave pública em hex minúsculo: 64 caracteres, nem mais nem menos.
+pub fn chave_valida(k: &str) -> bool {
+    k.len() == 64
+        && k.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 pub fn caminho_do_log(id: &str) -> PathBuf {

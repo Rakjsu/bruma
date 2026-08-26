@@ -7,8 +7,9 @@ publish = false
 # Ferramenta de PORTAO, nao faz parte de nada que se instale. Ver src/main.rs.
 
 [dependencies]
-ed25519-dalek = "2"
-blake2 = "0.10"
-data-encoding = "2"
+# A MESMA biblioteca que o tauri-plugin-updater usa para verificar. Escrita a mao, a
+# ferramenta verificava um subconjunto do que o updater verifica -- ver src/main.rs.
+minisign-verify = "0.2"
+base64 = "0.22"
 serde_json = "1"
 anyhow = "1"

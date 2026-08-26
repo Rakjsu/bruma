@@ -193,6 +193,8 @@ fn main() {
             comandos::permissoes,
             comandos::bloquear,
             comandos::definir_quem_escreve,
+            comandos::convites_de_teste,
+            comandos::escapou_alguma_coisa,
             comandos::enviar,
             comandos::mensagens,
             comandos::presenca_de_voz,

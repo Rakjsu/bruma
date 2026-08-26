@@ -185,6 +185,98 @@ pub fn aplicar_bloqueio(
     Ok(())
 }
 
+/// Fabrica convites venenosos para a medicao os experimentar. So serve para isso.
+///
+/// Fabrica-los no Rust e nao no JS e de proposito: usa-se o MESMO `Convite::codificar` que a
+/// app usa, portanto o que se experimenta e um convite a serio e nao a minha ideia de como um
+/// convite e feito. Um teste que constroi o seu proprio formato acaba a testar o construtor
+/// do teste.
+#[tauri::command]
+pub fn convites_de_teste() -> R<String> {
+    let bom = "aa".repeat(32);
+    let raiz = estado::raiz();
+    let fora = raiz
+        .parent()
+        .map(|p| p.join("ESCAPOU"))
+        .unwrap_or_else(|| std::path::PathBuf::from("ESCAPOU"));
+    let casos: Vec<(&str, String, String)> = vec![
+        (
+            "absoluto",
+            fora.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            bom.clone(),
+        ),
+        ("subir", "../../ESCAPOU".into(), bom.clone()),
+        ("barra", "sub/ESCAPOU".into(), bom.clone()),
+        ("nulo", format!("abc{}def", '\0'), bom.clone()),
+        ("vazio", String::new(), bom.clone()),
+        // E o terceiro que ganhava direitos de sala sem ter provado nada, aqui com uma chave
+        // que nem sequer e uma chave.
+        ("anfitriao-lixo", "0".repeat(32), "nao-sou-uma-chave".into()),
+    ];
+    let mut saida: Vec<Vec<String>> = Vec::new();
+    for (nome, servidor, anfitriao) in casos {
+        let c = crate::modelo::Convite {
+            servidor,
+            nome: "isca".into(),
+            chave: "bb".repeat(32),
+            anfitriao,
+        };
+        if let Ok(codigo) = c.codificar() {
+            saida.push(vec![nome.to_string(), codigo]);
+        }
+    }
+    serde_json::to_string(&saida).map_err(erro)
+}
+
+/// Alguma coisa apareceu FORA da pasta de dados, ou com um nome que nao e um id nosso?
+#[tauri::command]
+pub fn escapou_alguma_coisa(app: State<Arc<App>>) -> R<String> {
+    let raiz = estado::raiz();
+    let mut achados = Vec::new();
+    if let Some(pai) = raiz.parent() {
+        for cand in [pai.join("ESCAPOU"), pai.join("ESCAPOU.json")] {
+            if cand.exists() {
+                achados.push(cand.to_string_lossy().to_string());
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(raiz.join("servidores")) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            let base = n.trim_end_matches(".json");
+            if !estado::id_de_servidor_valido(base) {
+                achados.push(format!("ficheiro:{n}"));
+            }
+        }
+    }
+    // E o estado em memoria: um id valido na forma pode na mesma ter entrado por um convite
+    // fabricado. O `00000...0` era exactamente esse caso -- passava pelo nome do ficheiro e
+    // ficava la na mesma, com uma chave de anfitriao que nem sequer e uma chave.
+    if let Ok(s) = app.servidores.lock() {
+        for srv in s.values() {
+            if let Some(c) = &srv.convidou {
+                if !estado::chave_valida(c) {
+                    achados.push(format!(
+                        "convidou-invalido:{}",
+                        &srv.id[..8.min(srv.id.len())]
+                    ));
+                }
+            }
+            for pr in &srv.peers {
+                if !estado::chave_valida(pr) {
+                    achados.push(format!("peer-invalido:{}", &srv.id[..8.min(srv.id.len())]));
+                }
+            }
+        }
+    }
+    Ok(if achados.is_empty() {
+        "nenhum".into()
+    } else {
+        achados.join(",")
+    })
+}
+
 #[tauri::command]
 pub fn definir_quem_escreve(politica: String, app: State<Arc<App>>) -> R<()> {
     let p = match politica.as_str() {
@@ -292,13 +384,7 @@ pub fn criar_servidor(
     let chave = estado::nova_chave_de_servidor().map_err(erro)?;
     let log = blog::Log::load(estado::caminho_do_log(&id)).map_err(erro)?;
 
-    let mut srv = estado::Servidor {
-        id: id.clone(),
-        chave,
-        log,
-        peers: Vec::new(),
-        com: None, // um servidor, nao uma conversa
-    };
+    let mut srv = estado::Servidor::novo(id.clone(), chave, log, Vec::new(), None, None);
 
     // Um servidor recém-criado sem canais é uma sala vazia sem portas. Cria-se o mínimo
     // para ser utilizável desde o primeiro segundo.
@@ -425,6 +511,39 @@ pub async fn entrar_com_convite(
     let convite = Convite::descodificar(&codigo).map_err(erro)?;
     let chave = estado::hex32(&convite.chave).map_err(erro)?;
 
+    // NADA DE UM CONVITE VAI PARA UM CAMINHO DE FICHEIRO SEM SER OLHADO.
+    //
+    // O convite é JSON em base32 SEM assinatura: quem o escreve escolhe o que lá está. E o
+    // `convite.servidor` ia directo para `caminho_do_log`, que faz
+    // `raiz().join("servidores").join(format!("{id}.json"))`. O `join` com um caminho
+    // absoluto deita fora o prefixo — um convite a apontar para a pasta de arranque do
+    // Windows fazia a app escrever um ficheiro lá dentro. Com `..` chegava-se ao mesmo.
+    //
+    // E não bastava confiar no erro que o comando dava a seguir: ele dava mesmo, mas só ao
+    // tentar ligar-se, DEPOIS de o ficheiro já estar criado. Quem lesse o erro concluía
+    // «recusado».
+    //
+    // O erro é o mesmo para os dois casos: dizer «esse id não presta» a quem fabricou o
+    // convite é dizer-lhe o que a app repara.
+    if !estado::id_de_servidor_valido(&convite.servidor) {
+        return Err("esse convite não é válido".into());
+    }
+    if !estado::chave_valida(&convite.anfitriao) {
+        return Err("esse convite não é válido".into());
+    }
+
+    // NADA DE UM CONVITE VAI PARA UM CAMINHO DE FICHEIRO SEM SER OLHADO.
+    //
+    // O convite é JSON em base32 SEM assinatura: quem o escreve escolhe o que lá está. E o
+    // `convite.servidor` ia directo para `caminho_do_log`, que faz
+    // `raiz().join("servidores").join(format!("{id}.json"))`. O `join` com um caminho
+    // absoluto deita fora o prefixo — um convite com o `servidor` a apontar para a pasta de
+    // arranque do Windows fazia a app escrever um ficheiro lá dentro. Com `..` chegava-se ao
+    // mesmo pelo caminho longo.
+    //
+    // O erro tem de ser o mesmo para os dois casos: dizer «esse id não presta» a quem
+    // fabricou o convite é dizer-lhe o que a app repara.
+
     let ja_tinha = {
         let servidores = app.servidores.lock().map_err(erro)?;
         servidores.contains_key(&convite.servidor)
@@ -432,13 +551,24 @@ pub async fn entrar_com_convite(
 
     if !ja_tinha {
         let log = blog::Log::load(estado::caminho_do_log(&convite.servidor)).map_err(erro)?;
-        let mut srv = estado::Servidor {
-            id: convite.servidor.clone(),
+        // `convidou`, e NÃO `peers`.
+        //
+        // Estava a pôr o campo `anfitriao` de um convite não assinado na lista que decide
+        // quem me pode pôr som nas colunas e forjar presença. Bastava alguém dar-me um
+        // convite com a chave de um terceiro lá dentro para esse terceiro ganhar direitos de
+        // sala sobre mim sem nunca ter provado nada — a terceira porta da mesma família,
+        // depois do `aplicar` e do `aprender_dos_logs`.
+        //
+        // Como `convidou` ele continua a servir para o que precisa: discar-lhe e trocar o
+        // histórico desta sala. Escreva ele uma entrada que decifra, e entra nos `peers`.
+        let mut srv = estado::Servidor::novo(
+            convite.servidor.clone(),
             chave,
             log,
-            peers: vec![convite.anfitriao.clone()],
-            com: None, // um servidor, nao uma conversa
-        };
+            Vec::new(),
+            Some(convite.anfitriao.clone()),
+            None, // um servidor, nao uma conversa
+        );
         // Apresentar-se é o que faz a pessoa aparecer na lista de membros dos outros.
         let meu_nome = app.nome.lock().map_err(erro)?.clone();
         let entrada = if meu_nome.is_empty() {

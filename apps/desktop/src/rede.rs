@@ -481,6 +481,9 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                 continue;
             };
             let mut v: Vec<String> = s.values().flat_map(|x| x.peers.clone()).collect();
+            // E quem me convidou. Ele ainda não provou nada — e por isso não passa o
+            // porteiro — mas é o único fio que tenho para o servidor onde acabei de entrar.
+            v.extend(s.values().filter_map(|x| x.convidou.clone()));
             // E os amigos, que podem não partilhar sala nenhuma comigo. Sem isto, ter alguém
             // na lista não servia de nada: nunca nos ligaríamos, e a conversa privada com
             // quem não está num servidor meu nunca chegaria a acontecer.
@@ -854,7 +857,9 @@ async fn sessao(
     let pacotes: Vec<(String, Vec<blog::Entry>)> = {
         let s = app.servidores.lock().unwrap();
         s.values()
-            .filter(|srv| srv.peers.iter().any(|p| p == &peer))
+            .filter(|srv| {
+                srv.peers.iter().any(|p| p == &peer) || srv.convidou.as_deref() == Some(&peer)
+            })
             .map(|srv| (srv.id.clone(), srv.log.ordered()))
             .collect()
     };
@@ -1034,7 +1039,7 @@ async fn sessao(
                             // quando o ataque nem saiu de casa. Foi o que me aconteceu três
                             // vezes hoje.
                             let ataque = std::env::var("BRUMA_ESTRANHO").is_ok();
-                            if ataque || participa(&app, &servidor, &peer) {
+                            if ataque || pode_sincronizar(&app, &servidor, &peer) {
                                 Some(Quadro::Controlo(Msg::Nova { servidor, entrada }))
                             } else {
                                 None
@@ -1218,6 +1223,27 @@ fn aprender_dos_logs(app: &Arc<App>, peer: &str) {
     }
 }
 
+/// Pode SINCRONIZAR aquele servidor comigo — que não é o mesmo que pertencer.
+///
+/// Distinção que custou uma porta aberta: quem me deu o convite tem de poder trocar comigo o
+/// histórico daquela sala (senão entrar num servidor não funciona), mas NÃO tem de poder
+/// pôr-me som nas colunas nem forjar presença só por eu ter aceitado um código que ele
+/// escreveu. Trocar histórico de uma sala cuja chave ele obviamente tem não lhe dá nada que
+/// ele já não tivesse; ser tratado como membro dá.
+///
+/// O porteiro (`conhecido`, `participa`) continua a ler só `peers`, onde só se entra
+/// provando. Este é o único sítio onde o `convidou` conta.
+fn pode_sincronizar(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
+    app.servidores
+        .lock()
+        .map(|s| {
+            s.get(servidor).is_some_and(|srv| {
+                srv.peers.iter().any(|p| p == peer) || srv.convidou.as_deref() == Some(peer)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn participa(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
     app.servidores
         .lock()
@@ -1294,7 +1320,13 @@ fn aplicar(
             return;
         }
 
-        let novas = srv.log.merge(entradas).unwrap_or(0);
+        // `merge_verificado`, e nao `log.merge`: o log so guarda o que DECIFRA.
+        //
+        // Isto fecha, na origem, a familia inteira de que ja tinha apanhado dois membros. O
+        // `log.merge` verifica a assinatura -- que e feita com a chave de quem escreve, logo
+        // qualquer pessoa assina o que quiser. Um estranho anexava-me lixo, sem limite de
+        // tamanho, e ficava a constar como autor de uma sala onde nunca entrou.
+        let novas = srv.merge_verificado(entradas).unwrap_or(0);
 
         // E aqui está o que faltava: PROVAR, e não dizer.
         //
@@ -1309,13 +1341,17 @@ fn aplicar(
         // quem as convidou.
         let mut aprendi = false;
         if novas > 0 {
-            for autor in srv.autores_provados() {
-                if autor != peer_proprio(app) && !srv.peers.iter().any(|p| p == &autor) {
-                    if autor == peer {
-                        aprendi = true;
-                    }
-                    srv.peers.push(autor);
+            let novos: Vec<String> = srv
+                .autores_provados()
+                .iter()
+                .filter(|a| a.as_str() != peer_proprio(app) && !srv.peers.iter().any(|p| p == *a))
+                .cloned()
+                .collect();
+            for autor in novos {
+                if autor == peer {
+                    aprendi = true;
                 }
+                srv.peers.push(autor);
             }
         }
         (novas, aprendi)

@@ -7,53 +7,46 @@
 //! única coisa de que depende a actualização automática funcionar: que aquela assinatura se
 //! verifica com aquela chave.
 //!
-//! E é a avaria com a pior forma possível — **total e silenciosa**. Uma chave privada rodada
+//! É a avaria com a pior forma possível — **total e silenciosa**. Uma chave privada rodada
 //! sem rodar a pública no `tauri.conf.json` (ou ao contrário) publica uma versão com aspecto
 //! perfeito: os ficheiros lá estão, o `latest.json` aponta para o sítio certo, a página da
 //! release está bonita. E toda a gente deixa de conseguir actualizar-se, para sempre, sem
 //! ver um único erro. Cada versão seguinte agrava, porque ninguém dá por nada.
 //!
-//! Nenhum dos portões que já existiam podia apanhar isto: todos olham para nomes de
-//! ficheiros e números de versão, e a assinatura é o único que precisa da chave.
+//! # E porque é que NÃO tem o parsing escrito à mão
 //!
-//! # O formato
+//! A primeira versão desta ferramenta lia o formato minisign por sua conta: descascava as
+//! duas camadas de base64, pegava na segunda linha, e fazia uma verificação Ed25519. Passava
+//! nos testes todos — incluindo os de sabotagem, que eu próprio escrevi.
 //!
-//! O Tauri usa minisign, com os ficheiros em base64 por cima:
+//! E estava errada. Um ficheiro minisign tem **quatro** linhas: comentário, assinatura,
+//! `trusted comment:` e a assinatura GLOBAL, que cobre a assinatura mais o comentário
+//! confiável. O `minisign_verify` — que é o que o `tauri-plugin-updater` usa — exige as
+//! quatro e faz **duas** verificações. A minha fazia uma e deitava fora metade do ficheiro.
 //!
-//! - a `pubkey` do `tauri.conf.json` é o ficheiro `.pub` inteiro em base64;
-//! - o `.sig` é o ficheiro de assinatura inteiro em base64.
+//! Um portão que valida um subconjunto do que o consumidor valida diz «confere» sobre coisas
+//! que o consumidor recusa. É pior do que não existir, porque dá confiança a mais.
 //!
-//! Dentro de cada um, a linha que interessa é a segunda (a primeira é um comentário), também
-//! em base64: `algoritmo (2) + id da chave (8) + os bytes`.
-//!
-//! O algoritmo decide **o que foi assinado**: `Ed` assina o ficheiro como está, `ED` assina o
-//! BLAKE2b-512 dele. Tratar os dois é o que distingue esta ferramenta de uma que só funciona
-//! por acaso com a versão do `tauri signer` de hoje.
+//! Por isso esta ferramenta usa **a mesma biblioteca, na mesma versão**, chamada da mesma
+//! maneira que o updater a chama. Não há aqui um formato reimplementado que possa divergir
+//! do verdadeiro: se isto disser que sim, o updater diz que sim.
 
 use anyhow::{anyhow, bail, Context, Result};
-use blake2::{Blake2b512, Digest};
-use data_encoding::BASE64;
-use ed25519_dalek::{Signature, VerifyingKey};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use minisign_verify::{PublicKey, Signature};
 
-/// Descasca uma das duas camadas de base64 e devolve o bloco da segunda linha.
+/// Descasca a camada de base64 com que o Tauri embrulha os ficheiros minisign.
 ///
-/// Devolve também o comentário, que é onde o minisign põe o id da chave em texto — serve
-/// para a mensagem de erro dizer alguma coisa de útil a quem estiver a olhar.
-fn bloco(b64_do_ficheiro: &str, o_que: &str) -> Result<(Vec<u8>, String)> {
-    let dentro = BASE64
-        .decode(b64_do_ficheiro.trim().as_bytes())
+/// Tanto a `pubkey` do `tauri.conf.json` como o conteúdo do `.sig` (e o campo `signature` do
+/// `latest.json`) são o **ficheiro minisign inteiro** em base64. O que sai daqui vai tal e
+/// qual para o `minisign_verify`, que trata do resto — as quatro linhas, os comprimentos, o
+/// prefixo do comentário confiável, tudo.
+fn desembrulhar(b64: &str, o_que: &str) -> Result<String> {
+    let bytes = STANDARD
+        .decode(b64.trim().as_bytes())
         .with_context(|| format!("o {o_que} não é base64"))?;
-    let texto = String::from_utf8(dentro)
-        .with_context(|| format!("o {o_que} não é texto depois de descodificado"))?;
-    let mut linhas = texto.lines().filter(|l| !l.trim().is_empty());
-    let comentario = linhas.next().unwrap_or_default().to_string();
-    let corpo = linhas
-        .next()
-        .ok_or_else(|| anyhow!("o {o_que} não tem a segunda linha, que é onde estão os bytes"))?;
-    let bytes = BASE64
-        .decode(corpo.trim().as_bytes())
-        .with_context(|| format!("a segunda linha do {o_que} não é base64"))?;
-    Ok((bytes, comentario))
+    String::from_utf8(bytes)
+        .with_context(|| format!("o {o_que} não é texto depois de descodificado"))
 }
 
 /// Aceita o `.sig` ou o `latest.json`, e prefere-se sempre o `latest.json`.
@@ -67,7 +60,7 @@ fn assinatura_de(caminho: &str) -> Result<(String, String)> {
     let txt =
         std::fs::read_to_string(caminho).with_context(|| format!("não consegui ler {caminho}"))?;
     let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else {
-        return Ok((txt, format!("ficheiro {caminho}"))); // é o .sig, que é só base64
+        return Ok((txt, format!("ficheiro {caminho}")));
     };
     let a = j["platforms"]["windows-x86_64"]["signature"]
         .as_str()
@@ -86,67 +79,40 @@ fn main() -> Result<()> {
     };
 
     let conteudo = std::fs::read(&exe).with_context(|| format!("não consegui ler {exe}"))?;
+    if conteudo.is_empty() {
+        bail!("o {exe} está vazio");
+    }
     let (sig_b64, donde) = assinatura_de(&sig)?;
+
     let conf_txt =
         std::fs::read_to_string(&conf).with_context(|| format!("não consegui ler {conf}"))?;
-
     let json: serde_json::Value = serde_json::from_str(&conf_txt)?;
     let pubkey_b64 = json["plugins"]["updater"]["pubkey"]
         .as_str()
-        .ok_or_else(|| anyhow!("o {conf} não tem plugins.updater.pubkey"))?;
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("o {conf} não tem plugins.updater.pubkey (ou está vazio)"))?;
 
-    let (pk, pk_comentario) = bloco(pubkey_b64, "pubkey")?;
-    let (sg, sg_comentario) = bloco(&sig_b64, &donde)?;
+    // A partir daqui é a MESMA sequência que o `verify_signature` do tauri-plugin-updater.
+    let chave = PublicKey::decode(&desembrulhar(pubkey_b64, "pubkey")?)
+        .map_err(|e| anyhow!("a `pubkey` do {conf} não é uma chave minisign válida: {e}"))?;
+    let assinatura = Signature::decode(&desembrulhar(&sig_b64, &donde)?)
+        .map_err(|e| anyhow!("a assinatura do {donde} não é um ficheiro minisign válido: {e}"))?;
 
-    if pk.len() != 42 {
-        bail!("a chave pública tem {} bytes e deviam ser 42", pk.len());
-    }
-    if sg.len() != 74 {
-        bail!("a assinatura tem {} bytes e deviam ser 74", sg.len());
-    }
-
-    let (id_pk, chave) = (&pk[2..10], &pk[10..]);
-    let (algo, id_sg, assinatura) = (&sg[..2], &sg[2..10], &sg[10..]);
-
-    // O id da chave PRIMEIRO. Se não bate certo, o erro seguinte seria "assinatura inválida",
-    // que manda procurar no sítio errado — o problema não é a assinatura, é ter sido feita
-    // com outra chave.
-    if id_pk != id_sg {
-        bail!(
-            "a assinatura foi feita com OUTRA chave.\n  a app espera : {}\n  a assinatura : {}\n\
-             \n  Alguém rodou a chave de assinatura sem rodar a `pubkey` do tauri.conf.json\n\
-             (ou ao contrário). Ninguém se conseguiria actualizar.",
-            pk_comentario.trim(),
-            sg_comentario.trim()
-        );
-    }
-
-    // `Ed` assina o ficheiro; `ED` assina o BLAKE2b-512 dele.
-    let alvo: Vec<u8> = match algo {
-        b"Ed" => conteudo,
-        b"ED" => Blake2b512::digest(&conteudo).to_vec(),
-        outro => bail!(
-            "não conheço o algoritmo {:?} do minisign",
-            String::from_utf8_lossy(outro)
-        ),
-    };
-
-    let chave: [u8; 32] = chave.try_into()?;
-    let assinatura: [u8; 64] = assinatura.try_into()?;
-    VerifyingKey::from_bytes(&chave)?
-        .verify_strict(&alvo, &Signature::from_bytes(&assinatura))
-        .map_err(|e| {
-            anyhow!(
-                "a assinatura NÃO verifica ({e}).\n  O {exe} e a assinatura do {donde} não \
-                 são o mesmo par — ninguém se conseguiria actualizar."
-            )
-        })?;
+    // `true` = aceitar também assinaturas antigas (`Ed`, sobre o ficheiro) além das
+    // pré-digeridas (`ED`, sobre o BLAKE2b). É o mesmo valor que o updater passa: aceitar
+    // menos do que ele recusaria coisas que ele aceita, e aceitar mais deixaria passar
+    // coisas que ele recusa.
+    chave.verify(&conteudo, &assinatura, true).map_err(|e| {
+        anyhow!(
+            "a assinatura NÃO verifica ({e}).\n  O {exe} e a assinatura do {donde} não são o \
+             mesmo par — ninguém se conseguiria actualizar."
+        )
+    })?;
 
     println!(
-        "assinatura confere: {} bytes, algoritmo {}, chave {}",
-        alvo.len(),
-        String::from_utf8_lossy(algo),
-        pk_comentario.trim()
+        "assinatura confere: {} bytes verificados contra a chave do {conf}, pelo mesmo \
+         minisign-verify que o updater usa",
+        conteudo.len()
     );
     Ok(())
 }

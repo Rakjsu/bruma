@@ -5143,6 +5143,31 @@ function pararDeAssistir() {
       + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+
+    // ---- convites com veneno lá dentro (NO FIM, e de propósito) -----------------
+    //
+    // No fim porque um convite envenenado que passe deixa um servidor a mais no estado, e
+    // isso contaminaria todas as medições que viessem a seguir -- eu deixaria de saber se
+    // uma falha era da coisa medida ou do meu próprio ataque.
+    //
+    // E o que se mede é o DISCO, não o erro do comando. Sem a validação o comando TAMBÉM dá
+    // erro -- «não consegui ligar» -- só que já criou o ficheiro onde o convite mandou.
+    // Quem lesse o erro concluía «recusado» e estava enganado.
+    {
+      const venenos = JSON.parse(await invoke('convites_de_teste').catch(() => '[]'));
+      const tentados = [];
+      for (const [nome, codigo] of venenos) {
+        try { await invoke('entrar_com_convite', { codigo }); tentados.push(`${nome}=aceite`); }
+        catch (e) { tentados.push(`${nome}=erro`); }
+      }
+      // As escritas do log não são todas síncronas: da primeira vez o ficheiro só apareceu
+      // ao fim de ~23 segundos, muito depois do comando ter voltado. Uma verificação
+      // imediata dizia «sem rasto» com o ataque a caminho.
+      await new Promise(r => setTimeout(r, 8000));
+      const rasto = await invoke('escapou_alguma_coisa').catch(e => 'nao-medido:' + e);
+      diz(`ui convite venenoso: ${venenos.length} tentados, rasto=${rasto}`);
+    }
+
     document.querySelector('[data-modo="pers"]').click();
     $('#btn-qualidade').click();
   } else {
