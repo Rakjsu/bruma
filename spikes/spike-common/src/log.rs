@@ -236,6 +236,16 @@ impl Log {
             .collect()
     }
 
+    /// Se este autor alguma vez escreveu aqui.
+    ///
+    /// O `author` de cada entrada está em CLARO — é a chave pública de quem assinou, e é
+    /// também o endereço de rede dessa pessoa. Logo dá para saber quem pertence a esta sala
+    /// sem decifrar uma única mensagem, e sem o custo do `ordered()`, que ordena e recalcula
+    /// os hashes todos.
+    pub fn escreveu(&self, autor: &str) -> bool {
+        self.entries.values().any(|e| e.author == autor)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -216,6 +216,24 @@ impl Rede {
                     Ok(()) => eprintln!("[estranho] liguei-me a {}", &alvo[..8.min(alvo.len())]),
                     Err(e) => eprintln!("[estranho] não consegui ligar: {e}"),
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                // Forjar presença na sala dele. Era isto que o punha a mandar-me o
+                // microfone e a câmara: a interface acreditava em quem se anunciasse.
+                if let Ok(sala) = std::env::var("BRUMA_ESTRANHO_SALA") {
+                    let (srv, canal) = sala.split_once('/').unwrap_or((sala.as_str(), "x"));
+                    let _ = rede
+                        .tx
+                        .send(Saida::Presenca(srv.to_string(), Some(canal.to_string())));
+                    eprintln!("[estranho] forjei presença em {srv}/{canal}");
+                }
+
+                // E injectar som nas colunas dele.
+                for _ in 0..40 {
+                    rede.enviar_voz(&[alvo.trim().to_string()], b"som que ninguem pediu");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                eprintln!("[estranho] mandei 40 pedaços de voz");
             });
         }
 
@@ -602,6 +620,10 @@ async fn sessao(
             .map_err(|e| anyhow!("sem stream: {e}"))?
     };
 
+    // Antes de decidir o que sai e o que entra: ver se este par já escreveu numa sala
+    // minha. Se escreveu, é de casa, mesmo que nunca tenhamos sincronizado um com o outro.
+    aprender_dos_logs(&app, &peer);
+
     let _ = janela.emit("peer-ligado", &peer);
     guarda.anunciado = true;
 
@@ -609,7 +631,11 @@ async fn sessao(
     let voz_conn = conn.clone();
     let voz_peer = peer.clone();
     let contagem = rede.clone();
+    let voz_app = app.clone();
     let ouvinte = tokio::spawn(async move {
+        // Uma linha por sessão, e não uma por datagrama: a voz vem cinquenta vezes por
+        // segundo, e um registo que se enche a si próprio deixa de ser lido.
+        let mut avisei_voz = false;
         loop {
             let d = match voz_conn.read_datagram().await {
                 Ok(d) => d,
@@ -618,6 +644,19 @@ async fn sessao(
                     break;
                 }
             };
+            // Som de quem não partilha sala nenhuma comigo não toca nas minhas colunas.
+            // A interface só verificava se EU estava numa chamada; bastava isso para um
+            // estranho ligado me tocar o que quisesse enquanto eu falava com outra pessoa.
+            if !conhecido(&voz_app, &voz_peer) {
+                if !avisei_voz {
+                    avisei_voz = true;
+                    eprintln!(
+                        "[porteiro] recusei som de {}: não partilha sala nenhuma comigo",
+                        &voz_peer[..8.min(voz_peer.len())]
+                    );
+                }
+                continue;
+            }
             if let Ok(mut n) = contagem.contagem.lock() {
                 n.entry(voz_peer.clone()).or_default().voz_rec += 1;
             }
@@ -699,6 +738,12 @@ async fn sessao(
                     canal,
                     dados,
                 }) => {
+                    // Imagem de um estranho não abre descodificadores meus. Cada fluxo novo
+                    // custa um MediaSource, um <video> e um descodificador de hardware; a
+                    // interface criava-os para qualquer chave que mandasse bytes.
+                    if !conhecido(&leitura_app, &peer_leitura) {
+                        continue;
+                    }
                     if let Ok(mut n) = rede_leitura.contagem.lock() {
                         n.entry(peer_leitura.clone()).or_default().ecra_rec += 1;
                     }
@@ -749,6 +794,19 @@ async fn sessao(
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Presenca { servidor, canal })) => {
+                    // A presença é o que faz o meu microfone e a minha câmara passarem a
+                    // sair para alguém: a interface põe quem se anuncia na lista de
+                    // presentes, e é essa lista que decide para quem se envia. Sem porteiro,
+                    // bastava a um estranho devolver-me o id do meu próprio canal — que eu
+                    // lhe tinha anunciado — para passar a receber-me.
+                    if !participa(&leitura_app, &servidor, &peer_leitura) {
+                        eprintln!(
+                            "[porteiro] recusei presença de {} em {}: não é dessa sala",
+                            &peer_leitura[..8.min(peer_leitura.len())],
+                            &servidor[..8.min(servidor.len())]
+                        );
+                        continue;
+                    }
                     let _ = leitura_janela.emit(
                         "presenca",
                         serde_json::json!({ "peer": &peer_leitura, "servidor": servidor, "canal": canal }),
@@ -792,7 +850,13 @@ async fn sessao(
                         // A presença diz em que sala de voz estou. Mesma regra: só a quem
                         // é dessa casa.
                         Saida::Presenca(servidor, canal) => {
-                            if participa(&app, &servidor, &peer) {
+                            // O `||` existe para o simulador de ataque poder anunciar uma
+                            // presença que não lhe pertence. Sem ele o atacante era travado
+                            // à saída e o porteiro do outro lado nunca chegava a ser posto
+                            // à prova — que é o erro de medir a defesa com um ataque que
+                            // nunca sai de casa.
+                            let ataque = std::env::var("BRUMA_ESTRANHO").is_ok();
+                            if ataque || participa(&app, &servidor, &peer) {
                                 Some(Quadro::Controlo(Msg::Presenca { servidor, canal }))
                             } else {
                                 None
@@ -871,6 +935,45 @@ async fn sessao(
 /// era difundida a toda a gente com o id do servidor à frente. O conteúdo ia cifrado, mas
 /// os ids, os autores e as horas iam em claro — ou seja, qualquer conhecido ficava a saber
 /// em que salas eu estou, com quem, e quando falo.
+/// Se este par partilha ALGUMA sala comigo.
+///
+/// É o porteiro. Até aqui não havia nenhum: `accept()` aceitava qualquer ligação com o ALPN
+/// certo, e a partir daí um estranho com o meu `EndpointId` — que viaja em cada convite que
+/// eu criei — podia injectar som nas minhas colunas a meio de uma chamada e, forjando uma
+/// presença, passar a receber o meu microfone e a minha câmara. A cifra protegia o conteúdo
+/// dos logs; o transporte não tinha porteiro nenhum.
+fn conhecido(app: &Arc<App>, peer: &str) -> bool {
+    app.servidores
+        .lock()
+        .map(|s| s.values().any(|srv| srv.peers.iter().any(|p| p == peer)))
+        .unwrap_or(false)
+}
+
+/// Aprende, do próprio log, que este par é de casa.
+///
+/// `srv.peers` só cresce com quem sincroniza connosco. Duas pessoas que entraram pelo mesmo
+/// convite nunca se conhecem por aí — cada uma só tem o anfitrião — e sem isto ficariam a
+/// falar através dele para sempre, e a recusar-se voz uma à outra. O `author` de cada
+/// entrada está em claro: quem escreveu numa sala minha é, por definição, dessa sala.
+fn aprender_dos_logs(app: &Arc<App>, peer: &str) {
+    let aprendi = {
+        let Ok(mut s) = app.servidores.lock() else {
+            return;
+        };
+        let mut aprendi = false;
+        for srv in s.values_mut() {
+            if srv.log.escreveu(peer) && !srv.peers.iter().any(|p| p == peer) {
+                srv.peers.push(peer.to_string());
+                aprendi = true;
+            }
+        }
+        aprendi
+    };
+    if aprendi {
+        let _ = app.gravar_indice();
+    }
+}
+
 fn participa(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
     app.servidores
         .lock()
