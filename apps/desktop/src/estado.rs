@@ -434,6 +434,27 @@ impl Servidor {
         let boas: Vec<blog::Entry> = entradas
             .into_iter()
             .filter(|e| {
+                // A ASSINATURA PRIMEIRO, E NO MESMO FILTRO.
+                //
+                // Isto verificava só a decifragem aqui, e deixava a assinatura para o
+                // `log.merge` — que corre DEPOIS do `provados.insert`. O `author` de uma
+                // entrada com assinatura de lixo era adoptado como provado, e o `merge`
+                // rejeitava a entrada a seguir: o autor ficava, a entrada não.
+                //
+                // E `provados` é a base de tudo. Ele alimenta o `autores_provados()`, que o
+                // `aplicar` e o `aprender_dos_logs` usam para empurrar chaves para
+                // `srv.peers` — a lista que decide quem me põe som nas colunas. Como o
+                // `peers` é gravado no índice, ficava para sempre.
+                //
+                // Qualquer membro da sala consegue fazer uma entrada que decifra (tem a
+                // chave). Bastava-lhe pôr no `author` a chave de um terceiro e assinar com
+                // lixo, e esse terceiro ganhava direitos de sala sem nunca lá ter entrado.
+                //
+                // Construí a cadeia inteira sobre «a prova é uma entrada que DECIFRA» e
+                // depois enchi o conjunto antes de a prova estar completa.
+                if e.verify().is_err() {
+                    return false;
+                }
                 let (Ok(nonce), Ok(ct)) =
                     (hex24(&e.nonce), HEXLOWER.decode(e.ciphertext.as_bytes()))
                 else {
@@ -1208,6 +1229,65 @@ mod testes {
             antes_de_eu_falar,
             "a minha mensagem não pode mexer na marca de leitura"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uma entrada que DECIFRA mas está mal assinada não dá direitos a ninguém.
+    ///
+    /// Qualquer membro da sala consegue fazer uma entrada que decifra — tem a chave. Se lhe
+    /// puser no `author` a chave de um terceiro e assinar com lixo, o `merge` rejeita a
+    /// entrada; a questão é se o terceiro fica na lista dos provados na mesma. Ficava.
+    ///
+    /// O teste tem de provar as DUAS metades: a forjada sai **e** a legítima entra. Apertar
+    /// isto de mais deixaria de aprender pares verdadeiros, e o sintoma seria «às vezes não
+    /// o vejo na chamada» — muito pior de encontrar do que este.
+    #[test]
+    fn assinatura_ma_nao_da_direitos() {
+        let dir = std::env::temp_dir().join(format!("bruma-assin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let membro = crypto::Identity::from_seed(&[9u8; 32]);
+        let chave_da_sala = [7u8; 32];
+        let terceiro = "cc".repeat(32);
+
+        let log = blog::Log::load(dir.join("s.json")).unwrap();
+        let mut srv = Servidor::novo("dd".repeat(16), chave_da_sala, log, vec![], None, None);
+
+        // Uma entrada legítima do membro, para o caminho bom ficar provado no mesmo teste.
+        let boa = {
+            let carga = Carga::Mensagem {
+                canal: "geral".into(),
+                texto: "sou membro".into(),
+            };
+            let claro = serde_json::to_vec(&carga).unwrap();
+            let (nonce, ct) = crypto::seal(&chave_da_sala, &claro).unwrap();
+            let mut solto = blog::Log::load(dir.join("bom.json")).unwrap();
+            solto
+                .append_local(&membro.signing, nonce, ct, agora_ms())
+                .unwrap()
+        };
+
+        // E a forjada: decifra na mesma (a chave da sala é a mesma), mas o `author` é de um
+        // terceiro e a assinatura é lixo.
+        let mut forjada = boa.clone();
+        forjada.author = terceiro.clone();
+        forjada.sig = "00".repeat(64);
+
+        let entraram = srv.merge_verificado(vec![boa, forjada]).unwrap();
+
+        let provados = srv.autores_provados();
+        let chave_do_membro = HEXLOWER.encode(membro.signing.verifying_key().as_bytes());
+        assert!(
+            provados.contains(&chave_do_membro),
+            "o membro legítimo tinha de ficar provado"
+        );
+        assert!(
+            !provados.contains(&terceiro),
+            "o terceiro NÃO pode ficar provado: a entrada dele nem sequer entrou no log"
+        );
+        assert_eq!(entraram, 1, "só a boa podia entrar");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
