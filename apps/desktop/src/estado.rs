@@ -931,7 +931,17 @@ impl App {
         // ordem, portanto não fecha ciclo com os outros.
         let _escrita = self.escrita_do_indice.lock().unwrap();
         let bytes = serde_json::to_string_pretty(&cofre)?.into_bytes();
-        escrever_atomico(&raiz().join("indice.json"), &bytes)
+        // UMA GERAÇÃO ANTERIOR (#17). O `escrever_atomico` já protege da queda a meio da
+        // escrita, mas não de nada que torne o CONTEÚDO mau — um bug de serialização, um
+        // sector que se degrada, um campo apagado por uma versão antiga. Este é o único
+        // ficheiro cuja perda não se recupera de lado nenhum: os logs ficam, mas sem as
+        // chaves são ruído. Guardar o índice actual como `.anterior` antes de o substituir
+        // custa um `copy` e dá ao `ler_indice` um plano B. Duas gerações chegam.
+        let destino = raiz().join("indice.json");
+        if destino.exists() {
+            let _ = std::fs::copy(&destino, destino.with_extension("anterior"));
+        }
+        escrever_atomico(&destino, &bytes)
     }
 }
 
@@ -1006,6 +1016,21 @@ struct Cofre {
     dados: String,
 }
 
+/// Abre um `Cofre` já parseado, com um motivo LEGÍVEL para cada forma de falhar.
+///
+/// A distinção que interessa a quem lê o registo: `open` a falhar quase sempre quer dizer
+/// «este índice é de outra identidade» (a semente mudou, ou uma restauração deixou o índice
+/// velho ao lado da chave nova); os outros são corrupção do formato.
+fn abrir_cofre(cofre: &Cofre, semente: &[u8; 32]) -> std::result::Result<Indice, String> {
+    let nonce = hex24(&cofre.nonce).map_err(|_| "o nonce do índice está corrompido".to_string())?;
+    let dados = HEXLOWER
+        .decode(cofre.dados.as_bytes())
+        .map_err(|_| "os dados do índice estão corrompidos (hex mal formado)".to_string())?;
+    let claro = crypto::open(&crypto::chave_do_indice(semente), &nonce, &dados)
+        .map_err(|_| "o índice deste computador pertence a outra identidade".to_string())?;
+    serde_json::from_slice(&claro).map_err(|e| format!("o índice decifrou mas não se leu: {e}"))
+}
+
 fn ler_indice(raiz: &std::path::Path, semente: &[u8; 32]) -> Result<(Indice, bool)> {
     let p = raiz.join("indice.json");
     if !p.exists() {
@@ -1014,13 +1039,39 @@ fn ler_indice(raiz: &std::path::Path, semente: &[u8; 32]) -> Result<(Indice, boo
     let bruto = std::fs::read_to_string(&p)?;
 
     // Cifrado é o formato de hoje.
+    //
+    // Um Cofre bem formado que falha a decifrar ou a parsear NÃO mata a app. Antes, qualquer
+    // `?` aqui subia até ao `.expect()` do main e a janela abria, piscava e desaparecia —
+    // exactamente a avaria que o comentário do `arrancar` diz ter fechado para os servidores,
+    // e que ficou aberta um nível acima, no único ficheiro que não se recupera.
     if let Ok(cofre) = serde_json::from_str::<Cofre>(&bruto) {
-        let nonce = hex24(&cofre.nonce)?;
-        let dados = HEXLOWER
-            .decode(cofre.dados.as_bytes())
-            .map_err(|e| anyhow!("índice ilegível: {e}"))?;
-        let claro = crypto::open(&crypto::chave_do_indice(semente), &nonce, &dados)?;
-        return Ok((serde_json::from_slice(&claro)?, false));
+        match abrir_cofre(&cofre, semente) {
+            Ok(i) => return Ok((i, false)),
+            Err(motivo) => {
+                eprintln!("[dados] o índice não abriu: {motivo}. A tentar a geração anterior.");
+                // PLANO B: a geração anterior (#17). Se o actual se degradou mas o `.anterior`
+                // ainda abre, recua-se uma geração — perde-se no máximo a última amizade ou a
+                // última prekey, em vez de as chaves todas.
+                let ant = raiz.join("indice.json.anterior");
+                if let Ok(bruto_ant) = std::fs::read_to_string(&ant) {
+                    if let Ok(cofre_ant) = serde_json::from_str::<Cofre>(&bruto_ant) {
+                        if let Ok(i) = abrir_cofre(&cofre_ant, semente) {
+                            eprintln!(
+                                "[dados] recuei uma geração do índice (indice.json.anterior)."
+                            );
+                            pos_de_lado(&p);
+                            return Ok((i, true));
+                        }
+                    }
+                }
+                // Nem o actual nem o anterior. Arranca-se vazio, com a razão certa — e a razão
+                // distingue «este índice é de outra identidade» de «está corrompido», que são
+                // problemas diferentes para quem os lê.
+                eprintln!("[dados] {motivo}; a começar vazio. O ficheiro ficou guardado ao lado.");
+                pos_de_lado(&p);
+                return Ok((Indice::default(), false));
+            }
+        }
     }
 
     // Em texto simples é o formato ANTIGO: lê-se, e a primeira gravação passa-o a cifrado.
@@ -1161,6 +1212,82 @@ mod testes {
     static DADOS_DE_TESTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn trava_dados() -> std::sync::MutexGuard<'static, ()> {
         DADOS_DE_TESTE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Constrói um `indice.json` cifrado com uma semente, com um nome de perfil identificável.
+    fn cofre_com(dir: &std::path::Path, ficheiro: &str, semente: &[u8; 32], nome: &str) {
+        let indice = Indice {
+            nome: nome.to_string(),
+            ..Default::default()
+        };
+        let claro = serde_json::to_vec(&indice).unwrap();
+        let (nonce, dados) = crypto::seal(&crypto::chave_do_indice(semente), &claro).unwrap();
+        let cofre = Cofre {
+            v: 1,
+            nonce: HEXLOWER.encode(&nonce),
+            dados: HEXLOWER.encode(&dados),
+        };
+        std::fs::write(
+            dir.join(ficheiro),
+            serde_json::to_string_pretty(&cofre).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Um índice cifrado com OUTRA semente faz a app abrir vazia, não morrer (#5, #75).
+    #[test]
+    fn indice_de_outra_identidade_arranca_vazio() {
+        let dir = std::env::temp_dir().join(format!("bruma-outra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let minha = [1u8; 32];
+        let outra = [2u8; 32];
+
+        // Índice de outra identidade no disco.
+        cofre_com(&dir, "indice.json", &outra, "não sou eu");
+
+        // Ler com a MINHA semente: tem de arrancar vazio, NÃO dar erro fatal.
+        let (indice, _) = ler_indice(&dir, &minha).expect("não pode matar a app");
+        assert_eq!(indice.nome, "", "arranca vazio, não com o nome do outro");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".estragado")),
+            "o índice de outra identidade tinha de ficar guardado ao lado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Índice actual degradado, mas a geração anterior abre: recua-se (#17).
+    #[test]
+    fn indice_corrompido_recua_uma_geracao() {
+        let dir = std::env::temp_dir().join(format!("bruma-geracao-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let semente = [5u8; 32];
+
+        // Geração anterior boa, actual corrompido (um Cofre válido cujo `dados` não decifra).
+        cofre_com(&dir, "indice.json.anterior", &semente, "a geração de ontem");
+        cofre_com(&dir, "indice.json", &semente, "a geração de hoje");
+        let bruto = std::fs::read_to_string(dir.join("indice.json")).unwrap();
+        let mut cofre: Cofre = serde_json::from_str(&bruto).unwrap();
+        // Virar um byte no meio do hex de `dados`: continua a parsear como Cofre, mas o
+        // `open` falha — que é o caso em que se deve tentar a geração anterior.
+        let meio = cofre.dados.len() / 2;
+        let b = &cofre.dados[meio..meio + 1];
+        let trocado = if b == "a" { "b" } else { "a" };
+        cofre.dados.replace_range(meio..meio + 1, trocado);
+        std::fs::write(
+            dir.join("indice.json"),
+            serde_json::to_string_pretty(&cofre).unwrap(),
+        )
+        .unwrap();
+
+        let (indice, _) = ler_indice(&dir, &semente).expect("não pode matar a app");
+        assert_eq!(indice.nome, "a geração de ontem", "recuou para a anterior");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Uma escrita atómica não deixa temporário e põe lá o conteúdo certo.

@@ -176,6 +176,38 @@ fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 
     handler_com![]
 }
 
+/// Mostra uma janela nativa com a razão de o Bruma não ter arrancado, e sai.
+///
+/// Sem consola (é uma app de janela) e sem a WebView (que ainda não existe quando o arranque
+/// falha), esta é a única forma de dizer alguma coisa a quem está à frente do ecrã. A
+/// alternativa era o comportamento antigo: a janela pisca e desaparece, e o único vestígio é
+/// uma linha no bruma.log que ninguém sabe que existe.
+fn avisar_e_sair(razao: &str) -> ! {
+    let registo = crate::registo::caminho();
+    let texto = format!(
+        "O Bruma não conseguiu abrir.
+
+{razao}
+
+Os teus dados NÃO foram apagados.          Há mais detalhes em:
+{}",
+        registo.display()
+    );
+    eprintln!("[arranque] {razao}");
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        MessageBoxW(
+            None,
+            &HSTRING::from(texto.as_str()),
+            &HSTRING::from("Bruma"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+    std::process::exit(1);
+}
+
 fn main() {
     // A PRIMEIRA coisa: o `std` guarda o descritor de saída na primeira utilização e não
     // volta a perguntar, portanto isto tem de acontecer antes de alguém escrever seja o
@@ -235,7 +267,18 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let nucleo = Arc::new(estado::App::arrancar()?);
+            // ARRANCAR SEM MORRER EM SILENCIO (#14).
+            //
+            // O `ler_indice` já não mata a app por causa do índice. Mas restam erros de
+            // arranque — a pasta de dados inacessível, a semente corrompida — que subiam até
+            // ao `.expect()` do `run()` e, com `windows_subsystem = "windows"`, faziam a
+            // janela abrir, piscar e desaparecer. A pior falha silenciosa que este projecto
+            // tem. Se o arranque falha, mostra-se uma janela nativa com a razão e o caminho do
+            // registo, e sai-se com dignidade.
+            let nucleo = match estado::App::arrancar() {
+                Ok(n) => Arc::new(n),
+                Err(e) => avisar_e_sair(&format!("{e}")),
+            };
             let ecra = Arc::new(comandos::Ecra::default());
             let _ = comandos::ECRA.set(ecra.clone());
             app.manage(ecra);
