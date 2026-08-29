@@ -1275,6 +1275,55 @@ mod testes {
         .unwrap();
     }
 
+    /// As mensagens não mudam o índice — logo, não há razão para o gravar por causa delas.
+    ///
+    /// É a justificação do #140: o índice guarda chaves, peers, amigos, marcas de leitura —
+    /// nunca mensagens. Escrever mensagens num servidor e voltar a gravar o índice tem de
+    /// produzir o mesmo conteúdo claro.
+    #[test]
+    fn mensagens_nao_mudam_o_indice() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-msg-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = App::arrancar().expect("arrancar");
+
+        // Um servidor com uma chave conhecida, para poder escrever nele.
+        let chave = [4u8; 32];
+        let log = blog::Log::load(caminho_do_log("aa".repeat(16).as_str())).unwrap();
+        let srv = Servidor::novo("aa".repeat(16), chave, log, vec![], None, None);
+        app.servidores.lock().unwrap().insert("aa".repeat(16), srv);
+
+        app.gravar_indice().unwrap();
+        let (antes, _) = ler_indice(&dir, &app.semente).unwrap();
+        let antes = serde_json::to_string(&antes).unwrap();
+
+        // Escrever mensagens no log do servidor — o que muda os FICHEIROS, não o índice.
+        {
+            let mut sv = app.servidores.lock().unwrap();
+            let srv = sv.get_mut(&"aa".repeat(16)).unwrap();
+            for i in 0..5 {
+                srv.escrever(
+                    &app.ident.signing,
+                    &Carga::Mensagem {
+                        canal: "geral".into(),
+                        texto: format!("m{i}"),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        app.gravar_indice().unwrap();
+        let (depois, _) = ler_indice(&dir, &app.semente).unwrap();
+        let depois = serde_json::to_string(&depois).unwrap();
+
+        assert_eq!(
+            antes, depois,
+            "as mensagens não podem mudar o conteúdo do índice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Depois de congelada, a app recusa gravar o índice (#6, #16).
     ///
     /// É o que impede a corrupção entre restaurar a identidade e o processo reiniciar: a

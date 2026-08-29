@@ -925,6 +925,11 @@ async fn sessao(
     let leitura_janela = janela.clone();
     let peer_leitura = peer.clone();
     let mut leitor = tokio::spawn(async move {
+        // O `Ola` aceita-se UMA vez por sessão (#141). Cada um que chega chama `guardar_prekey`,
+        // e uma prekey diferente força um `gravar_indice` — o ciclo completo de cifrar e
+        // escrever no disco. Nada obriga o outro lado a mandar um só: mil `Ola`, cada um com
+        // uma chave x25519 que ele assina, eram mil reescritas do índice à cadência dele.
+        let mut ola_visto = false;
         loop {
             match ler(&mut recebe).await {
                 // O video nao passa pelo emit normal do Tauri: um Vec<u8> vira um array
@@ -957,15 +962,25 @@ async fn sessao(
                     prekey_sig,
                 })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
-                    // A chave de conversa dele, guardada para se poder abrir a conversa
-                    // mais tarde sem ele estar online. Verificada antes de guardada — sem
-                    // isso, qualquer um anunciava a prekey de outro e lia-lhe as conversas.
-                    if let (Some(x), Some(sig)) = (x_pub, prekey_sig) {
-                        if let Err(e) = leitura_app.guardar_prekey(&peer_leitura, &x, &sig) {
-                            eprintln!(
-                                "[rede] a chave de conversa de {} não confere: {e}",
-                                &peer_leitura[..8.min(peer_leitura.len())]
-                            );
+                    if ola_visto {
+                        // Um par que manda dois `Ola` na mesma sessão está avariado ou a
+                        // experimentar — vale a pena sabê-lo, e não vale gravar o disco por ele.
+                        eprintln!(
+                            "[rede] {} mandou outro Olá na mesma sessão; ignorado",
+                            &peer_leitura[..8.min(peer_leitura.len())]
+                        );
+                    } else {
+                        ola_visto = true;
+                        // A chave de conversa dele, guardada para se poder abrir a conversa
+                        // mais tarde sem ele estar online. Verificada antes de guardada — sem
+                        // isso, qualquer um anunciava a prekey de outro e lia-lhe as conversas.
+                        if let (Some(x), Some(sig)) = (x_pub, prekey_sig) {
+                            if let Err(e) = leitura_app.guardar_prekey(&peer_leitura, &x, &sig) {
+                                eprintln!(
+                                    "[rede] a chave de conversa de {} não confere: {e}",
+                                    &peer_leitura[..8.min(peer_leitura.len())]
+                                );
+                            }
                         }
                     }
                 }
@@ -1429,10 +1444,16 @@ fn aplicar(
         }
         (novas, aprendi)
     };
-    // Gravar TAMBÉM quando só se aprendeu um par. Antes só se gravava se viessem entradas
-    // novas, e por isso um par que sincronizasse sem trazer nada ficava só em memória e
-    // perdia-se ao fechar a app.
-    if novas > 0 || aprendi {
+    // Gravar SÓ quando se aprendeu um par (#140).
+    //
+    // O índice guarda chaves de servidores, peers, prekeys, amigos, bloqueados e marcas de
+    // leitura — NÃO guarda mensagens. Quando só `novas > 0`, nada disso mudou: as mensagens
+    // foram para o log (o ficheiro do servidor), e gravar o índice era serializar tudo,
+    // cifrar tudo, escrever um temporário, `sync_data` e `rename` por uma mensagem que não lhe
+    // diz respeito. Numa conversa activa era um fsync por mensagem recebida, à cadência que o
+    // outro lado escolhia. O par que sincroniza sem trazer nada mas que se aprende cai em
+    // `aprendi`, portanto continua a gravar; uma conversa nova grava-se no seu próprio ramo.
+    if aprendi {
         if let Err(e) = app.gravar_indice() {
             eprintln!("[dados] não consegui gravar o índice: {e}");
             let _ = janela.emit(
