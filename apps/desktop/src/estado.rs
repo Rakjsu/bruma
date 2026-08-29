@@ -187,6 +187,18 @@ pub struct Indice {
     pub lido: BTreeMap<String, i64>,
     #[serde(default)]
     pub quem_escreve: QuemEscreve,
+    /// Tudo o que uma versão MAIS RECENTE tenha escrito aqui e que esta não conhece.
+    ///
+    /// O serde descarta campos desconhecidos por omissão. Sem isto: instala-se a v0.19 que
+    /// acrescenta um campo ao índice; a actualização falha ou reinstala-se uma release
+    /// anterior; a v0.18 lê o índice, ignora o campo novo, e a primeira gravação apaga-o
+    /// PERMANENTEMENTE. Com a rotação de chave de sala e a forward secrecy no horizonte — as
+    /// duas guardam estado novo — isto deixa de ser teórico e passa a ser perda de chaves.
+    ///
+    /// Com o `flatten`, os campos desconhecidos são lidos e reescritos intactos por qualquer
+    /// versão. Engole também campos escritos por engano; é o preço, e é muito menor.
+    #[serde(flatten, default)]
+    pub resto: BTreeMap<String, serde_json::Value>,
 }
 
 pub struct Servidor {
@@ -535,6 +547,9 @@ pub struct App {
     /// qual — sobretudo a chave — e o `gravar_indice` reescreve-as, para a primeira gravação
     /// não apagar do índice a única forma de decifrar o ficheiro que ficou no disco.
     nao_abriram: Mutex<Vec<ServidorGuardado>>,
+    /// O que uma versão MAIS RECENTE escreveu no índice e esta não conhece. Guarda-se do
+    /// arranque até à gravação para ser devolvido intacto — ver [`Indice::resto`].
+    resto_do_indice: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Depois de uma restauração de identidade, a semente em `self.semente` é a ANTIGA e a do
     /// disco é a nova. Qualquer `gravar_indice` cifraria com a antiga e deixaria um índice que
     /// no arranque seguinte não abre. Enquanto isto estiver `true`, o `gravar_indice` recusa.
@@ -638,6 +653,7 @@ impl App {
             lido: Mutex::new(indice.lido),
             escrita_do_indice: Mutex::new(()),
             nao_abriram: Mutex::new(nao_abriram),
+            resto_do_indice: Mutex::new(indice.resto.clone()),
             congelada: std::sync::atomic::AtomicBool::new(false),
         };
 
@@ -972,6 +988,8 @@ impl App {
             bloqueados: self.bloqueados.lock().unwrap().clone(),
             quem_escreve: *self.quem_escreve.lock().unwrap(),
             lido: self.lido.lock().unwrap().clone(),
+            // O que uma versão mais recente escreveu e esta não conhece, devolvido intacto.
+            resto: self.resto_do_indice.lock().unwrap().clone(),
         };
         // CIFRADO, sempre. O que aqui está são as chaves de todos os servidores.
         let claro = serde_json::to_vec(&indice)?;
@@ -1082,6 +1100,13 @@ fn pos_de_lado(p: &std::path::Path) {
 /// O `indice.json` cifrado. Fica em JSON com o conteúdo em hex — em vez de bytes crus —
 /// para continuar a ser um ficheiro de texto que se abre e se percebe: vê-se que está
 /// cifrado, vê-se a versão do formato, e não se vê chave nenhuma.
+/// A versão do formato do índice que ESTA versão do Bruma sabe escrever.
+///
+/// O `Cofre.v` era escrito e nunca lido. Ler serve para uma coisa concreta: se o índice foi
+/// escrito por uma versão mais recente, LER pode (o `flatten` preserva o que não se conhece),
+/// mas ESCREVER por cima não — seria a versão antiga a decidir o formato do futuro.
+const VERSAO_DO_INDICE: u8 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct Cofre {
     v: u8,
@@ -1095,6 +1120,18 @@ struct Cofre {
 /// «este índice é de outra identidade» (a semente mudou, ou uma restauração deixou o índice
 /// velho ao lado da chave nova); os outros são corrupção do formato.
 fn abrir_cofre(cofre: &Cofre, semente: &[u8; 32]) -> std::result::Result<Indice, String> {
+    // LER PODE, ESCREVER POR CIMA NÃO.
+    //
+    // O `Cofre.v` era escrito e nunca lido. Se o índice foi escrito por uma versão mais
+    // recente, o `flatten` do `Indice::resto` garante que se lê sem perder nada — mas gravar
+    // por cima seria esta versão a decidir o formato do futuro. Marca-se, e o `gravar_indice`
+    // recusa com uma mensagem que diz o que fazer.
+    if cofre.v > VERSAO_DO_INDICE {
+        return Err(format!(
+            "o índice foi escrito por uma versão mais recente do Bruma (formato {} contra {});              actualiza antes de continuar",
+            cofre.v, VERSAO_DO_INDICE
+        ));
+    }
     let nonce = hex24(&cofre.nonce).map_err(|_| "o nonce do índice está corrompido".to_string())?;
     let dados = HEXLOWER
         .decode(cofre.dados.as_bytes())
@@ -1314,6 +1351,64 @@ mod testes {
             serde_json::to_string_pretty(&cofre).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Um campo escrito por uma versão mais recente sobrevive a esta versão o ler e gravar.
+    ///
+    /// Sem o `flatten`, o serde descartava-o e a primeira gravação apagava-o para sempre —
+    /// e com a rotação de chave no horizonte, isso é perda de chaves, não de comodidade.
+    #[test]
+    fn campo_de_versao_futura_sobrevive_a_ida_e_volta() {
+        // Um índice como a v0.19 o escreveria: campos conhecidos mais um que esta não conhece.
+        let json = br#"{"nome":"eu","servidores":[],"chaves_antigas":{"sala1":"abc"}}"#;
+        let indice: Indice = serde_json::from_slice(json).expect("tem de ler");
+        assert_eq!(indice.nome, "eu", "os conhecidos leem-se");
+        assert!(
+            indice.resto.contains_key("chaves_antigas"),
+            "o campo desconhecido tinha de ser guardado, e não descartado"
+        );
+
+        // E ao voltar a escrever, sai intacto.
+        let volta = serde_json::to_string(&indice).unwrap();
+        assert!(
+            volta.contains("chaves_antigas") && volta.contains("abc"),
+            "o campo desconhecido tinha de ser reescrito intacto: {volta}"
+        );
+    }
+
+    /// Um índice de formato MAIS RECENTE não se sobrescreve — lê-se, mas recusa-se gravar.
+    #[test]
+    fn indice_de_formato_futuro_e_recusado() {
+        let semente = [8u8; 32];
+        let indice = Indice {
+            nome: "do futuro".into(),
+            ..Default::default()
+        };
+        let claro = serde_json::to_vec(&indice).unwrap();
+        let (nonce, dados) = crypto::seal(&crypto::chave_do_indice(&semente), &claro).unwrap();
+
+        // O mesmo conteúdo, com a versão de formato desta app: abre.
+        let agora = Cofre {
+            v: VERSAO_DO_INDICE,
+            nonce: HEXLOWER.encode(&nonce),
+            dados: HEXLOWER.encode(&dados),
+        };
+        assert!(
+            abrir_cofre(&agora, &semente).is_ok(),
+            "o formato de hoje tem de abrir"
+        );
+
+        // Com uma versão de formato futura: recusa, com a razão certa.
+        let futuro = Cofre {
+            v: VERSAO_DO_INDICE + 1,
+            nonce: agora.nonce.clone(),
+            dados: agora.dados.clone(),
+        };
+        let e = abrir_cofre(&futuro, &semente).unwrap_err();
+        assert!(
+            e.contains("versão mais recente"),
+            "a razão tem de dizer o que se passa: {e}"
+        );
     }
 
     /// A raiz de produção é ABSOLUTA — um caminho absoluto não depende do cwd, que era o bug.
