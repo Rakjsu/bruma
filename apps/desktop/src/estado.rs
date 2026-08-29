@@ -35,14 +35,41 @@ use crate::modelo::{self, Aplicavel, Carga, EstadoDoServidor, MensagemVista};
 ///     ambiente de desenvolvimento — não se abandona o que já lá está;
 ///  3. a pasta de dados do sistema, que é onde isto devia ter começado.
 pub fn raiz() -> PathBuf {
+    // BRUMA_DADOS é relido A CADA CHAMADA, de propósito: é o mecanismo dos testes, e cada
+    // teste quer a sua pasta. Não passa pelo cache abaixo.
     if let Ok(escolhida) = std::env::var("BRUMA_DADOS") {
         return PathBuf::from(escolhida);
     }
-    let ao_lado = PathBuf::from("dados");
-    if ao_lado.join("identidade.key").exists() {
-        return ao_lado;
+    // EM PRODUÇÃO, resolve-se UMA vez e fica.
+    //
+    // Antes, `raiz()` era uma função pura recalculada em cada `gravar_indice`, `caminho_do_log`
+    // e `registo::caminho`. Dois problemas: o ramo `dados` era `PathBuf::from("dados")`,
+    // RELATIVO ao directório de trabalho — se um diálogo nativo ou uma biblioteca mudasse o
+    // cwd a meio da sessão, as gravações seguintes iam para outra pasta e o histórico
+    // partia-se em dois sem um erro. E a decisão dependia de `dados/identidade.key` existir
+    // NAQUELE instante, portanto lançar a app de outro sítio criava uma identidade nova em
+    // silêncio. Um `OnceLock` que só cobre este caminho (nunca o de BRUMA_DADOS) resolve os
+    // dois sem tocar nos testes.
+    static RAIZ: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    RAIZ.get_or_init(resolver_raiz).clone()
+}
+
+/// A pasta de dados em produção, resolvida em ABSOLUTO e estável ao cwd.
+fn resolver_raiz() -> PathBuf {
+    // `dados` ao lado do EXECUTÁVEL, não do directório de trabalho. É o que torna a pasta
+    // portátil imune a uma mudança de cwd, que era o bug concreto.
+    let ao_lado = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|dir| dir.join("dados")));
+    if let Some(d) = &ao_lado {
+        if d.join("identidade.key").exists() {
+            return d.clone();
+        }
     }
-    pasta_do_sistema().unwrap_or(ao_lado)
+    // Senão, a pasta do sistema (%APPDATA%\Bruma ou ~/.local/share/bruma), que já é absoluta.
+    pasta_do_sistema()
+        .or(ao_lado)
+        .unwrap_or_else(|| PathBuf::from("dados"))
 }
 
 #[cfg(windows)]
@@ -1273,6 +1300,19 @@ mod testes {
             serde_json::to_string_pretty(&cofre).unwrap(),
         )
         .unwrap();
+    }
+
+    /// A raiz de produção é ABSOLUTA — um caminho absoluto não depende do cwd, que era o bug.
+    ///
+    /// O ramo antigo era `PathBuf::from("dados")`, relativo ao directório de trabalho: uma
+    /// mudança de cwd a meio da sessão mandava as gravações para outra pasta. Estável ao cwd
+    /// = absoluto.
+    #[test]
+    fn a_raiz_de_producao_e_absoluta() {
+        assert!(
+            resolver_raiz().is_absolute(),
+            "a raiz de produção não pode ser relativa ao cwd"
+        );
     }
 
     /// As mensagens não mudam o índice — logo, não há razão para o gravar por causa delas.
