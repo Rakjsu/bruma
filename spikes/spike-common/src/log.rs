@@ -16,7 +16,31 @@ use std::path::Path;
 
 pub const ZERO_HASH: [u8; 32] = [0u8; 32];
 
+/// Uma entrada do log: o que vai para o disco e para a rede, tal e qual.
+///
+/// # NÃO SE ACRESCENTAM CAMPOS AQUI
+///
+/// Campos novos vão **dentro do cifrado**, na `Carga` — nunca neste struct. A razão é que o
+/// `ciphertext` é o último campo do [`Entry::canonical`] e portanto **está coberto pela
+/// assinatura**: tudo o que cresce lá dentro (anexos, respostas, reacções, editar, apagar) já
+/// está protegido de graça, sem tocar em nada disto.
+///
+/// Um campo acrescentado a este struct, esse, NÃO entraria no `canonical()` — logo não ficaria
+/// coberto pela assinatura, e poderia ser alterado por quem retransmite sem que ninguém desse
+/// por isso. É por isso que existe o `deny_unknown_fields` abaixo: um campo que uma versão
+/// futura acrescente faz a entrada ser RECUSADA, em vez de aceite com uma parte por verificar.
+///
+/// Recusar é seguro aqui porque o `Log::load` salta a entrada, conta-a e guarda-a em
+/// `.rejeitadas` em vez de matar o log; a ligação não cai por causa disso; e a interface diz
+/// que o outro lado tem outra versão. Sem essas três, isto trocaria um silêncio por uma
+/// ligação partida.
+///
+/// Se um dia um campo tiver mesmo de estar em claro — o único candidato conhecido é a rotação
+/// de chave de sala —, não se acrescenta aqui: sobe-se um byte de versão e faz-se um
+/// `canonical_v2` a coexistir com o v1. Ver o plano de transição no cérebro
+/// (`bruma-plano-do-hash`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     pub author: String, // hex, 32 bytes — é também o EndpointId do iroh
     pub ts_ms: u64,
@@ -28,6 +52,19 @@ pub struct Entry {
 
 impl Entry {
     /// Bytes canónicos sobre os quais se calcula o hash. A ordem é parte do protocolo.
+    ///
+    /// # ISTO NÃO SE MUDA
+    ///
+    /// O hash que sai daqui é a IDENTIDADE da entrada: é a chave do mapa, é o `prev` que forma
+    /// a cadeia, e é o que a assinatura cobre. Mudar esta função — reordenar, acrescentar,
+    /// «arrumar» — faz todas as entradas em disco passarem a ter outro hash, a `verify()` de
+    /// cada uma falhar, e o `load` saltá-las uma a uma: **o histórico inteiro desaparece do
+    /// ecrã em silêncio**, e a app arranca com salas vazias como se nada fosse.
+    ///
+    /// O teste `a_disposicao_do_canonical_esta_fixada` existe para isso não acontecer sem
+    /// alguém decidir que quer que aconteça.
+    ///
+    /// Para crescer, ver a nota do [`Entry`]: campos novos vão dentro do cifrado.
     fn canonical(&self) -> Result<Vec<u8>> {
         let mut b = Vec::new();
         b.extend_from_slice(&hex32(&self.author)?);
@@ -732,6 +769,80 @@ mod tests {
             .unwrap();
         assert!(log.orfas().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A DISPOSIÇÃO do `canonical()` está fixada, e mudá-la falha aqui.
+    ///
+    /// O teste constrói os bytes à mão, segundo a disposição documentada — `author ‖ ts_ms ‖
+    /// prev ‖ nonce ‖ ciphertext`, o `ts_ms` em big-endian — e exige que o `hash()` concorde.
+    /// Não é uma fotografia do que o código faz: é a ESPECIFICAÇÃO escrita à parte, com o
+    /// código a ser verificado contra ela. Se alguém reordenar, acrescentar um campo ou trocar
+    /// o big-endian, isto falha e diz porquê.
+    ///
+    /// Porque é que vale a pena: mudar o `canonical()` faz todas as entradas em disco passarem
+    /// a ter outro hash, as assinaturas deixarem de conferir, e o `load` saltá-las uma a uma —
+    /// o histórico desaparece **em silêncio**. A correcção que tornou o log resiliente a uma
+    /// linha estragada tornou este erro mais silencioso, não menos.
+    #[test]
+    fn a_disposicao_do_canonical_esta_fixada() {
+        let autor = [0xABu8; 32];
+        let prev = [0xCDu8; 32];
+        let nonce = [0xEFu8; 24];
+        let ct: Vec<u8> = vec![1, 2, 3, 4, 5];
+        let ts: u64 = 0x0102_0304_0506_0708;
+
+        let e = Entry {
+            author: HEXLOWER.encode(&autor),
+            ts_ms: ts,
+            prev: HEXLOWER.encode(&prev),
+            nonce: HEXLOWER.encode(&nonce),
+            ciphertext: HEXLOWER.encode(&ct),
+            sig: String::new(),
+        };
+
+        // A disposição, escrita aqui à mão e não tirada do `canonical()`.
+        let mut esperado = Vec::new();
+        esperado.extend_from_slice(&autor);
+        esperado.extend_from_slice(&ts.to_be_bytes());
+        esperado.extend_from_slice(&prev);
+        esperado.extend_from_slice(&nonce);
+        esperado.extend_from_slice(&ct);
+        assert_eq!(
+            e.canonical().unwrap(),
+            esperado,
+            "a disposição do canonical() mudou — ver a nota na função antes de seguir"
+        );
+
+        // E o hash que dela sai, preso a um valor. Apanha até uma mudança que alterasse os
+        // dois lados do assert acima ao mesmo tempo.
+        assert_eq!(
+            e.hash_hex().unwrap(),
+            "37d7c975e7a9d011cf46e8b2c089f40239bd992c97c88fdee8b5f93325c172be",
+            "o hash canónico mudou — o histórico de toda a gente deixaria de verificar"
+        );
+    }
+
+    /// Um campo que uma versão futura acrescente ao `Entry` é RECUSADO, não ignorado.
+    ///
+    /// Sem o `deny_unknown_fields`, o serde ignorava-o: a entrada parseava, o `canonical()`
+    /// calculava-se sem ele, a assinatura conferia, e a entrada era aceite — com um campo que
+    /// ninguém verificou e que qualquer retransmissor podia ter alterado. Uma falha de
+    /// segurança que se apresenta como sucesso.
+    #[test]
+    fn um_campo_novo_no_entry_e_recusado() {
+        let bom =
+            br#"{"author":"aa","ts_ms":1,"prev":"bb","nonce":"cc","ciphertext":"dd","sig":"ee"}"#;
+        assert!(
+            serde_json::from_slice::<Entry>(bom).is_ok(),
+            "uma entrada normal tem de continuar a ser lida"
+        );
+
+        // O que uma v0.19 mandaria se acrescentasse um campo ao Entry.
+        let futuro = br#"{"author":"aa","ts_ms":1,"prev":"bb","nonce":"cc","ciphertext":"dd","sig":"ee","chave_usada":"f0"}"#;
+        assert!(
+            serde_json::from_slice::<Entry>(futuro).is_err(),
+            "um campo por verificar tem de ser recusado, não aceite em silêncio"
+        );
     }
 
     /// Uma linha estragada no meio não mata o histórico à volta.
