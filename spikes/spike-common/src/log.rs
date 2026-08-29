@@ -60,6 +60,10 @@ pub struct Log {
     /// Indexado por hash em hex — a deduplicação sai de graça.
     entries: BTreeMap<String, Entry>,
     path: std::path::PathBuf,
+    /// Linhas que não se conseguiram ler ou cuja assinatura não bateu, ao carregar. Um só
+    /// byte trocado no meio do ficheiro deixava de custar uma sessão e passava a custar a
+    /// sala inteira. Agora salta-se a linha má, conta-se aqui, e as boas à volta sobrevivem.
+    ilegiveis: usize,
 }
 
 impl Log {
@@ -85,32 +89,80 @@ impl Log {
                     e.verify()?;
                     entries.insert(e.hash_hex()?, e);
                 }
-                let log = Log { entries, path };
+                let log = Log {
+                    entries,
+                    path,
+                    ilegiveis: 0,
+                };
                 log.reescrever()?;
                 return Ok(log);
             }
+            let total = raw.lines().count();
+            let mut ilegiveis = 0usize;
+            let mut rejeitadas: Vec<&str> = Vec::new();
             for (n, linha) in raw.lines().enumerate() {
                 if linha.trim().is_empty() {
                     continue;
                 }
                 let e: Entry = match serde_json::from_str(linha) {
                     Ok(e) => e,
-                    Err(erro) => {
-                        // Só a ÚLTIMA linha pode estar cortada: é a que estava a ser
-                        // escrita. Uma linha partida no meio é corrupção a sério e não se
-                        // finge que não é.
-                        if n + 1 == raw.lines().count() {
+                    Err(_) => {
+                        // A ÚLTIMA linha cortada é a que estava a ser escrita — normal, ignora-se
+                        // em silêncio. Uma linha ilegível no MEIO já não mata o ficheiro: um log
+                        // é um conjunto de entradas independentes, e não há razão para uma
+                        // envenenar as outras. Salta-se, conta-se, e guarda-se de lado.
+                        if n + 1 == total {
                             break;
                         }
-                        return Err(anyhow!("linha {} do registo ilegível: {erro}", n + 1));
+                        ilegiveis += 1;
+                        rejeitadas.push(linha);
+                        continue;
                     }
                 };
-                // Recusa entradas adulteradas mesmo vindas do disco.
-                e.verify()?;
-                entries.insert(e.hash_hex()?, e);
+                // A assinatura tem de bater mesmo vinda do disco. Uma que não bate é ruído —
+                // salta como o `merge` já faz, em vez de abortar o log inteiro.
+                if e.verify().is_err() {
+                    ilegiveis += 1;
+                    rejeitadas.push(linha);
+                    continue;
+                }
+                let Ok(h) = e.hash_hex() else {
+                    ilegiveis += 1;
+                    rejeitadas.push(linha);
+                    continue;
+                };
+                entries.insert(h, e);
             }
+            // As linhas rejeitadas não se deitam fora: ficam num ficheiro ao lado, para quem
+            // souber ler JSON as poder recuperar, e para não serem lixo invisível.
+            if !rejeitadas.is_empty() {
+                let destino = path.with_extension("rejeitadas");
+                let _ = std::fs::write(
+                    &destino,
+                    rejeitadas.join(
+                        "
+",
+                    ),
+                );
+                eprintln!(
+                    "[dados] {} entrada(s) de {} não se leram em {}; guardadas em {}",
+                    ilegiveis,
+                    total,
+                    path.display(),
+                    destino.display()
+                );
+            }
+            return Ok(Log {
+                entries,
+                path,
+                ilegiveis,
+            });
         }
-        Ok(Log { entries, path })
+        Ok(Log {
+            entries,
+            path,
+            ilegiveis: 0,
+        })
     }
 
     /// Acrescenta entradas ao fim do ficheiro.
@@ -244,6 +296,11 @@ impl Log {
     /// os hashes todos.
     pub fn escreveu(&self, autor: &str) -> bool {
         self.entries.values().any(|e| e.author == autor)
+    }
+
+    /// Quantas entradas não se conseguiram ler no último `load`. Ver [`Log::ilegiveis`].
+    pub fn ilegiveis(&self) -> usize {
+        self.ilegiveis
     }
 
     pub fn len(&self) -> usize {
@@ -430,7 +487,10 @@ mod tests {
     /// que esta tudo bem, porque continuar a acrescentar por cima de um ficheiro estragado
     /// so espalha o estrago.
     #[test]
-    fn linha_partida_no_meio_e_erro_e_nao_silencio() {
+    fn linha_partida_no_meio_e_saltada_e_nao_mata() {
+        // Esta decisão INVERTEU-SE (backlog #11): uma linha partida no meio deixou de matar
+        // o log inteiro. Um log é um conjunto de entradas independentes; não há razão para
+        // uma envenenar as outras. Salta-se, conta-se, e as boas à volta sobrevivem.
         let path = tmp("corrompido");
         {
             let mut log = Log::load(&path).unwrap();
@@ -452,8 +512,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Log::load(&path).is_err(), "tem de recusar, nao ignorar");
+        let log = Log::load(&path).expect("não pode recusar o log inteiro por uma linha");
+        assert_eq!(log.len(), 2, "as duas boas sobrevivem");
+        assert_eq!(log.ilegiveis(), 1, "e a má é contada, não escondida");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("rejeitadas"));
     }
 
     /// Quem ja tinha o Bruma instalado tem ficheiros no formato antigo. Abrir a app nova
@@ -669,6 +732,47 @@ mod tests {
             .unwrap();
         assert!(log.orfas().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Uma linha estragada no meio não mata o histórico à volta.
+    ///
+    /// Antes, um byte trocado numa linha do meio fazia o `load` devolver `Err`, o servidor era
+    /// posto de lado, e a chave apagada a seguir: um bit custava a sala inteira. Agora a linha
+    /// má é saltada, contada, e guardada em `.rejeitadas`; as boas entram.
+    #[test]
+    fn linha_estragada_nao_mata_o_log() {
+        let path = tmp("linha-estragada");
+        {
+            let mut log = Log::load(&path).unwrap();
+            for i in 0..5u8 {
+                log.append_local(&key(1), [0u8; 24], vec![i], 1_000 + i as u64)
+                    .unwrap();
+            }
+        }
+        // Estragar a linha do MEIO (a 3.ª de 5), deixando as outras intactas.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut linhas: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
+        assert_eq!(linhas.len(), 5, "cinco entradas");
+        linhas[2] = "{isto nao e json valido".into();
+        std::fs::write(
+            &path,
+            linhas.join(
+                "
+",
+            ),
+        )
+        .unwrap();
+
+        let log = Log::load(&path).unwrap();
+        assert_eq!(log.len(), 4, "as quatro boas tinham de sobreviver");
+        assert_eq!(log.ilegiveis(), 1, "e a estragada tinha de ser contada");
+        assert!(
+            path.with_extension("rejeitadas").exists(),
+            "a linha rejeitada tinha de ficar guardada de lado"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("rejeitadas"));
     }
 
     /// Se a escrita falha, a entrada NÃO fica na memória — o erro sobe e o `len()` não muda.
