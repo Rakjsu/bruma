@@ -822,6 +822,56 @@ mod tests {
         );
     }
 
+    /// E o que a assinatura COBRE também está preso — não só a disposição dos bytes.
+    ///
+    /// O teste acima prende o `canonical()` e o algoritmo do resumo. Não prendia o
+    /// ARGUMENTO que vai ao `sign`. Trocar `signing.sign(&e.hash()?)` por
+    /// `signing.sign(&e.canonical()?)` no `append_local` e a mesma troca no `verify()`
+    /// deixava a suite inteira verde — as duas metades continuam a concordar uma com a
+    /// outra — e apagava o histórico de toda a gente na actualização seguinte, porque as
+    /// assinaturas já gravadas foram feitas sobre a outra mensagem.
+    ///
+    /// Por isso este teste NÃO assina nada por sua conta: manda o `append_local` fazê-lo, e
+    /// prende o resultado. A chave é determinística (`key(1)` é `[1; 32]`) e o Ed25519 é
+    /// determinístico por norma, portanto a assinatura de uma entrada conhecida é um valor
+    /// fixo. Fixá-lo é fixar o caminho de escrita inteiro: o `head()` de um log vazio, a
+    /// montagem do `Entry`, a disposição, o resumo, e o que se assina.
+    #[test]
+    fn o_que_a_assinatura_cobre_esta_fixado() {
+        let caminho = tmp("assinatura-fixada");
+        let mut log = Log::load(&caminho).unwrap();
+        let e = log
+            .append_local(
+                &key(1),
+                [0xEF; 24],
+                vec![1, 2, 3, 4, 5],
+                0x0102_0304_0506_0708,
+            )
+            .unwrap();
+
+        // Um log vazio: o `prev` é o hash-zero. Se isto mudar, tudo o resto abaixo muda.
+        assert_eq!(
+            e.prev,
+            HEXLOWER.encode(&ZERO_HASH),
+            "o prev de um log vazio"
+        );
+
+        assert_eq!(
+            e.hash_hex().unwrap(),
+            "e99714b702980e788201811cf29fc86c6d949b0a8cd352c31cbfbcfc4982298c",
+            "o hash da entrada escrita pelo caminho de produção mudou"
+        );
+        assert_eq!(
+            e.sig, "3b8d01d968db6e28923fd8f210f91fce4c9b615a3d035e8ad7c6dc61f1f98dc121f78a7288c6348dd053bf2850d6f304b8baa09590dab08bd9b2e93335dd8502",
+            "a MENSAGEM assinada mudou — as assinaturas já gravadas deixariam de conferir"
+        );
+
+        // E continua a verificar, que é o outro lado da mesma moeda.
+        e.verify()
+            .expect("a entrada que acabámos de escrever tem de verificar");
+        let _ = std::fs::remove_file(&caminho);
+    }
+
     /// Um campo que uma versão futura acrescente ao `Entry` é RECUSADO, não ignorado.
     ///
     /// Sem o `deny_unknown_fields`, o serde ignorava-o: a entrada parseava, o `canonical()`
