@@ -930,6 +930,8 @@ async fn sessao(
         // escrever no disco. Nada obriga o outro lado a mandar um só: mil `Ola`, cada um com
         // uma chave x25519 que ele assina, eram mil reescritas do índice à cadência dele.
         let mut ola_visto = false;
+        // Um quadro ignorado regista-se uma vez por sessão, não mil.
+        let mut quadro_ignorado = false;
         loop {
             match ler(&mut recebe).await {
                 // O video nao passa pelo emit normal do Tauri: um Vec<u8> vira um array
@@ -993,6 +995,19 @@ async fn sessao(
                         "[rede] {} falou uma coisa que esta versão não conhece; ignorada",
                         &peer_leitura[..8.min(peer_leitura.len())]
                     );
+                }
+                // Um QUADRO que esta versão não sabe ler — um tipo novo, ou um corpo que não
+                // desserializa. Ignora-se, pela mesma razão da linha acima, e regista-se UMA
+                // vez por sessão: se o outro lado estiver a mandar mil quadros de um tipo novo,
+                // mil linhas iguais no registo escondem tudo o resto.
+                Ok(Quadro::Desconhecido(porque)) => {
+                    if !quadro_ignorado {
+                        quadro_ignorado = true;
+                        eprintln!(
+                            "[rede] {} mandou um quadro que esta versão não lê ({porque});                              ignorado (não volto a dizer nesta sessão)",
+                            &peer_leitura[..8.min(peer_leitura.len())]
+                        );
+                    }
                 }
                 Ok(Quadro::Controlo(Msg::Sync { servidor, entradas })) => {
                     if ataque_permitido() {
@@ -1506,6 +1521,9 @@ fn aplicar(
 /// O cabecalho do video vai em JSON na mesma, porque e pequeno e diz a que servidor e
 /// canal pertence; o que fica cru sao os bytes que pesam.
 pub enum Quadro {
+    /// Um quadro que esta versão não sabe ler — tipo desconhecido, ou corpo que não
+    /// desserializa. Ver o `ler()`: NÃO é um erro, é uma coisa a ignorar.
+    Desconhecido(&'static str),
     Controlo(Msg),
     Video {
         tipo: String,
@@ -1539,6 +1557,9 @@ async fn escrever(envia: &mut SendStream, m: &Msg) -> Result<()> {
 
 async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
     let corpo: Vec<u8> = match q {
+        // Nunca se ENVIA um desconhecido: a variante existe só para o lado da leitura. Se
+        // alguém a construir para enviar, é um bug de programação e não um caso a tolerar.
+        Quadro::Desconhecido(porque) => bail!("não se envia um quadro desconhecido ({porque})"),
         Quadro::Controlo(m) => {
             let mut v = vec![TIPO_CONTROLO];
             v.extend_from_slice(&serde_json::to_vec(m)?);
@@ -1593,26 +1614,60 @@ async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
         .await
         .map_err(|e| anyhow!("read: {e}"))?;
 
+    interpretar(&corpo)
+}
+
+/// O que um corpo de quadro QUER DIZER — sem I/O nenhum.
+///
+/// Está à parte do `ler()` de propósito: é uma DECISÃO, e uma decisão testa-se sozinha. O
+/// `ler()` recebe um stream QUIC, que não se constrói num teste; isto recebe bytes.
+///
+/// O QUE NÃO SE ENTENDE IGNORA-SE; SÓ O QUE NÃO SE CONSEGUE LER É QUE É ERRO.
+///
+/// Isto devolvia `Err` para um tipo de quadro desconhecido e para um corpo que não
+/// desserializa — e o leitor faz `break` a qualquer `Err`, ou seja, mata a sessão. O
+/// `Msg::Desconhecida` existe com um comentário longo a explicar que uma variante nova não
+/// pode derrubar a ligação; só que essa tolerância está uma camada ACIMA de onde a decisão é
+/// tomada. No dia em que a v0.18 acrescentar um `TIPO_ANEXO`, a primeira coisa que ela
+/// mandasse a uma v0.17 matava a ligação — e o vigia religava, e ela voltava a mandar: um
+/// ciclo eterno com o sintoma «aparece ligado e não chega nada».
+///
+/// O enquadramento leva o tamanho à frente, portanto um quadro desconhecido é trivialmente
+/// saltável: o corpo já está em memória e deita-se fora. Os erros de ENQUADRAMENTO (não
+/// conseguir ler, tamanho absurdo) ficam no `ler()` e continuam a ser erro, porque aí não se
+/// sabe onde começa o quadro seguinte — a diferença é entre não perceber o conteúdo e não
+/// saber onde ele acaba.
+fn interpretar(corpo: &[u8]) -> Result<Quadro> {
+    if corpo.is_empty() {
+        return Ok(Quadro::Desconhecido("quadro vazio"));
+    }
     match corpo[0] {
-        TIPO_CONTROLO => Ok(Quadro::Controlo(serde_json::from_slice(&corpo[1..])?)),
+        TIPO_CONTROLO => match serde_json::from_slice(&corpo[1..]) {
+            Ok(m) => Ok(Quadro::Controlo(m)),
+            Err(_) => Ok(Quadro::Desconhecido("controlo que não desserializa")),
+        },
         TIPO_VIDEO => {
             if corpo.len() < 3 {
-                bail!("quadro de video truncado");
+                return Ok(Quadro::Desconhecido("vídeo truncado"));
             }
             let tam_cab = u16::from_be_bytes([corpo[1], corpo[2]]) as usize;
             let fim = 3 + tam_cab;
             if corpo.len() < fim {
-                bail!("cabecalho de video truncado");
+                return Ok(Quadro::Desconhecido("cabeçalho de vídeo truncado"));
             }
-            let cab: CabecalhoVideo = serde_json::from_slice(&corpo[3..fim])?;
-            Ok(Quadro::Video {
-                tipo: cab.tipo,
-                servidor: cab.servidor,
-                canal: cab.canal,
-                dados: corpo[fim..].to_vec(),
-            })
+            match serde_json::from_slice::<CabecalhoVideo>(&corpo[3..fim]) {
+                Ok(cab) => Ok(Quadro::Video {
+                    tipo: cab.tipo,
+                    servidor: cab.servidor,
+                    canal: cab.canal,
+                    dados: corpo[fim..].to_vec(),
+                }),
+                Err(_) => Ok(Quadro::Desconhecido("cabeçalho de vídeo ilegível")),
+            }
         }
-        outro => bail!("tipo de quadro desconhecido: {outro}"),
+        _ => Ok(Quadro::Desconhecido(
+            "tipo de quadro que esta versão não conhece",
+        )),
     }
 }
 
@@ -1626,6 +1681,41 @@ mod testes {
     /// `Err` e o leitor faz `break`. No dia em que uma versao acrescentasse uma mensagem,
     /// deixava de conseguir falar com todas as anteriores -- e o sintoma nao seria "essa
     /// funcionalidade nao funciona", seria "o outro aparece ligado e nao chega nada".
+    /// Um QUADRO de um tipo que esta versão não conhece não pode derrubar a ligação.
+    ///
+    /// É o irmão do teste abaixo, uma camada mais abaixo — e é a camada que decide primeiro.
+    /// A tolerância do `Msg::Desconhecida` não servia de nada enquanto o enquadramento
+    /// matasse a sessão antes de o JSON sequer ser lido.
+    #[test]
+    fn um_quadro_desconhecido_nao_derruba_a_sessao() {
+        // O que a v0.18 mandaria: um tipo que ainda não existe, com um corpo qualquer.
+        let mut futuro = vec![7u8];
+        futuro.extend_from_slice(b"o que quer que a proxima versao invente");
+        let q = interpretar(&futuro).expect("um tipo desconhecido NÃO pode ser erro");
+        assert!(
+            matches!(q, Quadro::Desconhecido(_)),
+            "devia cair no desconhecido, deu outra coisa"
+        );
+
+        // Um corpo de um tipo CONHECIDO que não desserializa: idem. É o mesmo `break` do
+        // leitor, chegado por outro caminho.
+        let mut lixo = vec![TIPO_CONTROLO];
+        lixo.extend_from_slice(b"{isto nao e json");
+        assert!(
+            matches!(interpretar(&lixo), Ok(Quadro::Desconhecido(_))),
+            "um controlo ilegível não pode matar a sessão"
+        );
+
+        // E a tolerância NÃO pode engolir o que se conhece — senão troca-se uma ligação
+        // partida por uma app muda, que é pior.
+        let mut ola = vec![TIPO_CONTROLO];
+        ola.extend_from_slice(br#"{"t":"Ola","nome":"Rakjsu"}"#);
+        assert!(
+            matches!(interpretar(&ola), Ok(Quadro::Controlo(Msg::Ola { .. }))),
+            "o Olá deixou de ser lido"
+        );
+    }
+
     #[test]
     fn uma_mensagem_desconhecida_nao_derruba_a_sessao() {
         // O que uma versao futura mandaria, com campos que esta nem imagina.

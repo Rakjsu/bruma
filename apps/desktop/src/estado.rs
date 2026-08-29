@@ -281,8 +281,22 @@ impl Servidor {
             let Ok(claro) = crypto::open(&self.chave, &nonce, &ct) else {
                 continue;
             };
-            let Ok(carga) = serde_json::from_slice::<Carga>(&claro) else {
-                continue;
+            // LEITURA EM DOIS PASSOS (#8, #20).
+            //
+            // Uma carga que esta versão não reconhece caía aqui num `continue`: desaparecia
+            // da vista, sem erro, sem sinal — e ficava guardada no disco na mesma. A app
+            // guardava aquilo que se recusava a mostrar, e não o dizia. Agora, se a `Carga`
+            // não se lê, tenta-se ler o mínimo (a etiqueta e o canal) para se poder pôr um
+            // marcador no sítio certo. Só se deita fora o que nem sequer é uma carga.
+            let carga = match serde_json::from_slice::<Carga>(&claro) {
+                Ok(c) => c,
+                Err(_) => match serde_json::from_slice::<modelo::CargaCrua>(&claro) {
+                    Ok(crua) => Carga::Desconhecida {
+                        etiqueta: crua.t,
+                        canal: crua.canal,
+                    },
+                    Err(_) => continue,
+                },
             };
             saida.push(Aplicavel {
                 autor: e.author.clone(),

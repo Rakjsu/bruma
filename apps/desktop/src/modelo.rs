@@ -78,6 +78,32 @@ pub enum Carga {
     Apresentar {
         nome: String,
     },
+    /// Uma carga escrita por uma versão MAIS RECENTE do Bruma.
+    ///
+    /// Sem isto, uma carga que o serde não reconhece caía num `continue` no `aplicaveis`:
+    /// desaparecia da vista, sem erro, sem sinal. No dia em que a v0.18 mandasse uma reacção
+    /// ou um anexo, a v0.17 via um BURACO onde estava uma mensagem — e a app ficava a guardar
+    /// no disco aquilo que se recusava a mostrar, sem o dizer.
+    ///
+    /// Não é `#[serde(other)]` (que num enum etiquetado só admite variante sem dados) mas uma
+    /// leitura em dois passos: assim guarda-se o `t` que veio e o `canal`, se houver. É a
+    /// diferença entre «há aqui uma coisa que não sei mostrar» no sítio certo e um silêncio.
+    Desconhecida {
+        /// A etiqueta que a versão nova usou. Chama-se `etiqueta` e não `t` porque o serde
+        /// recusa um campo com o mesmo nome da etiqueta do enum — e com razão.
+        etiqueta: String,
+        /// O canal, quando a carga desconhecida tem um — uma carga futura do género mensagem
+        /// terá. Sem canal, não é uma coisa da linha do tempo e não se mostra lá.
+        canal: Option<String>,
+    },
+}
+
+/// O mínimo que se lê de uma carga que não se reconhece: a etiqueta e, se houver, o canal.
+#[derive(Deserialize)]
+pub struct CargaCrua {
+    pub t: String,
+    #[serde(default)]
+    pub canal: Option<String>,
 }
 
 /// Uma entrada já decifrada e pronta a aplicar.
@@ -110,6 +136,16 @@ pub struct EstadoDoServidor {
 /// É deliberadamente uma função pura: não lê ficheiros, não fala com a rede, e dá sempre o
 /// mesmo resultado para a mesma lista. É isso que torna o estado testável e que garante que
 /// dois membros convergem sem negociar nada.
+/// O nome mostrável de um autor, ou «desconhecido».
+fn nome_de(estado: &EstadoDoServidor, autor: &str) -> String {
+    estado
+        .membros
+        .iter()
+        .find(|m| m.chave == autor)
+        .map(|m| m.nome.clone())
+        .unwrap_or_else(|| "desconhecido".into())
+}
+
 pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
     let mut nome = String::new();
     let mut canais: Vec<Canal> = Vec::new();
@@ -138,6 +174,10 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
                 nomes.insert(e.autor.clone(), n.clone());
             }
             Carga::Mensagem { .. } => {}
+            // Uma carga de uma versão mais recente não muda o estado — o que ela faria, esta
+            // versão não sabe. O AUTOR conta na mesma (o `nomes` acima já o registou), para a
+            // pessoa não sumir da lista de membros só por ter uma versão mais nova.
+            Carga::Desconhecida { .. } => {}
         }
     }
 
@@ -186,15 +226,24 @@ pub fn mensagens_do_canal(
             Carga::Mensagem { canal: c, texto } if c == canal => Some(MensagemVista {
                 id: id.clone(),
                 autor: e.autor.clone(),
-                autor_nome: estado
-                    .membros
-                    .iter()
-                    .find(|m| m.chave == e.autor)
-                    .map(|m| m.nome.clone())
-                    .unwrap_or_else(|| "desconhecido".into()),
+                autor_nome: nome_de(estado, &e.autor),
                 canal: c.clone(),
                 ts_ms: e.ts_ms,
                 texto: texto.clone(),
+            }),
+            // Uma carga de uma versão mais recente, NESTE canal: mostra-se um marcador com o
+            // autor e a hora reais, em vez de um buraco. A pessoa vê que ali houve alguma
+            // coisa, e porque não a vê.
+            Carga::Desconhecida {
+                canal: Some(c), ..
+            } if c == canal => Some(MensagemVista {
+                id: id.clone(),
+                autor: e.autor.clone(),
+                autor_nome: nome_de(estado, &e.autor),
+                canal: c.clone(),
+                ts_ms: e.ts_ms,
+                texto: "(uma mensagem escrita por uma versão mais recente do Bruma —                         actualiza para a veres)"
+                    .into(),
             }),
             _ => None,
         })
@@ -254,6 +303,89 @@ mod tests {
             ts_ms: ts,
             carga,
         }
+    }
+
+    /// Uma carga de uma versão MAIS RECENTE aparece na linha do tempo, em vez de sumir.
+    ///
+    /// Sem isto, a v0.17 via um buraco onde a v0.18 escreveu — e guardava a entrada no disco
+    /// na mesma, sem o dizer. O marcador leva o autor e a hora reais: a pessoa vê que ali
+    /// houve alguma coisa, e porquê não a vê.
+    #[test]
+    fn carga_de_versao_mais_recente_aparece_como_marcador() {
+        let entradas = vec![
+            ap(
+                "aa",
+                1,
+                Carga::Apresentar {
+                    nome: "Rakjsu".into(),
+                },
+            ),
+            ap(
+                "aa",
+                2,
+                Carga::Mensagem {
+                    canal: "geral".into(),
+                    texto: "olá".into(),
+                },
+            ),
+            // O que a v0.18 mandaria: uma carga que esta versão não conhece, num canal.
+            ap(
+                "aa",
+                3,
+                Carga::Desconhecida {
+                    etiqueta: "Reaccao".into(),
+                    canal: Some("geral".into()),
+                },
+            ),
+            // E uma sem canal — não é da linha do tempo, não se mostra lá.
+            ap(
+                "aa",
+                4,
+                Carga::Desconhecida {
+                    etiqueta: "SejaOQueFor".into(),
+                    canal: None,
+                },
+            ),
+        ];
+        let ids: Vec<String> = (0..entradas.len()).map(|i| format!("id{i}")).collect();
+        let estado = reconstruir(&entradas);
+        let msgs = mensagens_do_canal(&entradas, &ids, "geral", &estado);
+
+        assert_eq!(
+            msgs.len(),
+            2,
+            "a mensagem e o marcador, e não a carga sem canal"
+        );
+        assert_eq!(msgs[1].autor, "aa", "o marcador leva o autor real");
+        assert_eq!(msgs[1].ts_ms, 3, "e a hora real");
+        assert_eq!(msgs[1].autor_nome, "Rakjsu", "e o nome, não «desconhecido»");
+        assert!(
+            msgs[1].texto.contains("versão mais recente"),
+            "e diz porque não se vê: {}",
+            msgs[1].texto
+        );
+    }
+
+    /// A leitura em dois passos: uma carga com um `t` novo lê-se como desconhecida.
+    #[test]
+    fn carga_com_etiqueta_nova_le_se_como_desconhecida() {
+        // O que a v0.18 escreveria dentro do cifrado.
+        let futuro = br#"{"t":"Anexo","canal":"geral","ficheiro":"foto.png","bytes":123}"#;
+        // A `Carga` normal não a conhece...
+        assert!(serde_json::from_slice::<Carga>(futuro).is_err());
+        // ...mas o segundo passo tira-lhe a etiqueta e o canal.
+        let crua: CargaCrua = serde_json::from_slice(futuro).expect("o segundo passo tem de ler");
+        assert_eq!(crua.t, "Anexo");
+        assert_eq!(crua.canal.as_deref(), Some("geral"));
+
+        // E o que se conhece continua a ser conhecido — um catch-all mal posto faria TUDO
+        // cair no desconhecido, e a app ficava muda sem um erro.
+        let msg: Carga =
+            serde_json::from_slice(br#"{"t":"Mensagem","canal":"geral","texto":"ola"}"#).unwrap();
+        assert!(
+            matches!(msg, Carga::Mensagem { .. }),
+            "a Mensagem tem de continuar a ler-se"
+        );
     }
 
     #[test]
