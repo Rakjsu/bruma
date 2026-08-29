@@ -277,31 +277,47 @@ impl Log {
             sig: String::new(),
         };
         e.sig = HEXLOWER.encode(&signing.sign(&e.hash()?).to_bytes());
-        self.entries.insert(e.hash_hex()?, e.clone());
+        // GRAVAR PRIMEIRO, inserir depois.
+        //
+        // Estava ao contrário: inseria no mapa e só depois anexava. Se a escrita falhasse
+        // (disco cheio, pasta só de leitura, o antivírus a segurar o ficheiro), a entrada
+        // ficava na memória mas não no disco — aparecia no ecrã, entrava nos `provados`, e o
+        // `head()` passava a apontar para um hash que não existe em disco, portanto a mensagem
+        // SEGUINTE nascia com um `prev` órfão permanente. O sintoma para quem usa é «as
+        // mensagens de ontem desapareceram quando reabri», sem um erro a ligar as duas coisas.
+        let hash = e.hash_hex()?;
         self.anexar(std::slice::from_ref(&e))?;
+        self.entries.insert(hash, e.clone());
         Ok(e)
     }
 
     /// Devolve quantas entradas eram novas. Entradas inválidas são rejeitadas, não confiadas.
     pub fn merge(&mut self, incoming: Vec<Entry>) -> Result<usize> {
+        // Determinar quais são novas SEM as inserir, gravar o lote, e só então pô-las no
+        // mapa. Estava a inserir primeiro e a anexar no fim: se a escrita falhasse, as
+        // entradas ficavam na memória e nunca chegavam ao disco — desapareciam ao fechar a
+        // app, e a contagem devolvida não distinguia isso de sucesso.
         let mut novas = Vec::new();
+        let mut vistos = std::collections::HashSet::new();
         for e in incoming {
             if e.verify().is_err() {
                 eprintln!("  [!] entrada rejeitada: assinatura inválida");
                 continue;
             }
-            // `entry` em vez de contains_key+insert: uma travessia da arvore em vez de duas.
-            // Nota: caminho completo porque `Entry` aqui colidiria com o nosso struct Entry.
-            if let std::collections::btree_map::Entry::Vacant(slot) =
-                self.entries.entry(e.hash_hex()?)
-            {
-                novas.push(e.clone());
-                slot.insert(e);
+            let h = e.hash_hex()?;
+            // Já no disco, ou repetida dentro deste mesmo lote.
+            if self.entries.contains_key(&h) || !vistos.insert(h) {
+                continue;
             }
+            novas.push(e);
         }
         // Uma gravação para o lote todo, e não uma por entrada: quando alguém entra e traz
-        // mil mensagens de histórico, a diferença é entre um write e mil.
+        // mil mensagens de histórico, a diferença é entre um write e mil. E se falhar, o `?`
+        // sobe o erro ANTES de o mapa mudar — o chamador vê a falha, não um sucesso falso.
         self.anexar(&novas)?;
+        for e in &novas {
+            self.entries.insert(e.hash_hex()?, e.clone());
+        }
         Ok(novas.len())
     }
 }
@@ -652,6 +668,54 @@ mod tests {
         log.append_local(&key(1), [0u8; 24], vec![1], 1_000)
             .unwrap();
         assert!(log.orfas().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Se a escrita falha, a entrada NÃO fica na memória — o erro sobe e o `len()` não muda.
+    ///
+    /// Sem isto, uma entrada aparecia no ecrã e nunca chegava ao disco: desaparecia ao
+    /// fechar a app, e o `head()` ficava a apontar para um hash órfão. Força-se a falha
+    /// marcando o ficheiro do log como só-leitura, que faz o `OpenOptions::append().open()`
+    /// dar «access denied» em Windows.
+    #[test]
+    fn escrita_falhada_nao_deixa_entrada_na_memoria() {
+        let path = tmp("escrita-falhada");
+        let mut log = Log::load(&path).unwrap();
+        log.append_local(&key(1), [0u8; 24], vec![1], 1_000)
+            .unwrap();
+        assert_eq!(log.len(), 1, "a primeira entrou");
+
+        // Ficheiro só-leitura: a próxima escrita tem de falhar.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // append_local: o erro sobe e o mapa não cresce.
+        let r = log.append_local(&key(1), [0u8; 24], vec![2], 2_000);
+        assert!(r.is_err(), "a escrita bloqueada tinha de dar erro");
+        assert_eq!(log.len(), 1, "a entrada falhada não pode ficar na memória");
+
+        // merge: idem. Uma entrada nova, válida, que não se consegue gravar.
+        let mut fonte = Log::load(tmp("escrita-falhada-fonte")).unwrap();
+        let e = fonte
+            .append_local(&key(2), [0u8; 24], vec![3], 3_000)
+            .unwrap();
+        let r = log.merge(vec![e]);
+        assert!(r.is_err(), "o merge bloqueado tinha de dar erro");
+        assert_eq!(
+            log.len(),
+            1,
+            "a entrada do merge falhado não pode ficar na memória"
+        );
+
+        // Repor a escrita para poder apagar. O `set_readonly(false)` é o que interessa aqui
+        // (é um teste, não um controlo de acesso real), por isso silencia-se o lint.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

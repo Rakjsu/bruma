@@ -476,7 +476,7 @@ pub fn criar_servidor(
     let chave = estado::nova_chave_de_servidor().map_err(erro)?;
     let log = blog::Log::load(estado::caminho_do_log(&id)).map_err(erro)?;
 
-    let mut srv = estado::Servidor::novo(id.clone(), chave, log, Vec::new(), None, None);
+    let srv = estado::Servidor::novo(id.clone(), chave, log, Vec::new(), None, None);
 
     // Um servidor recém-criado sem canais é uma sala vazia sem portas. Cria-se o mínimo
     // para ser utilizável desde o primeiro segundo.
@@ -494,19 +494,32 @@ pub fn criar_servidor(
             tipo: TipoCanal::Voz,
         },
     ];
-    let mut entradas = Vec::new();
-    for c in &arranque {
-        entradas.push(srv.escrever(&app.ident.signing, c).map_err(erro)?);
-    }
-    if !meu_nome.is_empty() {
-        entradas.push(
-            srv.escrever(&app.ident.signing, &Carga::Apresentar { nome: meu_nome })
-                .map_err(erro)?,
-        );
-    }
-
+    // A CHAVE DURÁVEL ANTES DO PRIMEIRO BYTE CIFRADO COM ELA (#13).
+    //
+    // Estava ao contrário: escrevia as quatro entradas de arranque — cada `escrever` faz um
+    // `anexar` com `sync_data`, ou seja fica MESMO no disco — e só depois gravava o índice.
+    // Uma queda de energia nessa janela deixava `servidores/{id}.json` com quatro entradas
+    // que ninguém no mundo decifra, e o índice sem vestígio de que a sala existiu. A regra é:
+    // a chave tem de ser durável antes de existir o primeiro dado cifrado com ela.
     app.servidores.lock().map_err(erro)?.insert(id.clone(), srv);
     app.gravar_indice().map_err(erro)?;
+
+    // Só AGORA as entradas de arranque, no servidor que já está no mapa e com a chave gravada.
+    let entradas = {
+        let mut sv = app.servidores.lock().map_err(erro)?;
+        let srv = sv.get_mut(&id).ok_or("o servidor desapareceu do mapa")?;
+        let mut es = Vec::new();
+        for c in &arranque {
+            es.push(srv.escrever(&app.ident.signing, c).map_err(erro)?);
+        }
+        if !meu_nome.is_empty() {
+            es.push(
+                srv.escrever(&app.ident.signing, &Carga::Apresentar { nome: meu_nome })
+                    .map_err(erro)?,
+            );
+        }
+        es
+    };
 
     for e in entradas {
         rede.difundir(&id, e);
@@ -653,7 +666,7 @@ pub async fn entrar_com_convite(
         //
         // Como `convidou` ele continua a servir para o que precisa: discar-lhe e trocar o
         // histórico desta sala. Escreva ele uma entrada que decifra, e entra nos `peers`.
-        let mut srv = estado::Servidor::novo(
+        let srv = estado::Servidor::novo(
             convite.servidor.clone(),
             chave,
             log,
@@ -661,21 +674,28 @@ pub async fn entrar_com_convite(
             Some(convite.anfitriao.clone()),
             None, // um servidor, nao uma conversa
         );
-        // Apresentar-se é o que faz a pessoa aparecer na lista de membros dos outros.
+        // A CHAVE DURÁVEL ANTES DA PRIMEIRA ENTRADA CIFRADA (#13), como no `criar_servidor`:
+        // a entrada `Apresentar` é escrita no disco por `srv.escrever`, e vinha antes do
+        // `gravar_indice`. Insere-se e grava-se o índice primeiro; a apresentação só depois.
         let meu_nome = app.nome.lock().map_err(erro)?.clone();
-        let entrada = if meu_nome.is_empty() {
-            None
-        } else {
-            Some(
-                srv.escrever(&app.ident.signing, &Carga::Apresentar { nome: meu_nome })
-                    .map_err(erro)?,
-            )
-        };
         app.servidores
             .lock()
             .map_err(erro)?
             .insert(convite.servidor.clone(), srv);
         app.gravar_indice().map_err(erro)?;
+
+        let entrada = if meu_nome.is_empty() {
+            None
+        } else {
+            let mut sv = app.servidores.lock().map_err(erro)?;
+            let srv = sv
+                .get_mut(&convite.servidor)
+                .ok_or("o servidor desapareceu do mapa")?;
+            Some(
+                srv.escrever(&app.ident.signing, &Carga::Apresentar { nome: meu_nome })
+                    .map_err(erro)?,
+            )
+        };
         if let Some(e) = entrada {
             rede.difundir(&convite.servidor, e);
         }

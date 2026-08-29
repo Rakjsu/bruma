@@ -1251,7 +1251,12 @@ fn aprender_dos_logs(app: &Arc<App>, peer: &str) {
         aprendi
     };
     if aprendi {
-        let _ = app.gravar_indice();
+        // #156: NÃO engolir o erro. Se a escrita falhar, o par aprendido fica só em memória
+        // e volta a ser um estranho no arranque seguinte — sem porteiro, sem presença, e sem
+        // uma linha em lado nenhum a explicar porquê. O `eprintln` já vai para o bruma.log.
+        if let Err(e) = app.gravar_indice() {
+            eprintln!("[dados] não consegui gravar o índice ao aprender um par: {e}");
+        }
     }
 }
 
@@ -1380,7 +1385,21 @@ fn aplicar(
         // `log.merge` verifica a assinatura -- que e feita com a chave de quem escreve, logo
         // qualquer pessoa assina o que quiser. Um estranho anexava-me lixo, sem limite de
         // tamanho, e ficava a constar como autor de uma sala onde nunca entrou.
-        let novas = srv.merge_verificado(entradas).unwrap_or(0);
+        // #9: o merge devolve erro honesto quando a gravação falha (o log passou a gravar
+        // antes de inserir). Engoli-lo com `unwrap_or(0)` era a pior falha que este projecto
+        // reconhece: as mensagens apareciam no ecrã e desapareciam ao fechar. Regista-se e
+        // avisa-se a interface.
+        let novas = match srv.merge_verificado(entradas) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[dados] não consegui gravar as mensagens que chegaram: {e}");
+                let _ = janela.emit(
+                    "erro-dados",
+                    "Não consegui gravar as mensagens que chegaram. Verifica o espaço em disco —                      o que se passar a partir de agora pode perder-se.",
+                );
+                0
+            }
+        };
 
         // E aqui está o que faltava: PROVAR, e não dizer.
         //
@@ -1414,7 +1433,13 @@ fn aplicar(
     // novas, e por isso um par que sincronizasse sem trazer nada ficava só em memória e
     // perdia-se ao fechar a app.
     if novas > 0 || aprendi {
-        let _ = app.gravar_indice();
+        if let Err(e) = app.gravar_indice() {
+            eprintln!("[dados] não consegui gravar o índice: {e}");
+            let _ = janela.emit(
+                "erro-dados",
+                "Não consigo escrever na pasta de dados. O que se passar a partir de agora                  pode perder-se.",
+            );
+        }
     }
     if novas > 0 {
         let _ = janela.emit("servidor-mudou", servidor);

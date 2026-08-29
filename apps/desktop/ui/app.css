@@ -1396,3 +1396,15 @@ body.ghost .app { transition: filter .8s var(--ease); }
   content: ""; height: 1px; background: currentColor; opacity: .5; flex: 1;
 }
 .novas-aqui::before { flex: 0 0 8px; }
+
+/* Faixa de erro de disco: persistente e inconfundível. O único vermelho de fundo cheio da
+   app -- porque é a única condição em que o que se faz a seguir se pode perder. */
+.faixa-disco {
+  order: -1;
+  padding: 9px 16px;
+  background: #7a2626;
+  color: #fbeaea;
+  font: 500 13px/1.4 var(--ui, system-ui);
+  border-bottom: 1px solid #582020;
+  text-align: center;
+}

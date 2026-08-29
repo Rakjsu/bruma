@@ -3765,6 +3765,22 @@ function desenharNaChamada() {
 /* O que não impede a partilha mas a pessoa tem de saber — hoje, um Windows que não deixa
    separar o som da app do resto e portanto devolve a voz da chamada. Fica no botão, que é
    onde ela vai olhar, e não numa consola que não existe. */
+/** Erro de escrita no disco — uma faixa PERSISTENTE, porque um disco cheio não se resolve
+ *  sozinho. Fica até a app fechar. É a diferença entre uma falha silenciosa total (o que
+ *  havia) e o utilizador saber que o que escrever a partir de agora pode perder-se. */
+listen('erro-dados', ev => {
+  const texto = String(ev.payload || 'Não consigo escrever na pasta de dados.');
+  let faixa = document.getElementById('faixa-disco');
+  if (!faixa) {
+    faixa = document.createElement('div');
+    faixa.id = 'faixa-disco';
+    faixa.className = 'faixa-disco';
+    const app = document.querySelector('.app');
+    if (app) app.prepend(faixa); else document.body.prepend(faixa);
+  }
+  faixa.textContent = '⚠ ' + texto;
+});
+
 listen('partilha-aviso', ev => {
   partilhaAviso = String(ev.payload || '');
   console.warn('aviso da partilha:', partilhaAviso);
