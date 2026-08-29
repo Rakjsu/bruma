@@ -1152,6 +1152,17 @@ mod testes {
     use super::*;
     use std::sync::Arc;
 
+    /// `BRUMA_DADOS` é uma variável de ambiente GLOBAL ao processo, e vários testes definem-na
+    /// para pastas diferentes. Correm em paralelo por omissão, e o `gravar_indice` relê a
+    /// variável a cada escrita — sem serialização, um teste gravava na pasta de outro e a
+    /// gravação falhava. Passou no meu portátil e falhou no runner do CI, que é o que os
+    /// testes de paralelismo fazem. Cada teste que mexe na variável segura este lock do
+    /// princípio ao fim.
+    static DADOS_DE_TESTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn trava_dados() -> std::sync::MutexGuard<'static, ()> {
+        DADOS_DE_TESTE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Uma escrita atómica não deixa temporário e põe lá o conteúdo certo.
     #[test]
     fn escrita_atomica_nao_deixa_rasto() {
@@ -1233,9 +1244,10 @@ mod testes {
     /// Duas gravações do índice ao mesmo tempo não o destroem: no fim, decifra.
     #[test]
     fn duas_gravacoes_do_indice_nao_o_destroem() {
+        let _guarda_dados = trava_dados();
         let dir = std::env::temp_dir().join(format!("bruma-2grav-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: um só teste toca nesta variável, antes de qualquer thread arrancar.
+        // O `trava_dados` acima garante que nenhum outro teste mexe nesta variável enquanto este corre.
         unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
         let app = Arc::new(App::arrancar().expect("arrancar"));
         // Encher com tamanhos diferentes para o hibrido, se acontecesse, não decifrar.
@@ -1525,9 +1537,10 @@ mod testes {
     /// não se liga a esta linha de código de maneira nenhuma.
     #[test]
     fn marcar_lido_nunca_recua() {
+        let _guarda_dados = trava_dados();
         let dir = std::env::temp_dir().join(format!("bruma-recua-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: um só teste toca nesta variável, e antes de qualquer thread arrancar.
+        // O `trava_dados` acima garante que nenhum outro teste mexe nesta variável enquanto este corre.
         unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
         let app = App::arrancar().expect("arrancar");
 
@@ -1562,9 +1575,10 @@ mod testes {
     fn duas_ordens_de_lock_nao_se_prendem() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let _guarda_dados = trava_dados();
         let dir = std::env::temp_dir().join(format!("bruma-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: um só teste toca nesta variável, e antes de qualquer thread arrancar.
+        // O `trava_dados` acima garante que nenhum outro teste mexe nesta variável enquanto este corre.
         unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
 
         let app = Arc::new(App::arrancar().expect("arrancar"));
