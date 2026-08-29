@@ -490,6 +490,10 @@ pub struct App {
     /// nada; é só um portão. É privado de propósito: se alguém o tomasse antes de chamar
     /// `gravar_indice`, prendia.
     escrita_do_indice: Mutex<()>,
+    /// As salas que não abriram no arranque (chave estragada, log ilegível). Guardam-se tal e
+    /// qual — sobretudo a chave — e o `gravar_indice` reescreve-as, para a primeira gravação
+    /// não apagar do índice a única forma de decifrar o ficheiro que ficou no disco.
+    nao_abriram: Mutex<Vec<ServidorGuardado>>,
 }
 
 impl App {
@@ -501,6 +505,11 @@ impl App {
 
         let (indice, em_claro) = ler_indice(&raiz, &semente)?;
         let mut servidores = BTreeMap::new();
+        // As salas que NAO abriram neste arranque, guardadas tal e qual. Ver o campo
+        // `nao_abriram` da App e o `gravar_indice`. Sem isto, a primeira gravação apagava-as
+        // do índice — e com elas a chave, que é a única forma de decifrar o ficheiro que
+        // ficou no disco.
+        let mut nao_abriram: Vec<ServidorGuardado> = Vec::new();
         for s in &indice.servidores {
             // UM SERVIDOR MAU NÃO LEVA A APP COM ELE.
             //
@@ -517,9 +526,10 @@ impl App {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!(
-                        "[dados] o servidor {} tem a chave estragada ({e}); fica de fora",
+                        "[dados] o servidor {} tem a chave estragada ({e}); fica de fora,                          mas a chave continua guardada no índice",
                         s.id
                     );
+                    nao_abriram.push(s.clone());
                     continue;
                 }
             };
@@ -532,9 +542,11 @@ impl App {
                         s.id
                     );
                     // O ficheiro mau é posto de lado, e não apagado: pode ser a única cópia
-                    // de uma conversa, e quem souber ler JSON ainda a tira de lá. Apagá-lo
-                    // seria a app decidir sozinha deitar fora o que não conseguiu abrir.
+                    // de uma conversa, e quem souber ler JSON ainda a tira de lá. E a entrada
+                    // do índice — sobretudo a CHAVE — guarda-se tal e qual, senão a próxima
+                    // gravação apagava a única forma de algum dia decifrar esse ficheiro.
                     pos_de_lado(&caminho);
+                    nao_abriram.push(s.clone());
                     continue;
                 }
             };
@@ -580,6 +592,7 @@ impl App {
             quem_escreve: Mutex::new(indice.quem_escreve),
             lido: Mutex::new(indice.lido),
             escrita_do_indice: Mutex::new(()),
+            nao_abriram: Mutex::new(nao_abriram),
         };
 
         #[cfg(debug_assertions)]
@@ -878,7 +891,7 @@ impl App {
         // Recolher primeiro, e largar. Isto segurava `servidores` durante a serialização, a
         // cifra e a escrita no disco, enquanto ia pedindo os outros quatro — uma janela larga
         // para outro thread ficar preso do outro lado.
-        let guardados: Vec<ServidorGuardado> = {
+        let mut guardados: Vec<ServidorGuardado> = {
             let servidores = self.servidores.lock().unwrap();
             servidores
                 .values()
@@ -891,6 +904,10 @@ impl App {
                 })
                 .collect()
         };
+        // E as que não abriram, tal e qual. Reservadas do arranque e nunca derivadas do mapa
+        // vivo — é essa a diferença entre a chave sobreviver e ser apagada na primeira
+        // gravação.
+        guardados.extend(self.nao_abriram.lock().unwrap().iter().cloned());
         let indice = Indice {
             nome: self.nome.lock().unwrap().clone(),
             servidores: guardados,
@@ -1232,6 +1249,75 @@ mod testes {
             serde_json::to_string_pretty(&cofre).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Uma sala que não abre no arranque NÃO perde a chave na primeira gravação (#91, #129).
+    ///
+    /// O `gravar_indice` reconstrói a lista a partir do mapa vivo, e a sala má não está nele.
+    /// Sem a guardar à parte, a próxima gravação — e grava-se por tudo — apagava-a do índice
+    /// e com ela a chave, deixando o ficheiro no disco como ruído para sempre.
+    #[test]
+    fn sala_que_nao_abre_mantem_a_chave() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-quarentena-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("servidores")).unwrap();
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+
+        // Semente conhecida (36 bytes com soma), para poder ler o índice depois.
+        let semente = [3u8; 32];
+        let mut key = semente.to_vec();
+        key.extend_from_slice(&crypto::soma_de_controlo(&semente));
+        std::fs::write(dir.join("identidade.key"), &key).unwrap();
+
+        // Índice com uma sala de chave INVÁLIDA (hex mau), cifrado com a semente.
+        let chave_ma = "zz".repeat(32);
+        let indice = Indice {
+            servidores: vec![ServidorGuardado {
+                id: "sala-que-nao-abre".into(),
+                chave: chave_ma.clone(),
+                peers: vec![],
+                com: None,
+                convidou: None,
+            }],
+            ..Default::default()
+        };
+        let claro = serde_json::to_vec(&indice).unwrap();
+        let (nonce, dados) = crypto::seal(&crypto::chave_do_indice(&semente), &claro).unwrap();
+        let cofre = Cofre {
+            v: 1,
+            nonce: HEXLOWER.encode(&nonce),
+            dados: HEXLOWER.encode(&dados),
+        };
+        std::fs::write(
+            dir.join("indice.json"),
+            serde_json::to_string_pretty(&cofre).unwrap(),
+        )
+        .unwrap();
+
+        // Arrancar: a sala má fica de fora do mapa (chave inválida), mas em quarentena.
+        let app = App::arrancar().expect("arranca apesar da sala má");
+        assert!(
+            !app.servidores
+                .lock()
+                .unwrap()
+                .contains_key("sala-que-nao-abre"),
+            "a sala de chave inválida não entra no mapa vivo"
+        );
+
+        // Gravar o índice — é aqui que a chave se perdia.
+        app.gravar_indice().unwrap();
+
+        // Reler o índice: a sala má tem de continuar lá, com a chave intacta.
+        let (relido, _) = ler_indice(&dir, &semente).unwrap();
+        let achada = relido
+            .servidores
+            .iter()
+            .find(|x| x.id == "sala-que-nao-abre");
+        assert!(achada.is_some(), "a sala tinha de sobreviver à gravação");
+        assert_eq!(achada.unwrap().chave, chave_ma, "com a chave intacta");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Um índice cifrado com OUTRA semente faz a app abrir vazia, não morrer (#5, #75).
