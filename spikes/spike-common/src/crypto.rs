@@ -75,6 +75,21 @@ pub fn verify_prekey(id: &VerifyingKey, xpub: &[u8; 32], sig: &[u8; 64]) -> Resu
 ///
 /// Ordenam-se as duas chaves pelo mesmo motivo que em `session_key`: quem abre a conversa
 /// primeiro não pode mudar o resultado.
+/// Quatro bytes de soma de controlo sobre uns bytes quaisquer.
+///
+/// Serve para distinguir «esta é a minha semente» de «esta é a minha semente com um bit
+/// virado». Sem isto, um bit trocado no ficheiro da identidade fazia a app arrancar como
+/// OUTRA pessoa, em silêncio e para sempre. Quatro bytes é 1 em 4 mil milhões — de sobra para
+/// apanhar corrupção acidental, que é o que isto defende (não é uma assinatura).
+pub fn soma_de_controlo(bytes: &[u8]) -> [u8; 4] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"bruma/soma/v1");
+    h.update(bytes);
+    let mut c = [0u8; 4];
+    c.copy_from_slice(&h.finalize().as_bytes()[..4]);
+    c
+}
+
 pub fn id_da_conversa(a: &[u8; 32], b: &[u8; 32]) -> [u8; 16] {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     let mut h = blake3::Hasher::new();

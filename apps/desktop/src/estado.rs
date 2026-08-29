@@ -486,6 +486,10 @@ pub struct App {
     pub quem_escreve: Mutex<QuemEscreve>,
     /// Ver [`Indice::lido`].
     pub lido: Mutex<BTreeMap<String, i64>>,
+    /// Serializa `gravar_indice` — duas escritas ao mesmo tempo destruíam o índice. Não guarda
+    /// nada; é só um portão. É privado de propósito: se alguém o tomasse antes de chamar
+    /// `gravar_indice`, prendia.
+    escrita_do_indice: Mutex<()>,
 }
 
 impl App {
@@ -575,6 +579,7 @@ impl App {
             bloqueados: Mutex::new(indice.bloqueados),
             quem_escreve: Mutex::new(indice.quem_escreve),
             lido: Mutex::new(indice.lido),
+            escrita_do_indice: Mutex::new(()),
         };
 
         #[cfg(debug_assertions)]
@@ -917,24 +922,74 @@ impl App {
         // recupera.
         //
         // Enquanto o novo nao estiver inteiro e sincronizado, o antigo continua a ser o bom.
-        let destino = raiz().join("indice.json");
-        let temporario = destino.with_extension("novo");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&temporario)?;
-            f.write_all(serde_json::to_string_pretty(&cofre)?.as_bytes())?;
-            f.sync_data()?;
-        }
-        std::fs::rename(&temporario, &destino)?;
-        Ok(())
+        //
+        // E UMA ESCRITA DE CADA VEZ. Sem o lock, duas gravações simultâneas — uma da rede,
+        // outra de um comando do Tauri — escreviam o MESMO `indice.novo` a partir do offset 0
+        // de cada handle. Se os tamanhos diferissem, o que ficava era a cauda de uma colada ao
+        // corpo da outra, e esse híbrido era renomeado por cima do índice: um cofre que não
+        // decifra, e as chaves de todas as salas perdidas de uma vez. O lock é o último da
+        // ordem, portanto não fecha ciclo com os outros.
+        let _escrita = self.escrita_do_indice.lock().unwrap();
+        let bytes = serde_json::to_string_pretty(&cofre)?.into_bytes();
+        escrever_atomico(&raiz().join("indice.json"), &bytes)
     }
+}
+
+/// Escreve um ficheiro de forma ATOMICA: temporário, sync, rename.
+///
+/// O `fs::write` abre com truncate — durante um instante o ficheiro tem zero bytes e o
+/// conteúdo novo ainda não lá está. Um corte de energia nessa janela deixa-o meio escrito.
+/// Enquanto o novo não estiver inteiro e sincronizado, o antigo continua a ser o bom.
+///
+/// Está numa função só porque é a mesma defesa em três sítios (o índice, a semente, o que
+/// vier a seguir), e escrevê-la três vezes é escrevê-la mal duas — foi assim que a semente
+/// ficou de fora quando o índice já a tinha.
+fn escrever_atomico(destino: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    // NOME UNICO POR ESCRITA, e não um `.novo` fixo.
+    //
+    // Com um nome partilhado, duas gravações ao mesmo tempo colidem no mesmo temporário: em
+    // Windows a segunda falha com «sharing violation» e a gravação perde-se em silêncio (o
+    // chamador fazia `let _ =`); noutros sistemas fica um híbrido que não decifra. Um nome
+    // único por escrita fecha a corrida na origem — cada escrita tem o seu ficheiro, e o
+    // `rename` atómico garante que o destino final é sempre um índice inteiro.
+    static CONTADOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let marca = CONTADOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporario = destino.with_extension(format!("novo-{}-{}", std::process::id(), marca));
+    {
+        let mut f = std::fs::File::create(&temporario)?;
+        f.write_all(bytes)?;
+        f.sync_data()?;
+    }
+    if let Err(e) = std::fs::rename(&temporario, destino) {
+        let _ = std::fs::remove_file(&temporario);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Renomeia um ficheiro que não se conseguiu ler, para não voltar a matar o arranque.
 ///
-/// Guarda-se em vez de se apagar: pode ser a única cópia de uma conversa.
+/// Guarda-se em vez de se apagar: pode ser a única cópia de uma conversa. E com um CARIMBO
+/// único no nome, porque `with_extension` fixo (`.estragado`) escrevia sempre o mesmo destino
+/// — e em Windows o `rename` substitui sem avisar. O segundo ficheiro a falhar apagava a cópia
+/// do primeiro, e um problema de disco raramente atinge um ficheiro só: o caso em que isto
+/// interessa era precisamente o caso em que destruía a prova.
 fn pos_de_lado(p: &std::path::Path) {
-    let destino = p.with_extension("json.estragado");
+    let etiqueta = format!(
+        "{}.estragado-{}",
+        p.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        agora_ms()
+    );
+    let mut destino = p.with_file_name(&etiqueta);
+    // No caso improvável de dois no mesmo milissegundo, um contador em vez de sobrescrever.
+    let mut n = 1u32;
+    while destino.exists() {
+        destino = p.with_file_name(format!("{etiqueta}-{n}"));
+        n += 1;
+    }
     match std::fs::rename(p, &destino) {
         Ok(()) => eprintln!("[dados] guardado como {}", destino.display()),
         Err(e) => eprintln!("[dados] não consegui pôr de lado o ficheiro: {e}"),
@@ -990,16 +1045,40 @@ fn ler_indice(raiz: &std::path::Path, semente: &[u8; 32]) -> Result<(Indice, boo
 
 fn semente_ou_cria(p: &std::path::Path) -> Result<[u8; 32]> {
     if let Ok(raw) = std::fs::read(p) {
+        // 32 bytes: FORMATO ANTIGO, aceite tal e qual. Convertido para 36 na próxima escrita
+        // — não se reescreve aqui, à leitura, porque a leitura tem de poder ser só de leitura.
         if raw.len() == 32 {
             let mut s = [0u8; 32];
             s.copy_from_slice(&raw);
             return Ok(s);
         }
-        bail!("{} existe mas não tem 32 bytes", p.display());
+        // 36 bytes: os 32 da semente mais 4 de soma. Um bit virado no ficheiro deixa de trocar
+        // a pessoa em silêncio — dá um erro que diz o que aconteceu e aponta para as 24
+        // palavras. NÃO se arranca como outra pessoa: essa é a falha irreversível.
+        if raw.len() == 36 {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&raw[..32]);
+            if crypto::soma_de_controlo(&s) == raw[32..] {
+                return Ok(s);
+            }
+            bail!(
+                "o ficheiro da tua identidade ({}) está corrompido — um bit trocado.                  Tens as 24 palavras? Restaura a identidade com elas.",
+                p.display()
+            );
+        }
+        bail!(
+            "{} existe mas não tem 32 nem 36 bytes — não é uma identidade do Bruma",
+            p.display()
+        );
     }
+    // Criar: 36 bytes, e ATOMICO. Era o único ficheiro cuja perda é irreversível e era escrito
+    // com menos cuidado do que o índice — um `fs::write` cru, sem sync nem rename.
     let mut s = [0u8; 32];
     getrandom::getrandom(&mut s).map_err(|e| anyhow!("rng: {e}"))?;
-    std::fs::write(p, s)?;
+    let mut com_soma = Vec::with_capacity(36);
+    com_soma.extend_from_slice(&s);
+    com_soma.extend_from_slice(&crypto::soma_de_controlo(&s));
+    escrever_atomico(p, &com_soma)?;
     Ok(s)
 }
 
@@ -1072,6 +1151,153 @@ pub fn caminho_do_log(id: &str) -> PathBuf {
 mod testes {
     use super::*;
     use std::sync::Arc;
+
+    /// Uma escrita atómica não deixa temporário e põe lá o conteúdo certo.
+    #[test]
+    fn escrita_atomica_nao_deixa_rasto() {
+        let dir = std::env::temp_dir().join(format!("bruma-atom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("x.dat");
+        escrever_atomico(&alvo, b"conteudo").unwrap();
+        assert_eq!(std::fs::read(&alvo).unwrap(), b"conteudo");
+        assert!(
+            !alvo.with_extension("novo").exists(),
+            "o temporário tinha de desaparecer"
+        );
+        // Reescrever por cima também funciona.
+        escrever_atomico(&alvo, b"outro").unwrap();
+        assert_eq!(std::fs::read(&alvo).unwrap(), b"outro");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pôr dois ficheiros de lado não apaga a cópia do primeiro.
+    #[test]
+    fn quarentena_nao_sobrescreve() {
+        let dir = std::env::temp_dir().join(format!("bruma-quar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("s.json");
+        std::fs::write(&a, b"primeiro").unwrap();
+        pos_de_lado(&a);
+        std::fs::write(&a, b"segundo").unwrap();
+        pos_de_lado(&a);
+        // Os dois estragados têm de coexistir, com os dois conteúdos.
+        let mut conteudos: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".estragado"))
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        conteudos.sort();
+        assert_eq!(conteudos, vec![b"primeiro".to_vec(), b"segundo".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A semente: 36 bytes com soma boa entra; soma má é recusada; 32 (antigo) entra.
+    #[test]
+    fn semente_com_soma_de_controlo() {
+        let dir = std::env::temp_dir().join(format!("bruma-sem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("identidade.key");
+
+        // Criada de raiz: 36 bytes, e relê-se igual.
+        let criada = semente_ou_cria(&alvo).unwrap();
+        assert_eq!(
+            std::fs::read(&alvo).unwrap().len(),
+            36,
+            "tem de guardar 36 bytes"
+        );
+        assert_eq!(semente_ou_cria(&alvo).unwrap(), criada, "relê a mesma");
+
+        // Um bit virado no ficheiro é RECUSADO, não aceite como outra pessoa.
+        let mut raw = std::fs::read(&alvo).unwrap();
+        raw[3] ^= 0x01;
+        std::fs::write(&alvo, &raw).unwrap();
+        assert!(
+            semente_ou_cria(&alvo).is_err(),
+            "um bit virado tinha de dar erro"
+        );
+
+        // Formato antigo de 32 bytes continua a ser aceite.
+        std::fs::write(&alvo, [9u8; 32]).unwrap();
+        assert_eq!(
+            semente_ou_cria(&alvo).unwrap(),
+            [9u8; 32],
+            "32 bytes ainda entra"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Duas gravações do índice ao mesmo tempo não o destroem: no fim, decifra.
+    #[test]
+    fn duas_gravacoes_do_indice_nao_o_destroem() {
+        let dir = std::env::temp_dir().join(format!("bruma-2grav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: um só teste toca nesta variável, antes de qualquer thread arrancar.
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = Arc::new(App::arrancar().expect("arrancar"));
+        // Encher com tamanhos diferentes para o hibrido, se acontecesse, não decifrar.
+        for i in 0..20 {
+            app.amigos.lock().unwrap().push(Amigo {
+                chave: format!("{i:064x}"),
+                nome: "x".repeat(i * 3),
+                desde_ms: 0,
+                verificado: false,
+            });
+        }
+
+        // Dois threads a gravar em concorrência, um a variar o tamanho do índice. Mede-se o
+        // número de gravações que FALHARAM — que, com um temporário partilhado, eram os
+        // «sharing violation» do Windows, engolidos em silêncio pelo `let _ =` do chamador.
+        // Com o nome único do temporário e o mutex, tem de ser ZERO.
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let erros = Arc::new(AtomicUsize::new(0));
+
+        let a = Arc::clone(&app);
+        let ea = Arc::clone(&erros);
+        let t1 = std::thread::spawn(move || {
+            for i in 0..400 {
+                {
+                    let mut am = a.amigos.lock().unwrap();
+                    if i % 2 == 0 {
+                        am.push(Amigo {
+                            chave: format!("{i:064x}"),
+                            nome: "z".repeat(i % 50),
+                            desde_ms: 0,
+                            verificado: false,
+                        });
+                    } else {
+                        am.pop();
+                    }
+                }
+                if a.gravar_indice().is_err() {
+                    ea.fetch_add(1, O::Relaxed);
+                }
+            }
+        });
+        let b = Arc::clone(&app);
+        let eb = Arc::clone(&erros);
+        let t2 = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if b.gravar_indice().is_err() {
+                    eb.fetch_add(1, O::Relaxed);
+                }
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(
+            erros.load(O::Relaxed),
+            0,
+            "nenhuma gravação concorrente pode falhar"
+        );
+        // E o índice tem de continuar a decifrar — um híbrido daria erro aqui.
+        ler_indice(&dir, &app.semente).expect("o índice tinha de decifrar depois da corrida");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A contagem do que falta ler, sem máquinas nenhumas.
     ///
