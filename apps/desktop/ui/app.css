@@ -1408,3 +1408,7 @@ body.ghost .app { transition: filter .8s var(--ease); }
   border-bottom: 1px solid #582020;
   text-align: center;
 }
+
+/* Versao diferente da minha: ambar, nao vermelho -- nao e um erro, e uma explicacao. Sem
+   isto, uma funcionalidade que nao funciona por diferenca de versao parece uma avaria. */
+.versao-diferente { color: var(--amber) !important; }

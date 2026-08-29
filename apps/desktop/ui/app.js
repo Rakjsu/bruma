@@ -238,7 +238,8 @@ function desenharConversas() {
     pintar(av, c.com);
     const txt = elemento('span');
     txt.append(elemento('b', null, c.nome));
-    txt.append(elemento('i', null, chaveCurta(c.com)));
+    const avisoC = avisoDeVersao(c.com);
+    txt.append(elemento('i', avisoC ? 'versao-diferente' : null, avisoC || chaveCurta(c.com)));
     l.append(av, txt);
     if (c.nao_lidos) {
       l.classList.add('tem-novas');
@@ -328,7 +329,12 @@ function desenharMembros() {
     pintar(av, m.chave);
     const bloco = elemento('span');
     bloco.append(elemento('b', null, m.nome));
-    bloco.append(elemento('i', null, m.fundador ? 'fundou este servidor' : chaveCurta(m.chave)));
+    const aviso = avisoDeVersao(m.chave);
+    bloco.append(elemento(
+      'i',
+      aviso ? 'versao-diferente' : null,
+      aviso || (m.fundador ? 'fundou este servidor' : chaveCurta(m.chave)),
+    ));
     linha.append(av, bloco);
     lista.append(linha);
   }
@@ -2238,6 +2244,29 @@ listen('servidor-mudou', async ev => {
   // ler um canal de texto, o desenharTudo não lhe toca e as mensagens novas não apareciam.
   await desenharChatDaSala();
 });
+/** A versão de cada par, por chave. Vazio até ele dizer.
+ *
+ *  Existe para a degradação deixar de ser muda (#4): quando chega uma mensagem que esta
+ *  versão não conhece, ignora-se e segue-se — o que é certo para a ligação e errado para a
+ *  pessoa, que vê uma funcionalidade a não funcionar sem saber porquê. */
+const versaoDoPar = new Map();
+let minhaVersao = null;
+
+listen('peer-versao', ev => {
+  const [chave, dele, minha] = ev.payload || [];
+  if (!chave) return;
+  minhaVersao = minha;
+  versaoDoPar.set(chave, dele);
+  desenharTudo();
+});
+
+/** A etiqueta de versão de um par, ou null se estiver igual à minha (aí não há que dizer). */
+function avisoDeVersao(chave) {
+  const dele = versaoDoPar.get(chave);
+  if (!dele || !minhaVersao || dele === minhaVersao) return null;
+  return `tem a ${dele}, tu tens a ${minhaVersao}`;
+}
+
 listen('peer-ligado', () => { ligados += 1; desenharTopo(); });
 listen('peer-desligado', () => { ligados = Math.max(0, ligados - 1); desenharTopo(); });
 
@@ -5606,6 +5635,34 @@ function pararDeAssistir() {
       + ` reposto=${$('#mudo-transmissao').checked === antes}`);
     document.querySelector('[data-modo="jogos"]').click();
     diz(`ui modo jogos: resumo="${$('#resumo-qualidade').textContent}"`);
+
+    // ---- a versao do outro lado deixa de ser muda ------------------------------
+    //
+    // Mede-se a DECISAO: quando e que a etiqueta aparece. O efeito completo precisa de duas
+    // maquinas com versoes diferentes, o que nenhum teste local alcanca -- mas a regra ("so
+    // quando difere, e um par sem campo conta como anterior") e verificavel aqui.
+    {
+      const guardadaV = minhaVersao;
+      const alvoV = 'dd'.repeat(32);
+      minhaVersao = '0.18.0';
+
+      versaoDoPar.delete(alvoV);
+      const semDizer = avisoDeVersao(alvoV);          // ainda nao disse nada
+      versaoDoPar.set(alvoV, '0.18.0');
+      const igual = avisoDeVersao(alvoV);              // mesma versao: nao ha que dizer
+      versaoDoPar.set(alvoV, '0.19.0');
+      const maisNova = avisoDeVersao(alvoV);           // ele a frente
+      versaoDoPar.set(alvoV, 'anterior a 0.18');
+      const antiga = avisoDeVersao(alvoV);             // ele atras, sem campo
+
+      versaoDoPar.delete(alvoV);
+      minhaVersao = guardadaV;
+
+      diz(`ui versao do par: calado-sem-saber=${semDizer === null}`
+        + ` calado-se-igual=${igual === null}`
+        + ` avisa-se-mais-nova=${!!maisNova && maisNova.includes('0.19.0')}`
+        + ` avisa-se-anterior=${!!antiga && antiga.includes('anterior')}`);
+    }
 
     // ---- mensagens de varias linhas --------------------------------------------
     //

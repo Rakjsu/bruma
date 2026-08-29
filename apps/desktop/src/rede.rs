@@ -41,6 +41,19 @@ pub enum Msg {
         x_pub: Option<String>,
         #[serde(default)]
         prekey_sig: Option<String>,
+        /// A versão do Bruma do outro lado (#4).
+        ///
+        /// Vai da MESMA forma que os campos acima — `Option` com `default` numa variante que
+        /// já existe — precisamente pela razão escrita ali: uma variante nova derrubaria a
+        /// ligação com qualquer versão anterior.
+        ///
+        /// Serve para a degradação deixar de ser muda. Quando chega uma mensagem que esta
+        /// versão não conhece, ignora-se e segue-se — o que é a decisão certa para a ligação
+        /// e a errada para a pessoa: ela vê uma funcionalidade a não funcionar e não tem como
+        /// saber que é porque o outro está noutra versão. Um par sem este campo é uma versão
+        /// anterior a esta, o que também é informação.
+        #[serde(default)]
+        versao: Option<String>,
     },
     /// Tudo o que tenho deste servidor. Quem não o tiver ignora.
     Sync {
@@ -859,6 +872,7 @@ async fn sessao(
             nome: meu_nome,
             x_pub: Some(HEXLOWER.encode(app.ident.x_public().as_bytes())),
             prekey_sig: Some(HEXLOWER.encode(&app.ident.prekey_signature())),
+            versao: Some(env!("CARGO_PKG_VERSION").to_string()),
         },
     )
     .await?;
@@ -962,8 +976,24 @@ async fn sessao(
                     nome,
                     x_pub,
                     prekey_sig,
+                    versao,
                 })) => {
                     let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
+                    // A VERSÃO DO OUTRO LADO (#4).
+                    //
+                    // Um par sem este campo corre uma versão anterior à que o introduziu — e
+                    // isso também é informação, por isso não se cala: diz-se «anterior a
+                    // 0.18». A interface mostra-a e deixa de haver funcionalidades que não
+                    // funcionam sem se perceber porquê.
+                    let dele = versao.unwrap_or_else(|| "anterior a 0.18".to_string());
+                    let minha = env!("CARGO_PKG_VERSION");
+                    if dele != minha {
+                        eprintln!(
+                            "[rede] {} tem a versão {dele} e eu tenho a {minha}",
+                            &peer_leitura[..8.min(peer_leitura.len())]
+                        );
+                    }
+                    let _ = leitura_janela.emit("peer-versao", (&peer_leitura, &dele, minha));
                     if ola_visto {
                         // Um par que manda dois `Ola` na mesma sessão está avariado ou a
                         // experimentar — vale a pena sabê-lo, e não vale gravar o disco por ele.
@@ -1584,15 +1614,52 @@ async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
             v
         }
     };
-    envia
-        .write_all(&(corpo.len() as u32).to_be_bytes())
-        .await
-        .map_err(|e| anyhow!("write: {e}"))?;
-    envia
-        .write_all(&corpo)
-        .await
-        .map_err(|e| anyhow!("write: {e}"))?;
+    // COM PRAZO (#3).
+    //
+    // Isto eram dois `write_all` sem prazo nenhum. Um par que aceite a ligação e deixe de LER
+    // — por avaria, ou de propósito com software modificado — enche a janela do QUIC, e essa
+    // espera não termina nunca. A tarefa da sessão fica parada dentro do `select!`, deixa de
+    // servir o canal de saída e deixa de vigiar o leitor; e como o `SessaoViva` só limpa no
+    // `Drop`, a entrada fica no mapa `ligacoes` para sempre: o vigia vê «já está ligado» e não
+    // volta a tentar, a interface conta-o como presente, e a voz continua a ser enviada para
+    // ele. É exactamente o estado permanente que o `SessaoViva` foi escrito para impedir,
+    // alcançado por outro caminho.
+    //
+    // O prazo esgotado é fim de sessão: o chamador já trata o erro fechando, e aí o `Drop`
+    // faz o resto — o par volta a ser alcançável em vez de ficar preso a fingir.
+    let prazo = prazo_de_escrita(q);
+    let tam = (corpo.len() as u32).to_be_bytes();
+    escrita_com_prazo(envia.write_all(&tam), prazo, "o tamanho").await?;
+    escrita_com_prazo(envia.write_all(&corpo), prazo, "o corpo").await?;
     Ok(())
+}
+
+/// Quanto tempo se espera por uma escrita, por tipo de quadro.
+///
+/// Generoso no controlo e curto no vídeo, e a diferença não é arbitrária: um sync legítimo
+/// entre o Brasil e os EUA pode ser grande e lento, e cortá-lo seria partir precisamente o
+/// caso de uso; um frame de vídeo que não sai em dois segundos já não interessa a ninguém —
+/// quem está a ver quer a imagem de agora, não a de há dois segundos.
+fn prazo_de_escrita(q: &Quadro) -> std::time::Duration {
+    match q {
+        Quadro::Video { .. } => std::time::Duration::from_secs(2),
+        _ => std::time::Duration::from_secs(20),
+    }
+}
+
+/// Corre uma escrita com prazo, e transforma o esgotamento num erro que se percebe.
+async fn escrita_com_prazo<F, E>(f: F, prazo: std::time::Duration, o_que: &str) -> Result<()>
+where
+    F: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(prazo, f).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!("write: {e}")),
+        Err(_) => Err(anyhow!(
+            "o outro lado deixou de ler: {o_que} não saiu em {prazo:?}"
+        )),
+    }
 }
 
 async fn ler(recebe: &mut RecvStream) -> Result<Quadro> {
@@ -1681,6 +1748,88 @@ mod testes {
     /// `Err` e o leitor faz `break`. No dia em que uma versao acrescentasse uma mensagem,
     /// deixava de conseguir falar com todas as anteriores -- e o sintoma nao seria "essa
     /// funcionalidade nao funciona", seria "o outro aparece ligado e nao chega nada".
+    /// O `Ola` de uma versão ANTERIOR (sem o campo `versao`) continua a ser lido.
+    ///
+    /// É o ponto todo de pôr o campo numa variante que já existe, com `Option` e `default`:
+    /// uma variante nova derrubaria a ligação com quem ainda não actualizou.
+    #[test]
+    fn o_ola_sem_versao_continua_a_ser_lido() {
+        // O que a v0.17 manda — não conhece o campo `versao`.
+        let antigo = br#"{"t":"Ola","nome":"Rakjsu","x_pub":"aa","prekey_sig":"bb"}"#;
+        let m: Msg = serde_json::from_slice(antigo).expect("o Olá antigo tem de ser lido");
+        match m {
+            Msg::Ola { nome, versao, .. } => {
+                assert_eq!(nome, "Rakjsu");
+                assert!(
+                    versao.is_none(),
+                    "sem campo é None, e isso também é informação"
+                );
+            }
+            outro => panic!("devia ser um Olá, deu {outro:?}"),
+        }
+
+        // E o de uma versão que já o manda.
+        let novo = br#"{"t":"Ola","nome":"R","x_pub":"aa","prekey_sig":"bb","versao":"0.18.0"}"#;
+        match serde_json::from_slice::<Msg>(novo).unwrap() {
+            Msg::Ola { versao, .. } => assert_eq!(versao.as_deref(), Some("0.18.0")),
+            outro => panic!("devia ser um Olá, deu {outro:?}"),
+        }
+    }
+
+    /// O prazo de escrita depende do tipo: generoso no controlo, curto no vídeo.
+    ///
+    /// Não é arbitrário. Um sync legítimo entre o Brasil e os EUA pode ser grande e lento, e
+    /// cortá-lo seria partir o caso de uso; um frame que não sai em dois segundos já não
+    /// interessa a ninguém.
+    #[test]
+    fn o_prazo_de_escrita_distingue_video_de_controlo() {
+        let video = Quadro::Video {
+            tipo: "ecra".into(),
+            servidor: "s".into(),
+            canal: "c".into(),
+            dados: vec![],
+        };
+        let controlo = Quadro::Controlo(Msg::Desconhecida);
+        let pv = prazo_de_escrita(&video);
+        let pc = prazo_de_escrita(&controlo);
+        assert!(
+            pv < pc,
+            "o vídeo tem de ter prazo mais curto: {pv:?} vs {pc:?}"
+        );
+        assert!(
+            pv >= std::time::Duration::from_secs(1),
+            "mas não tão curto que corte um frame normal"
+        );
+        assert!(
+            pc >= std::time::Duration::from_secs(10),
+            "e o controlo tem de aguentar um sync grande e lento: {pc:?}"
+        );
+    }
+
+    /// Uma escrita que nunca acaba dá erro, em vez de prender a sessão para sempre.
+    #[tokio::test]
+    async fn uma_escrita_que_nunca_acaba_da_erro() {
+        // Um futuro que nunca resolve — é o que um `write_all` faz quando o outro lado deixa
+        // de ler e a janela do QUIC enche.
+        let nunca = std::future::pending::<std::result::Result<(), std::io::Error>>();
+        let r = escrita_com_prazo(nunca, std::time::Duration::from_millis(50), "o corpo").await;
+        let e = r.expect_err("uma escrita presa tinha de dar erro");
+        assert!(
+            e.to_string().contains("deixou de ler"),
+            "e o erro tem de dizer o que se passou: {e}"
+        );
+
+        // E uma escrita que acaba a tempo passa — senão trocava-se um bloqueio por uma
+        // sessão que morre sozinha.
+        let pronta = std::future::ready::<std::result::Result<(), std::io::Error>>(Ok(()));
+        assert!(
+            escrita_com_prazo(pronta, std::time::Duration::from_secs(5), "o corpo")
+                .await
+                .is_ok(),
+            "uma escrita normal não pode falhar"
+        );
+    }
+
     /// Um QUADRO de um tipo que esta versão não conhece não pode derrubar a ligação.
     ///
     /// É o irmão do teste abaixo, uma camada mais abaixo — e é a camada que decide primeiro.
