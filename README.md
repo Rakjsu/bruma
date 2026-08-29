@@ -6,7 +6,7 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.18.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.18.1 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos, permissões de mensagens e por-ler com avisos.**
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
