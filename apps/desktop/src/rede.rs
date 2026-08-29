@@ -499,6 +499,18 @@ impl Adiamento {
     /// Há uma sessão viva com este par — e isto é PROVA e não promessa: ele está no mapa das
     /// ligações. O recuo volta a zero, para que uma queda a seguir a uma hora de conversa seja
     /// tentada dois segundos depois e não daqui a um minuto.
+    ///
+    /// # Porque é que isto não briga com o sync em lotes
+    ///
+    /// As duas correcções deste mesmo commit podiam morder-se: se a inscrição no mapa
+    /// acontecesse só DEPOIS do aperto de mão e dos `Sync`, um sync grande — que agora demora
+    /// mais voltas, por ir em lotes — mantinha o `ja_ligado` falso durante todo esse tempo, e
+    /// o recuo crescia até aos 60 s por uma sessão que estava a funcionar perfeitamente.
+    ///
+    /// Não acontece: a `sessao` inscreve-se no mapa `ligacoes` logo à cabeça, antes de abrir o
+    /// stream e muito antes do primeiro `Sync`. A janela entre o `ligar` devolver `Ok` e o
+    /// `ja_ligado` passar a verdadeiro é o tempo de arrancar uma tarefa, não o tempo de
+    /// sincronizar um histórico.
     fn pegou(&mut self, peer: &str) {
         self.espera.remove(peer);
         self.proxima.remove(peer);
@@ -1686,14 +1698,47 @@ fn partir_sync(servidor: String, entradas: Vec<blog::Entry>) -> Vec<Msg> {
             entradas: Vec::new(),
         }];
     }
+    // O que o envelope custa: `{"t":"Sync","servidor":"…","entradas":[]}` mais o byte do
+    // tipo de quadro. Calcula-se uma vez e serve para saber se uma entrada CABE.
+    let envelope = 1 + serde_json::to_vec(&Msg::Sync {
+        servidor: servidor.clone(),
+        entradas: Vec::new(),
+    })
+    .map(|v| v.len())
+    .unwrap_or(64);
+
     let mut lotes: Vec<Msg> = Vec::new();
     let mut atual: Vec<blog::Entry> = Vec::new();
     let mut tam = 0usize;
+    let mut indeliveraveis = 0usize;
     for e in entradas {
         // O tamanho REAL da entrada depois de serializada, e não uma estimativa: o
         // `ciphertext` vai em hexadecimal, e uma mensagem no limite dos 4000 caracteres ocupa
         // dezenas de KiB. Uma média não protege contra o caso que interessa, que é o extremo.
         let n = serde_json::to_vec(&e).map(|v| v.len()).unwrap_or(0) + 1;
+
+        // UMA ENTRADA QUE SOZINHA NÃO CABE NUM QUADRO NÃO SE PARTE — parte-se por entradas.
+        //
+        // O empacotamento fecha o lote antes de uma entrada grande, portanto ela acaba sozinha
+        // no seu; e um lote de uma entrada só tem o tamanho dessa entrada, que pode passar o
+        // `MAX_FRAME`. Aí o `corpo_do_quadro` recusa-se a construir o quadro, o `?` do aperto
+        // de mão propaga, e a sessão morre — **antes** da `Presenca` e antes do `select!`.
+        // Como o histórico não encolhe, morria outra vez a cada religação: seria o #213 a
+        // voltar por uma porta mais estreita.
+        //
+        // Que uma entrada assim exista é possível: o `merge_verificado` guarda tudo o que
+        // decifra e assina, sem tecto de tamanho, e um `Msg::Nova` cabe em três bytes a menos
+        // do que o `Msg::Sync` equivalente (`"entrada":E` contra `"entradas":[E]`). Ou seja,
+        // há uma janela em que uma entrada ENTRA por `Nova` e depois não SAI por `Sync`.
+        //
+        // Salta-se, e diz-se. Aquela entrada é indeliverável por construção — não há quadro
+        // que a leve —, mas o resto da sala não tem culpa nenhuma disso. Perder uma mensagem
+        // e dizê-lo é muito melhor do que perder a sala inteira em silêncio.
+        if envelope + n > MAX_FRAME {
+            indeliveraveis += 1;
+            continue;
+        }
+
         if !atual.is_empty() && tam + n > LOTE_SYNC {
             lotes.push(Msg::Sync {
                 servidor: servidor.clone(),
@@ -1706,8 +1751,22 @@ fn partir_sync(servidor: String, entradas: Vec<blog::Entry>) -> Vec<Msg> {
     }
     if !atual.is_empty() {
         lotes.push(Msg::Sync {
-            servidor,
+            servidor: servidor.clone(),
             entradas: atual,
+        });
+    }
+    if indeliveraveis > 0 {
+        eprintln!(
+            "[rede] {indeliveraveis} entrada(s) do servidor {} não cabem num quadro e não vão \
+             no sync; o resto da sala segue",
+            &servidor[..8.min(servidor.len())]
+        );
+    }
+    // Um servidor sem nada que caiba continua a dizer que é meu.
+    if lotes.is_empty() {
+        lotes.push(Msg::Sync {
+            servidor,
+            entradas: Vec::new(),
         });
     }
     lotes
@@ -2034,6 +2093,72 @@ mod testes {
             .collect();
         assert_eq!(juntas.len(), 3, "a entrada grande não pode desaparecer");
         assert_eq!(juntas[1].ciphertext, entradas[1].ciphertext);
+    }
+
+    /// O CONTRATO DO `partir_sync`: nenhum lote sai grande de mais. Nem com uma entrada gigante.
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O empacotamento fecha o lote antes de uma entrada grande, portanto ela acaba **sozinha**
+    /// no seu — e um lote de uma entrada só tem o tamanho dessa entrada. O teste dos lotes usa
+    /// entradas de ~40 KiB e nunca chega perto do `MAX_FRAME`, portanto passava a afirmar uma
+    /// garantia que a função não dava.
+    ///
+    /// Com uma entrada acima do `MAX_FRAME` no log, o `corpo_do_quadro` recusava-se a construir
+    /// o quadro, o `?` do aperto de mão propagava, e a sessão morria antes da `Presenca` e antes
+    /// do `select!`. Como o histórico não encolhe, morria outra vez a cada religação: o #213 a
+    /// voltar por uma porta mais estreita.
+    ///
+    /// Que uma entrada assim exista é possível — o `merge_verificado` guarda tudo o que decifra
+    /// e assina, sem tecto — e um `Msg::Nova` cabe em três bytes a menos do que o `Msg::Sync`
+    /// equivalente, portanto há uma janela em que uma entrada ENTRA e depois não SAI.
+    #[test]
+    fn nenhum_lote_sai_grande_de_mais_nem_com_uma_entrada_gigante() {
+        let gigante = entrada_de(MAX_FRAME, 9);
+        assert!(
+            serde_json::to_vec(&gigante).unwrap().len() > MAX_FRAME,
+            "o caso tem de ser mesmo maior do que um quadro"
+        );
+        let entradas = vec![entrada_de(10, 1), gigante.clone(), entrada_de(10, 3)];
+
+        let lotes = partir_sync("s".into(), entradas);
+        for m in &lotes {
+            // O `tamanho_do_sync` já faz `expect` no `corpo_do_quadro`: se um lote não coubesse,
+            // rebentava aqui — que é exactamente o que acontecia na sessão.
+            let n = tamanho_do_sync(m);
+            assert!(n <= MAX_FRAME, "um lote de {n} bytes não cabe num quadro");
+        }
+
+        let juntas: Vec<blog::Entry> = lotes
+            .iter()
+            .flat_map(|m| match m {
+                Msg::Sync { entradas, .. } => entradas.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(juntas.len(), 2, "as duas que cabem têm de ir, e só elas");
+        assert!(
+            !juntas.iter().any(|e| e.ciphertext == gigante.ciphertext),
+            "a entrada indeliverável não pode ir dentro de um lote"
+        );
+    }
+
+    /// E uma sala onde NADA cabe continua a dizer que é minha.
+    ///
+    /// Sem isto, um servidor cujas entradas fossem todas indeliveráveis desaparecia do sync: o
+    /// outro lado nunca sabia que a sala existe, e a retribuição nunca acontecia. Um `Sync`
+    /// vazio custa nada e mantém a sala no mapa dos dois.
+    #[test]
+    fn uma_sala_so_com_entradas_indeliveraveis_ainda_se_anuncia() {
+        let lotes = partir_sync("s".into(), vec![entrada_de(MAX_FRAME, 9)]);
+        assert_eq!(lotes.len(), 1);
+        match &lotes[0] {
+            Msg::Sync { servidor, entradas } => {
+                assert_eq!(servidor, "s");
+                assert!(entradas.is_empty(), "nada cabia, portanto o lote é vazio");
+            }
+            outro => panic!("devia ser um Sync vazio, deu {outro:?}"),
+        }
     }
 
     /// Um `Sync` VAZIO continua a ir.

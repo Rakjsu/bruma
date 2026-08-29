@@ -57,6 +57,37 @@ type R<T> = Result<T, String>;
 /// erro; se ficar menor, avisa cedo demais. Nenhum dos dois deixa passar o que não devia.
 pub const MAX_TEXTO: usize = 4000;
 
+/// E o do NOME, que é o mesmo `maxlength` do campo no `index.html`.
+///
+/// O `enviar` tinha tecto e o `definir_nome` não tinha nenhum do lado do Rust — só o
+/// `maxlength="32"` do HTML, que é uma sugestão ao teclado e não um guarda. E um nome não é um
+/// campo qualquer: o `definir_nome` escreve uma `Carga::Apresentar` no log de **todos** os
+/// servidores onde a pessoa está. Um nome enorme punha em cada uma dessas salas uma entrada
+/// que depois não cabe num quadro de sync — e a partir daí aquela sala deixava de sincronizar,
+/// por uma coisa que a própria pessoa fez sem intenção nenhuma.
+pub const MAX_NOME: usize = 32;
+
+/// O nome que se aceita, e porquê — à parte do comando, para se poder medir.
+///
+/// O `definir_nome` precisa de `State<Arc<App>>` e de uma `AppHandle`, que não se constroem num
+/// teste. Isto recebe uma `&str` e devolve o nome já aparado ou a razão de não servir, que é a
+/// única parte com uma regra lá dentro.
+fn nome_aceitavel(nome: &str) -> Result<String, String> {
+    let nome = nome.trim();
+    if nome.is_empty() {
+        return Err("o nome não pode ficar vazio".into());
+    }
+    // Em CARACTERES, como no `enviar`: é o que a pessoa vê no campo, e contar bytes daria um
+    // limite que encolhe quando se escreve com acentos — «Zé» gastaria três dos trinta e dois.
+    if nome.chars().count() > MAX_NOME {
+        return Err(format!(
+            "esse nome tem {} caracteres e o limite é {MAX_NOME}",
+            nome.chars().count()
+        ));
+    }
+    Ok(nome.to_string())
+}
+
 fn erro(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -433,10 +464,7 @@ pub fn definir_nome(
     rede: State<Arc<Rede>>,
     janela: AppHandle,
 ) -> R<()> {
-    let nome = nome.trim().to_string();
-    if nome.is_empty() {
-        return Err("o nome não pode ficar vazio".into());
-    }
+    let nome = nome_aceitavel(&nome)?;
     *app.nome.lock().map_err(erro)? = nome.clone();
     app.gravar_indice().map_err(erro)?;
 
@@ -1386,4 +1414,53 @@ pub fn autoteste_par() -> Option<String> {
 #[tauri::command]
 pub fn medir_ui_pedido() -> bool {
     std::env::args().any(|a| a == "--medir-ui")
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    /// O NOME TEM TECTO — e o tecto conta caracteres, não bytes.
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O `enviar` tinha tecto; o `definir_nome` não tinha nenhum do lado do Rust. Só o
+    /// `maxlength="32"` do campo no HTML, que é uma sugestão ao teclado e não um guarda.
+    ///
+    /// E um nome não é um campo qualquer: o `definir_nome` escreve uma `Carga::Apresentar` no
+    /// log de **todos** os servidores onde a pessoa está. Um nome enorme punha em cada uma
+    /// dessas salas uma entrada que depois não cabe num quadro de sync — e a partir daí a sala
+    /// deixava de sincronizar, por uma coisa que a própria pessoa fez sem querer.
+    ///
+    /// Contar caracteres e não bytes importa: com bytes, «José» gastava cinco dos trinta e dois
+    /// e ninguém percebia porquê.
+    #[test]
+    fn o_nome_tem_tecto_e_conta_caracteres() {
+        assert_eq!(
+            nome_aceitavel("  Rakjsu  ").unwrap(),
+            "Rakjsu",
+            "o nome apara-se"
+        );
+        assert!(
+            nome_aceitavel("   ").is_err(),
+            "um nome só de espaços fica vazio"
+        );
+
+        // Trinta e dois acentuados: são 64 bytes em UTF-8, e têm de passar.
+        let acentuado = "é".repeat(MAX_NOME);
+        assert_eq!(
+            acentuado.len(),
+            MAX_NOME * 2,
+            "o caso tem de ser mesmo multibyte"
+        );
+        assert!(
+            nome_aceitavel(&acentuado).is_ok(),
+            "o tecto conta caracteres: 32 acentuados têm de caber"
+        );
+
+        assert!(
+            nome_aceitavel(&"a".repeat(MAX_NOME + 1)).is_err(),
+            "um caracter acima do tecto tem de ser recusado"
+        );
+    }
 }
