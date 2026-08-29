@@ -1178,16 +1178,46 @@ pub fn palavras_da_identidade(nucleo: State<Arc<crate::estado::App>>) -> R<Strin
 /// Apagar seria mais arrumado e muito pior: se a pessoa se enganou nas palavras, o que
 /// tinha desaparecia sem volta.
 #[tauri::command]
-pub fn restaurar_identidade(palavras: String) -> R<String> {
+pub fn restaurar_identidade(
+    palavras: String,
+    app: State<Arc<App>>,
+    janela: AppHandle,
+) -> R<String> {
     let semente = spike_common::crypto::palavras_em_semente(&palavras).map_err(erro)?;
     let raiz = crate::estado::raiz();
+    let identidade = raiz.join("identidade.key");
     let indice = raiz.join("indice.json");
+
+    // UM CARIMBO ÚNICO, e o MESMO para os dois (#15, #16, #74).
+    //
+    // A semente antiga tem de ser GUARDADA, não escrita por cima: o índice que se guarda «para
+    // o caso de te enganares nas palavras» está cifrado com ela, e sem ela é lixo. E o nome
+    // não pode ser fixo — restaurar duas vezes atropelava o primeiro guardado. O carimbo liga
+    // a semente antiga ao índice antigo que ela decifra.
+    let carimbo = crate::estado::agora_ms();
+
+    // A semente antiga primeiro. Se falhar, aborta-se ANTES de tocar em mais nada.
+    if identidade.exists() {
+        let guardada = raiz.join(format!("identidade.key.antes-de-restaurar-{carimbo}"));
+        std::fs::rename(&identidade, &guardada).map_err(erro)?;
+    }
     if indice.exists() {
-        let guardado = indice.with_extension("json.antes-de-restaurar");
+        let guardado = raiz.join(format!("indice.json.antes-de-restaurar-{carimbo}"));
         std::fs::rename(&indice, &guardado).map_err(erro)?;
     }
-    std::fs::write(raiz.join("identidade.key"), semente).map_err(erro)?;
-    Ok("A identidade foi restaurada. Fecha e volta a abrir o Bruma.".into())
+
+    // A semente nova, ATÓMICA e com CHECKSUM — a mesma forma que a criação usa, e não um
+    // `fs::write` cru, que deixava a semente restaurada sem soma e sem durabilidade (#7, #18).
+    crate::estado::gravar_semente(&identidade, &semente).map_err(erro)?;
+
+    // CONGELAR E REINICIAR (#6, #16).
+    //
+    // A `App` em memória ainda tem a semente ANTIGA. Sem isto, um par a ligar-se nos segundos
+    // seguintes fazia o `guardar_prekey` gravar um índice cifrado com a semente velha ao lado
+    // da chave nova — e no arranque seguinte a app não abria. Congela-se para nada se gravar
+    // no intervalo, e reinicia-se para não haver intervalo nenhum.
+    app.congelar();
+    janela.restart();
 }
 
 /// Mede o som que sai das colunas durante `ms`, e diz se a captura nos exclui.

@@ -494,6 +494,10 @@ pub struct App {
     /// qual — sobretudo a chave — e o `gravar_indice` reescreve-as, para a primeira gravação
     /// não apagar do índice a única forma de decifrar o ficheiro que ficou no disco.
     nao_abriram: Mutex<Vec<ServidorGuardado>>,
+    /// Depois de uma restauração de identidade, a semente em `self.semente` é a ANTIGA e a do
+    /// disco é a nova. Qualquer `gravar_indice` cifraria com a antiga e deixaria um índice que
+    /// no arranque seguinte não abre. Enquanto isto estiver `true`, o `gravar_indice` recusa.
+    congelada: std::sync::atomic::AtomicBool,
 }
 
 impl App {
@@ -593,6 +597,7 @@ impl App {
             lido: Mutex::new(indice.lido),
             escrita_do_indice: Mutex::new(()),
             nao_abriram: Mutex::new(nao_abriram),
+            congelada: std::sync::atomic::AtomicBool::new(false),
         };
 
         #[cfg(debug_assertions)]
@@ -887,7 +892,17 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Congela as gravações do índice. Ver [`App::congelada`]. Uma vez, e não se desfaz — a
+    /// app está prestes a reiniciar.
+    pub fn congelar(&self) {
+        self.congelada
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn gravar_indice(&self) -> Result<()> {
+        if self.congelada.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("a identidade foi restaurada; a app vai reiniciar e não grava mais nada");
+        }
         // Recolher primeiro, e largar. Isto segurava `servidores` durante a serialização, a
         // cifra e a escrita no disco, enquanto ia pedindo os outros quatro — uma janela larga
         // para outro thread ficar preso do outro lado.
@@ -1111,6 +1126,18 @@ fn ler_indice(raiz: &std::path::Path, semente: &[u8; 32]) -> Result<(Indice, boo
     }
 }
 
+/// Grava uma semente com soma de controlo (36 bytes) de forma atómica.
+///
+/// A mesma forma que o `semente_ou_cria` usa ao criar — extraída para o `restaurar_identidade`
+/// não a escrever à mão com um `fs::write` cru, que foi como a semente restaurada ficava sem
+/// checksum e sem durabilidade, ao contrário da criada.
+pub fn gravar_semente(p: &std::path::Path, semente: &[u8; 32]) -> Result<()> {
+    let mut com_soma = Vec::with_capacity(36);
+    com_soma.extend_from_slice(semente);
+    com_soma.extend_from_slice(&crypto::soma_de_controlo(semente));
+    escrever_atomico(p, &com_soma)
+}
+
 fn semente_ou_cria(p: &std::path::Path) -> Result<[u8; 32]> {
     if let Ok(raw) = std::fs::read(p) {
         // 32 bytes: FORMATO ANTIGO, aceite tal e qual. Convertido para 36 na próxima escrita
@@ -1143,10 +1170,7 @@ fn semente_ou_cria(p: &std::path::Path) -> Result<[u8; 32]> {
     // com menos cuidado do que o índice — um `fs::write` cru, sem sync nem rename.
     let mut s = [0u8; 32];
     getrandom::getrandom(&mut s).map_err(|e| anyhow!("rng: {e}"))?;
-    let mut com_soma = Vec::with_capacity(36);
-    com_soma.extend_from_slice(&s);
-    com_soma.extend_from_slice(&crypto::soma_de_controlo(&s));
-    escrever_atomico(p, &com_soma)?;
+    gravar_semente(p, &s)?;
     Ok(s)
 }
 
@@ -1249,6 +1273,26 @@ mod testes {
             serde_json::to_string_pretty(&cofre).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Depois de congelada, a app recusa gravar o índice (#6, #16).
+    ///
+    /// É o que impede a corrupção entre restaurar a identidade e o processo reiniciar: a
+    /// semente em memória ainda é a antiga, e uma gravação nesse intervalo deixava um índice
+    /// que no arranque seguinte não abria.
+    #[test]
+    fn congelada_recusa_gravar() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-congela-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = App::arrancar().expect("arrancar");
+
+        app.gravar_indice().expect("antes de congelar, grava");
+        app.congelar();
+        assert!(app.gravar_indice().is_err(), "congelada não pode gravar");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Uma sala que não abre no arranque NÃO perde a chave na primeira gravação (#91, #129).

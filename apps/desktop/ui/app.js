@@ -1444,8 +1444,9 @@ function seccaoDasPalavras() {
   cx.append(ta);
   const perigo = elemento('div', 'aviso aviso--perigo');
   perigo.innerHTML = 'Isto <b>troca</b> a identidade desta máquina. Os servidores que tens '
-    + 'aqui deixam de abrir — as chaves deles pertencem à identidade antiga. Nada é apagado: '
-    + 'o índice antigo fica guardado ao lado, e voltas a entrar nas salas por convite.';
+    + 'aqui deixam de abrir — as chaves deles pertencem à identidade antiga. <b>Nada é '
+    + 'apagado:</b> a identidade antiga e o índice antigo ficam guardados ao lado, com a data, '
+    + 'e voltar a essas palavras traz tudo de volta. A app reinicia sozinha ao restaurar.';
   cx.append(perigo);
   const a2 = elemento('div', 'caixa__acoes');
   a2.style.justifyContent = 'flex-start';
@@ -1456,11 +1457,19 @@ function seccaoDasPalavras() {
     const palavras = ta.value.trim();
     if (!palavras) { nota2.textContent = 'escreve as 24 palavras primeiro'; return; }
     nota2.textContent = 'a verificar…';
+    fazer.disabled = true;
+    ta.disabled = true;
     try {
-      nota2.textContent = await invoke('restaurar_identidade', { palavras });
-      fazer.disabled = true;
-      ta.disabled = true;
-    } catch (e) { nota2.textContent = String(e); }
+      // O comando reinicia o processo e NÃO regressa (a semente em memória é a antiga, e
+      // deixá-la a gravar corromperia o índice novo). Se chegar a devolver, é porque falhou
+      // ANTES do reinício — aí mostra-se o erro e volta-se a permitir tentar.
+      nota2.textContent = 'a restaurar e a reiniciar…';
+      await invoke('restaurar_identidade', { palavras });
+    } catch (e) {
+      nota2.textContent = String(e);
+      fazer.disabled = false;
+      ta.disabled = false;
+    }
   };
   a2.append(fazer, nota2);
   cx.append(a2);
