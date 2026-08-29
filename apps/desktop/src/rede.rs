@@ -24,6 +24,21 @@ use crate::estado::App;
 pub const ALPN: &[u8] = b"bruma/1";
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
+/// Quanto vai, no máximo, num `Sync` — e porque é MUITO menor do que o `MAX_FRAME`.
+///
+/// O `Sync` levava o log INTEIRO de uma sala num só quadro. Acima dos 8 MiB do `MAX_FRAME` o
+/// outro lado recusa-o pelo cabeçalho, **antes de ler o corpo**: o leitor sai, a sessão morre,
+/// e como o histórico não encolhe sozinho a tentativa seguinte manda exactamente o mesmo. Uma
+/// sala grande passava a nunca poder sincronizar, com o sintoma «aparece ligado e não chega
+/// nada». Bastavam umas 14 mil mensagens, ou 260 no limite dos 4000 caracteres.
+///
+/// 256 KiB, e não «um pouco menos de 8 MiB», por causa do PRAZO. Cada quadro tem o seu prazo
+/// de escrita (generoso no controlo, mas finito), e o prazo é POR QUADRO: num quadro único, um
+/// par com pouca largura de banda esgota-o e a sessão cai; em lotes, cada um cabe à vontade e
+/// a sincronização **progride** em vez de reiniciar do zero. É a mesma lição do teste do
+/// impasse — medir progresso, não tempo decorrido.
+const LOTE_SYNC: usize = 256 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -464,6 +479,51 @@ impl Rede {
     }
 }
 
+/// O recuo da religação, por par — e sem rede nem relógio lá dentro.
+///
+/// Está à parte do vigia pela mesma razão que o `interpretar` está à parte do `ler`: é uma
+/// DECISÃO, e uma decisão testa-se sozinha. O vigia precisa de um `Endpoint`, de sessões vivas
+/// e de esperas reais; isto precisa de um `Instant` e de mais nada.
+///
+/// A regra que aqui está escrita, e que é a correcção do defeito: **só o [`Adiamento::pegou`]
+/// limpa o recuo.** Discar não o limpa, nem sequer quando o outro lado atende — porque atender
+/// não é funcionar, e o `ligar` devolve `Ok` mal faz `spawn` da sessão, antes de um único byte
+/// ir ao fio.
+#[derive(Default)]
+struct Adiamento {
+    espera: std::collections::HashMap<String, u64>,
+    proxima: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl Adiamento {
+    /// Há uma sessão viva com este par — e isto é PROVA e não promessa: ele está no mapa das
+    /// ligações. O recuo volta a zero, para que uma queda a seguir a uma hora de conversa seja
+    /// tentada dois segundos depois e não daqui a um minuto.
+    fn pegou(&mut self, peer: &str) {
+        self.espera.remove(peer);
+        self.proxima.remove(peer);
+    }
+
+    /// Ainda não chegou a hora da próxima tentativa.
+    fn ainda_cedo(&self, peer: &str, agora: std::time::Instant) -> bool {
+        self.proxima.get(peer).is_some_and(|q| agora < *q)
+    }
+
+    /// Discou-se. Agenda a próxima tentativa e faz o recuo crescer — **aconteça o que
+    /// acontecer à ligação**. Devolve os segundos que acabou de agendar, para quem os
+    /// quiser dizer.
+    fn discou(&mut self, peer: &str, agora: std::time::Instant) -> u64 {
+        let s = self.espera.entry(peer.to_string()).or_insert(2);
+        let agendado = *s;
+        self.proxima.insert(
+            peer.to_string(),
+            agora + std::time::Duration::from_secs(agendado),
+        );
+        *s = (*s * 2).min(60);
+        agendado
+    }
+}
+
 /// Mantém as ligações de pé, para sempre.
 ///
 /// # A avaria que isto corrige
@@ -486,9 +546,7 @@ impl Rede {
 /// a ligação pega. Sem recuo, um peer desligado durante a noite dava milhares de tentativas
 /// e enchia o registo de ruído.
 async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
-    use std::collections::HashMap;
-    let mut espera: HashMap<String, u64> = HashMap::new();
-    let mut proxima: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut adiamento = Adiamento::default();
     loop {
         let conhecidos: Vec<String> = {
             let Ok(s) = app.servidores.lock() else {
@@ -529,28 +587,38 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                 .unwrap_or(false);
             if ja_ligado {
                 // Pegou: o próximo corte volta a tentar depressa, e não daqui a um minuto.
-                espera.remove(&peer);
-                proxima.remove(&peer);
+                adiamento.pegou(&peer);
                 continue;
             }
-            if proxima.get(&peer).is_some_and(|q| agora < *q) {
+            if adiamento.ainda_cedo(&peer, agora) {
                 continue;
             }
-            let s = espera.entry(peer.clone()).or_insert(2);
-            match ligar(&rede, &app, &janela, &peer).await {
-                Ok(()) => {
-                    eprintln!("[rede] religado a {}", &peer[..8.min(peer.len())]);
-                    espera.remove(&peer);
-                    proxima.remove(&peer);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[rede] {} não atendeu ({e}); nova tentativa daqui a {s}s",
-                        &peer[..8.min(peer.len())]
-                    );
-                    proxima.insert(peer.clone(), agora + std::time::Duration::from_secs(*s));
-                    *s = (*s * 2).min(60);
-                }
+            // ATENDER NÃO É FUNCIONAR, E O RECUO TEM DE SABER A DIFERENÇA.
+            //
+            // Isto limpava o recuo no ramo `Ok`. Mas o `ligar` devolve `Ok` assim que faz
+            // `tokio::spawn` da sessão — antes de um único byte ir ao fio. «Ok» quer dizer «o
+            // aperto de mão do QUIC pegou e a tarefa arrancou», e não «isto serve para alguma
+            // coisa».
+            //
+            // A diferença deixa de ser académica quando a sessão morre logo a seguir: o `Drop`
+            // do `SessaoViva` tira-a do mapa, dois segundos depois o vigia vê que não está
+            // ligado, disca outra vez, volta a receber `Ok`, e volta a limpar o recuo. Ciclo
+            // de dois em dois segundos, para sempre, a dizer ao outro lado com o próprio
+            // tráfego que estamos online. Foi assim que um `Sync` grande de mais deixou de ser
+            // um erro e passou a ser um martelo.
+            //
+            // Quem limpa o recuo é o `pegou`, lá em cima, que tem prova de sessão viva.
+            let resultado = ligar(&rede, &app, &janela, &peer).await;
+            let s = adiamento.discou(&peer, agora);
+            match &resultado {
+                Ok(()) => eprintln!(
+                    "[rede] discado para {}; se pegar, o recuo limpa-se na volta seguinte",
+                    &peer[..8.min(peer.len())]
+                ),
+                Err(e) => eprintln!(
+                    "[rede] {} não atendeu ({e}); nova tentativa daqui a {s}s",
+                    &peer[..8.min(peer.len())]
+                ),
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -918,7 +986,9 @@ async fn sessao(
         if let Some(ms) = crate::bandeiras::sync_lento_ms() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
-        escrever(&mut envia, &Msg::Sync { servidor, entradas }).await?;
+        for m in partir_sync(servidor, entradas) {
+            escrever(&mut envia, &m).await?;
+        }
     }
 
     // E dizer onde estamos agora. Sem isto, quem chega depois de nós entrarmos numa sala
@@ -1196,7 +1266,7 @@ async fn sessao(
                         Saida::Video { .. } => None,
                     };
                     if let Some(q) = quadro {
-                        if escrever_quadro(&mut envia, &q).await.is_err() {
+                        if escrever_quadro_partido(&mut envia, q).await.is_err() {
                             break;
                         }
                     }
@@ -1581,11 +1651,117 @@ fn ecra() -> String {
 const TIPO_CONTROLO: u8 = 0;
 const TIPO_VIDEO: u8 = 1;
 
+/// O nome de uma mensagem, para uma queixa poder dizer QUAL delas cresceu.
+///
+/// Um erro que diz só «um quadro de 9 MiB» manda quem o lê procurar no ficheiro inteiro. A
+/// etiqueta é a mesma que vai no `t` do JSON, portanto o que se lê no registo é o que se
+/// procura no código.
+fn nome_da_msg(m: &Msg) -> &'static str {
+    match m {
+        Msg::Ola { .. } => "Ola",
+        Msg::Sync { .. } => "Sync",
+        Msg::Nova { .. } => "Nova",
+        Msg::Presenca { .. } => "Presenca",
+        Msg::Sinal { .. } => "Sinal",
+        Msg::Desconhecida => "Desconhecida",
+    }
+}
+
+/// Parte um `Sync` em tantos quantos forem precisos para cada um caber num quadro.
+///
+/// **Não é uma variante nova do protocolo, e isso é o ponto.** Uma versão anterior recebe
+/// vários `Msg::Sync` do mesmo servidor em vez de um, e junta cada um como já juntava — o
+/// `merge_verificado` é por entrada e a deduplicação sai do hash. Um par na v0.18.1 entende
+/// isto sem saber que existe, e sem precisar de actualizar.
+///
+/// E não multiplica a retribuição: o `Saida::SyncPara` sai de `aprendi`, que só é verdade da
+/// primeira vez que um par se prova naquela sala. Os lotes seguintes não a voltam a disparar.
+///
+/// Um `Sync` VAZIO continua a ir: é ele que diz «este servidor é meu e não tenho nada», e o
+/// simulador de ataque depende de o poder mandar.
+fn partir_sync(servidor: String, entradas: Vec<blog::Entry>) -> Vec<Msg> {
+    if entradas.is_empty() {
+        return vec![Msg::Sync {
+            servidor,
+            entradas: Vec::new(),
+        }];
+    }
+    let mut lotes: Vec<Msg> = Vec::new();
+    let mut atual: Vec<blog::Entry> = Vec::new();
+    let mut tam = 0usize;
+    for e in entradas {
+        // O tamanho REAL da entrada depois de serializada, e não uma estimativa: o
+        // `ciphertext` vai em hexadecimal, e uma mensagem no limite dos 4000 caracteres ocupa
+        // dezenas de KiB. Uma média não protege contra o caso que interessa, que é o extremo.
+        let n = serde_json::to_vec(&e).map(|v| v.len()).unwrap_or(0) + 1;
+        if !atual.is_empty() && tam + n > LOTE_SYNC {
+            lotes.push(Msg::Sync {
+                servidor: servidor.clone(),
+                entradas: std::mem::take(&mut atual),
+            });
+            tam = 0;
+        }
+        tam += n;
+        atual.push(e);
+    }
+    if !atual.is_empty() {
+        lotes.push(Msg::Sync {
+            servidor,
+            entradas: atual,
+        });
+    }
+    lotes
+}
+
+/// Escreve um quadro — e se for um `Sync` que não caiba, parte-o em vez de o mandar inteiro.
+///
+/// Está no caminho de saída, e não só no aperto de mão, porque a retribuição
+/// (`Saida::SyncPara`) manda o log completo de uma sala a quem acabou de se provar: é
+/// precisamente o caso em que a sala é grande e o outro lado não tem nada.
+async fn escrever_quadro_partido(envia: &mut SendStream, q: Quadro) -> Result<()> {
+    match q {
+        Quadro::Controlo(Msg::Sync { servidor, entradas }) => {
+            for m in partir_sync(servidor, entradas) {
+                escrever_quadro(envia, &Quadro::Controlo(m)).await?;
+            }
+            Ok(())
+        }
+        outro => escrever_quadro(envia, &outro).await,
+    }
+}
+
 async fn escrever(envia: &mut SendStream, m: &Msg) -> Result<()> {
     escrever_quadro(envia, &Quadro::Controlo(m.clone())).await
 }
 
 async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
+    let corpo = corpo_do_quadro(q)?;
+    // COM PRAZO (#3).
+    //
+    // Isto eram dois `write_all` sem prazo nenhum. Um par que aceite a ligação e deixe de LER
+    // — por avaria, ou de propósito com software modificado — enche a janela do QUIC, e essa
+    // espera não termina nunca. A tarefa da sessão fica parada dentro do `select!`, deixa de
+    // servir o canal de saída e deixa de vigiar o leitor; e como o `SessaoViva` só limpa no
+    // `Drop`, a entrada fica no mapa `ligacoes` para sempre: o vigia vê «já está ligado» e não
+    // volta a tentar, a interface conta-o como presente, e a voz continua a ser enviada para
+    // ele. É exactamente o estado permanente que o `SessaoViva` foi escrito para impedir,
+    // alcançado por outro caminho.
+    //
+    // O prazo esgotado é fim de sessão: o chamador já trata o erro fechando, e aí o `Drop`
+    // faz o resto — o par volta a ser alcançável em vez de ficar preso a fingir.
+    let prazo = prazo_de_escrita(q);
+    let tam = (corpo.len() as u32).to_be_bytes();
+    escrita_com_prazo(envia.write_all(&tam), prazo, "o tamanho").await?;
+    escrita_com_prazo(envia.write_all(&corpo), prazo, "o corpo").await?;
+    Ok(())
+}
+
+/// Os bytes de um quadro, e a recusa de o construir grande de mais.
+///
+/// À parte do `escrever_quadro` pela razão de sempre neste ficheiro: é uma decisão sobre
+/// bytes, e uma decisão testa-se sozinha. O `escrever_quadro` precisa de um `SendStream`,
+/// que não se constrói num teste; isto recebe um `Quadro` e devolve um `Vec<u8>`.
+fn corpo_do_quadro(q: &Quadro) -> Result<Vec<u8>> {
     let corpo: Vec<u8> = match q {
         // Nunca se ENVIA um desconhecido: a variante existe só para o lado da leitura. Se
         // alguém a construir para enviar, é um bug de programação e não um caso a tolerar.
@@ -1614,24 +1790,29 @@ async fn escrever_quadro(envia: &mut SendStream, q: &Quadro) -> Result<()> {
             v
         }
     };
-    // COM PRAZO (#3).
+    // NÃO SE ENTREGA UM QUADRO QUE O OUTRO LADO VAI RECUSAR.
     //
-    // Isto eram dois `write_all` sem prazo nenhum. Um par que aceite a ligação e deixe de LER
-    // — por avaria, ou de propósito com software modificado — enche a janela do QUIC, e essa
-    // espera não termina nunca. A tarefa da sessão fica parada dentro do `select!`, deixa de
-    // servir o canal de saída e deixa de vigiar o leitor; e como o `SessaoViva` só limpa no
-    // `Drop`, a entrada fica no mapa `ligacoes` para sempre: o vigia vê «já está ligado» e não
-    // volta a tentar, a interface conta-o como presente, e a voz continua a ser enviada para
-    // ele. É exactamente o estado permanente que o `SessaoViva` foi escrito para impedir,
-    // alcançado por outro caminho.
+    // O tamanho escrevia-se fosse ele qual fosse. Acima do `MAX_FRAME` o receptor faz
+    // `bail!` só de ler o cabeçalho — sem consumir o corpo, portanto o stream fica
+    // dessincronizado e não há recuperação: a sessão morre, e morre do lado de quem não fez
+    // nada de errado, com uma queixa sobre um limite que ele não escolheu.
     //
-    // O prazo esgotado é fim de sessão: o chamador já trata o erro fechando, e aí o `Drop`
-    // faz o resto — o par volta a ser alcançável em vez de ficar preso a fingir.
-    let prazo = prazo_de_escrita(q);
-    let tam = (corpo.len() as u32).to_be_bytes();
-    escrita_com_prazo(envia.write_all(&tam), prazo, "o tamanho").await?;
-    escrita_com_prazo(envia.write_all(&corpo), prazo, "o corpo").await?;
-    Ok(())
+    // Quem se tem de queixar é quem construiu o quadro. Aqui o erro traz o tipo e o
+    // tamanho, e chega antes de um único byte sair. O `Sync` já não passa por aqui grande
+    // — vai partido pelo `escrever_quadro_partido` —, portanto isto é o encosto para a
+    // PRÓXIMA mensagem que cresça sem ninguém reparar. Que é exactamente como esta nasceu.
+    if corpo.len() > MAX_FRAME {
+        bail!(
+            "quadro {} de {} bytes excede o limite de {MAX_FRAME}: o outro lado recusava-o \n             pelo cabeçalho e a sessão caía — parte-o antes de o mandar",
+            match q {
+                Quadro::Controlo(m) => nome_da_msg(m),
+                Quadro::Video { .. } => "de vídeo",
+                Quadro::Desconhecido(_) => "desconhecido",
+            },
+            corpo.len()
+        );
+    }
+    Ok(corpo)
 }
 
 /// Quanto tempo se espera por uma escrita, por tipo de quadro.
@@ -1741,6 +1922,240 @@ fn interpretar(corpo: &[u8]) -> Result<Quadro> {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// Uma entrada de log de tamanho à escolha, para medir a partição do `Sync`.
+    ///
+    /// Os campos vão em hexadecimal e o `ciphertext` é o único que cresce — é ele que leva a
+    /// mensagem cifrada. Uma mensagem no limite dos 4000 caracteres ocupa dezenas de KiB
+    /// depois de cifrada e passada a hexadecimal, portanto é esse o tamanho que interessa
+    /// exercitar, e não o de uma linha de conversa.
+    fn entrada_de(bytes_de_texto: usize, marca: u8) -> blog::Entry {
+        blog::Entry {
+            author: "aa".repeat(32),
+            ts_ms: 1,
+            prev: "bb".repeat(32),
+            nonce: "cc".repeat(24),
+            ciphertext: format!("{:02x}", marca).repeat(bytes_de_texto.max(1)),
+            sig: "dd".repeat(64),
+        }
+    }
+
+    fn tamanho_do_sync(m: &Msg) -> usize {
+        corpo_do_quadro(&Quadro::Controlo(m.clone()))
+            .expect("um lote tem de caber, é para isso que ele existe")
+            .len()
+    }
+
+    /// UM `SYNC` NUNCA VAI GRANDE DE MAIS — e nenhuma entrada se perde a caminho.
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O `Sync` levava o log inteiro de uma sala num só quadro. Acima do `MAX_FRAME` o outro
+    /// lado recusa-o pelo cabeçalho, **sem chegar a ler o corpo**: o leitor sai, a sessão
+    /// morre, e a tentativa seguinte manda exactamente o mesmo, porque o histórico não
+    /// encolhe. Uma sala com umas 14 mil mensagens deixava de poder sincronizar — para
+    /// sempre, e com o sintoma «aparece ligado e não chega nada».
+    ///
+    /// Mede-se o que interessa, que são duas coisas ao mesmo tempo: que **cada** lote cabe
+    /// num quadro, e que os lotes juntos são **exactamente** o que se lhes deu, pela mesma
+    /// ordem. Partir sem perder é o requisito todo; um dos dois sozinho não prova nada.
+    #[test]
+    fn o_sync_parte_se_em_lotes_que_cabem_e_nao_perde_nada() {
+        // ~40 KiB por entrada e 400 entradas: ~16 MiB, o dobro do MAX_FRAME. Num só quadro
+        // isto era recusado pelo outro lado.
+        let entradas: Vec<blog::Entry> = (0..400).map(|i| entrada_de(20_000, i as u8)).collect();
+        let inteiro = serde_json::to_vec(&Msg::Sync {
+            servidor: "s".into(),
+            entradas: entradas.clone(),
+        })
+        .unwrap()
+        .len();
+        assert!(
+            inteiro > MAX_FRAME,
+            "o caso de teste tem de ser MAIOR do que o limite, senão não mede nada ({inteiro} bytes)"
+        );
+
+        let lotes = partir_sync("s".into(), entradas.clone());
+        assert!(lotes.len() > 1, "com {inteiro} bytes tinha de partir");
+
+        let mut juntas: Vec<blog::Entry> = Vec::new();
+        for m in &lotes {
+            let n = tamanho_do_sync(m);
+            assert!(
+                n <= MAX_FRAME,
+                "um lote de {n} bytes ainda excede o limite: o outro lado recusá-lo-ia na mesma"
+            );
+            match m {
+                Msg::Sync { servidor, entradas } => {
+                    assert_eq!(servidor, "s", "o lote mudou de servidor");
+                    assert!(
+                        !entradas.is_empty(),
+                        "um lote vazio no meio não serve para nada"
+                    );
+                    juntas.extend(entradas.iter().cloned());
+                }
+                outro => panic!("partir um Sync tem de dar Syncs, deu {outro:?}"),
+            }
+        }
+
+        assert_eq!(
+            juntas.len(),
+            entradas.len(),
+            "perderam-se ou duplicaram-se entradas"
+        );
+        for (i, (a, b)) in juntas.iter().zip(entradas.iter()).enumerate() {
+            assert_eq!(
+                a.ciphertext, b.ciphertext,
+                "a entrada {i} mudou ou trocou de lugar"
+            );
+        }
+    }
+
+    /// Uma entrada sozinha maior do que o lote vai à mesma — sozinha, e não deitada fora.
+    ///
+    /// O empacotamento fecha o lote ANTES de acrescentar a entrada que não cabe. Se essa
+    /// verificação não olhasse para o lote já estar vazio, uma entrada grande de mais entrava
+    /// num ciclo de lotes vazios ou desaparecia sem aviso — e desaparecer é a pior das duas,
+    /// porque é uma mensagem que nunca mais chega e ninguém sabe porquê.
+    #[test]
+    fn uma_entrada_maior_do_que_o_lote_vai_sozinha_e_nao_se_perde() {
+        let entradas = vec![
+            entrada_de(10, 1),
+            entrada_de(LOTE_SYNC, 2), // sozinha já passa o tecto do lote
+            entrada_de(10, 3),
+        ];
+        let lotes = partir_sync("s".into(), entradas.clone());
+        let juntas: Vec<blog::Entry> = lotes
+            .iter()
+            .flat_map(|m| match m {
+                Msg::Sync { entradas, .. } => entradas.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(juntas.len(), 3, "a entrada grande não pode desaparecer");
+        assert_eq!(juntas[1].ciphertext, entradas[1].ciphertext);
+    }
+
+    /// Um `Sync` VAZIO continua a ir.
+    ///
+    /// É ele que diz «este servidor é meu e não tenho nada para te dar». Uma partição ingénua
+    /// devolvia zero lotes para uma lista vazia e calava-o — e com ele calava o simulador de
+    /// ataque, que precisa de o poder mandar para provar que o porteiro não inscreve ninguém
+    /// só por dizer o nome de um servidor.
+    #[test]
+    fn um_sync_vazio_continua_a_ir() {
+        let lotes = partir_sync("s".into(), Vec::new());
+        assert_eq!(lotes.len(), 1, "um Sync vazio não pode ser calado");
+        match &lotes[0] {
+            Msg::Sync { servidor, entradas } => {
+                assert_eq!(servidor, "s");
+                assert!(entradas.is_empty());
+            }
+            outro => panic!("devia ser um Sync vazio, deu {outro:?}"),
+        }
+    }
+
+    /// O ENVIO recusa-se a construir um quadro que o outro lado ia recusar.
+    ///
+    /// O tamanho escrevia-se fosse ele qual fosse, e a queixa aparecia do lado errado: quem
+    /// recebia via «quadro de N bytes excede o limite» e morria, sem ter feito nada. Aqui o
+    /// erro chega a quem o construiu, antes de um único byte sair, e diz QUAL mensagem
+    /// cresceu — que é o que se procura no código a seguir.
+    #[test]
+    fn nao_se_constroi_um_quadro_grande_de_mais() {
+        let pequeno = Quadro::Controlo(Msg::Sync {
+            servidor: "s".into(),
+            entradas: vec![entrada_de(10, 1)],
+        });
+        assert!(
+            corpo_do_quadro(&pequeno).is_ok(),
+            "um quadro normal tem de continuar a passar"
+        );
+
+        let grande = Quadro::Controlo(Msg::Sync {
+            servidor: "s".into(),
+            entradas: vec![entrada_de(MAX_FRAME, 2)],
+        });
+        // O `expect_err` imprimia o `Ok` inteiro quando o guarda saísse — oito megabytes de
+        // bytes no ecrã, para dizer uma frase. Um teste que falha tem de ser legível.
+        let erro = match corpo_do_quadro(&grande) {
+            Err(e) => e.to_string(),
+            Ok(v) => panic!(
+                "um quadro de {} bytes foi construído; o MAX_FRAME é {MAX_FRAME}",
+                v.len()
+            ),
+        };
+        assert!(
+            erro.contains("Sync"),
+            "a queixa tem de dizer QUAL mensagem cresceu, e disse: {erro}"
+        );
+    }
+
+    /// ATENDER NÃO É FUNCIONAR: discar não limpa o recuo, nem quando o outro lado atende.
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O recuo limpava-se no ramo `Ok` do `ligar`. Mas o `ligar` devolve `Ok` assim que faz
+    /// `spawn` da sessão — antes de um único byte ir ao fio. Se a sessão morresse logo a
+    /// seguir (um `Sync` grande de mais, um duelo de ligações, um par que bloqueámos), o
+    /// `Drop` tirava-a do mapa, dois segundos depois o vigia via que não estava ligado,
+    /// discava, recebia `Ok`, e limpava o recuo outra vez. **Ciclo de dois em dois segundos,
+    /// para sempre** — a dizer ao outro lado, com o próprio tráfego, que estamos online.
+    ///
+    /// A regra que substitui aquilo: só a PROVA de uma sessão viva (estar no mapa das
+    /// ligações, que é o que o `pegou` representa) limpa o recuo.
+    #[test]
+    fn atender_nao_limpa_o_recuo_e_so_uma_sessao_viva_o_faz() {
+        let mut a = Adiamento::default();
+        let t0 = std::time::Instant::now();
+        let seg = std::time::Duration::from_secs(1);
+
+        // Primeira tentativa: agenda daqui a 2 s.
+        assert_eq!(a.discou("p", t0), 2);
+        assert!(a.ainda_cedo("p", t0 + seg), "1 s depois ainda é cedo");
+        assert!(
+            !a.ainda_cedo("p", t0 + 2 * seg),
+            "aos 2 s já se pode tentar"
+        );
+
+        // A sessão atendeu e morreu — nunca houve `pegou`. O recuo TEM de crescer.
+        assert_eq!(
+            a.discou("p", t0 + 2 * seg),
+            4,
+            "atender não pode repor o recuo a 2"
+        );
+        assert_eq!(a.discou("p", t0 + 6 * seg), 8);
+        assert_eq!(a.discou("p", t0 + 14 * seg), 16);
+
+        // E tem tecto: não cresce até ao infinito.
+        for _ in 0..10 {
+            a.discou("p", t0);
+        }
+        assert_eq!(a.discou("p", t0), 60, "o recuo tem de parar nos 60 s");
+
+        // Prova de sessão viva: aí sim, volta ao princípio. Uma ligação que caia ao fim de
+        // uma hora de conversa tem de ser tentada daqui a 2 s, e não daqui a um minuto.
+        a.pegou("p");
+        assert!(
+            !a.ainda_cedo("p", t0),
+            "depois de pegar não há nada a adiar"
+        );
+        assert_eq!(a.discou("p", t0), 2, "o recuo tem de voltar ao princípio");
+    }
+
+    /// E cada par tem o seu recuo: o de um não adia o outro.
+    #[test]
+    fn o_recuo_e_por_par() {
+        let mut a = Adiamento::default();
+        let t0 = std::time::Instant::now();
+        a.discou("p1", t0);
+        a.discou("p1", t0);
+        assert_eq!(
+            a.discou("p2", t0),
+            2,
+            "o p2 nunca falhou, não pode herdar o recuo do p1"
+        );
+    }
 
     /// Uma mensagem de uma versao mais nova NAO pode derrubar a ligacao.
     ///
@@ -1945,6 +2360,117 @@ mod testes {
             assert_ne!(
                 a_sobre_a_dela, a_sobre_a_dele,
                 "{a} não pode querer ficar com as duas ligações a {b}"
+            );
+        }
+    }
+
+    /// O SYNC DE UMA SALA GRANDE ATRAVESSA MESMO O FIO — e é este o defeito, inteiro.
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// Os testes acima medem a partição como decisão: dão-lhe entradas e olham para os lotes.
+    /// Nenhum deles põe um byte no fio, e é no fio que o defeito vivia — o `ler()` recusa um
+    /// quadro pelo CABEÇALHO, sem sequer consumir o corpo, portanto o stream fica
+    /// dessincronizado e a sessão morre. Não há forma de descobrir isso a olhar para uma
+    /// função pura.
+    ///
+    /// Aqui monta-se o caso a sério: dois endpoints, um stream, e um `Sync` de mais de 8 MiB
+    /// — o histórico de uma sala com uns milhares de mensagens. Antes desta correcção, este
+    /// teste morria na primeira leitura, com «quadro de N bytes excede o limite». E morria
+    /// **outra vez** a cada religação, porque o histórico não encolhe: era o ciclo.
+    ///
+    /// Exige-se três coisas ao mesmo tempo, e as três são precisas: que TENHA sido partido
+    /// (senão não estamos a medir o caso), que cada quadro tenha sido lido sem erro, e que as
+    /// entradas cheguem TODAS e pela mesma ordem — partir sem perder é o requisito.
+    #[tokio::test]
+    async fn um_sync_maior_do_que_o_quadro_atravessa_o_fio_em_lotes() {
+        // ~40 KiB por entrada, 260 entradas: ~10 MiB, acima dos 8 MiB do MAX_FRAME.
+        let entradas: Vec<blog::Entry> = (0..260).map(|i| entrada_de(20_000, i as u8)).collect();
+        let quantas = entradas.len();
+        let inteiro = serde_json::to_vec(&Msg::Sync {
+            servidor: "sala-grande".into(),
+            entradas: entradas.clone(),
+        })
+        .unwrap()
+        .len();
+        assert!(
+            inteiro > MAX_FRAME,
+            "o caso tem de ser maior do que um quadro, senão não mede o defeito ({inteiro} bytes)"
+        );
+
+        let a = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint A");
+        let b = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint B");
+        let endereco_b = b.addr();
+
+        let ouvinte = tokio::spawn(async move {
+            let conn = b
+                .accept()
+                .await
+                .expect("ligação a chegar")
+                .await
+                .expect("aceitar");
+            let (_envia, mut recebe) = conn.accept_bi().await.expect("stream");
+            let mut recebidas: Vec<blog::Entry> = Vec::new();
+            let mut quadros = 0usize;
+            while recebidas.len() < quantas {
+                // Um `Err` aqui É o defeito: é exactamente assim que a sessão morria.
+                match ler(&mut recebe).await.expect("um quadro tem de se ler") {
+                    Quadro::Controlo(Msg::Sync { entradas, .. }) => {
+                        quadros += 1;
+                        recebidas.extend(entradas);
+                    }
+                    outro => panic!(
+                        "esperava um Sync, veio um quadro {}",
+                        match &outro {
+                            Quadro::Controlo(m) => nome_da_msg(m),
+                            Quadro::Video { .. } => "de vídeo",
+                            Quadro::Desconhecido(porque) => porque,
+                        }
+                    ),
+                }
+            }
+            (recebidas, quadros)
+        });
+
+        let conn = a.connect(endereco_b, ALPN).await.expect("ligar");
+        let (mut envia, _recebe) = conn.open_bi().await.expect("stream");
+        escrever_quadro_partido(
+            &mut envia,
+            Quadro::Controlo(Msg::Sync {
+                servidor: "sala-grande".into(),
+                entradas: entradas.clone(),
+            }),
+        )
+        .await
+        .expect("um Sync grande tem de poder ser enviado");
+
+        let (recebidas, quadros) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), ouvinte)
+                .await
+                .expect("o sync não atravessou a tempo")
+                .expect("tarefa do ouvinte");
+
+        assert!(
+            quadros > 1,
+            "veio num quadro só ({quadros}): ou não partiu, ou o caso encolheu"
+        );
+        assert_eq!(
+            recebidas.len(),
+            quantas,
+            "chegaram menos entradas do que se mandou"
+        );
+        for (i, (x, y)) in recebidas.iter().zip(entradas.iter()).enumerate() {
+            assert_eq!(
+                x.ciphertext, y.ciphertext,
+                "a entrada {i} trocou de lugar ou mudou"
             );
         }
     }
