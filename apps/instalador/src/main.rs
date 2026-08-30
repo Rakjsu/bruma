@@ -1,3 +1,18 @@
+// SEM A CONSOLA PRETA (#180).
+//
+// A app tem este mesmo atributo desde sempre; o instalador não tinha nada. Um binário Rust sem
+// ele é do subsistema de CONSOLA: ao fazer duplo clique no `Instalar-Bruma.exe`, o Windows
+// aloca uma janela preta por trás da nossa — e a elevação por `ShellExecuteExW` abre outra. A
+// primeira coisa que a pessoa vê ao instalar uma app de conversas é um terminal.
+//
+// Só em release. Em debug a consola fica, porque é onde os `println!` do `medir` aparecem
+// quando se está a trabalhar.
+//
+// E para o CI não perder a saída: o `agarrar_a_consola_do_pai` liga-se à consola de quem nos
+// chamou, quando existe uma. Corrido do PowerShell, os `println!` continuam a sair; corrido do
+// Explorador, não há consola nenhuma a que se ligar e não se abre nada.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! O instalador do Bruma, escrito de raiz.
 //!
 //! # Porquê um instalador nosso
@@ -36,6 +51,21 @@ const VERSAO: &str = env!("VERSAO_DA_APP");
 
 const CHAVE_DESINSTALACAO: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Bruma";
 
+/// O que uma instalação ou desinstalação tem a dizer para lá de «correu bem».
+///
+/// Era `Result<()>`: ou tudo, ou nada. E havia coisas no meio — um atalho que não se criou
+/// depois de a app já estar instalada, uma identidade que não se encontrou onde se prometeu
+/// apagá-la. Essas não são erros (o essencial aconteceu) nem são silêncio (a pessoa tem de
+/// saber). Passam a caber aqui, e a interface mostra-as.
+#[derive(serde::Serialize, Default)]
+struct Resultado {
+    /// Correu mal, mas não impediu o essencial. Vai para o ecrã e para o registo.
+    avisos: Vec<String>,
+    /// Quantas pastas de dados foram MESMO apagadas. Zero com o `apagar_dados` ligado quer
+    /// dizer que não se encontrou nenhuma — e nesse caso não se pode dizer que se apagou.
+    dados_apagados: usize,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Modo {
     Instalar,
@@ -57,12 +87,24 @@ struct Opcoes {
     args_da_app: Vec<String>,
 }
 
+/// Lê o `argv` real. Três linhas, porque a decisão está toda no [`opcoes_de`].
 fn opcoes() -> Opcoes {
     let exe = std::env::current_exe().unwrap_or_default();
-    let sou_uninstall = exe
-        .file_name()
-        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("uninstall.exe"))
-        .unwrap_or(false);
+    let nome = exe.file_name().map(|n| n.to_string_lossy().into_owned());
+    opcoes_de(nome.as_deref().unwrap_or(""), std::env::args().skip(1))
+}
+
+/// O que os argumentos QUEREM DIZER — sem tocar no ambiente.
+///
+/// Isto lia o `std::env::args()` e o `current_exe()` lá dentro, o que o tornava impossível de
+/// testar de fora: por isso não tinha um único teste, apesar de decidir tudo o que o instalador
+/// faz a seguir — se instala ou desinstala, se pede elevação, se apaga a identidade, e o que
+/// passa à app quando a relança.
+///
+/// O dialecto do updater (`/P /R /UPDATE /ARGS`) é o caminho por onde passam **todas** as
+/// instalações existentes, e era o menos exercitado de todos.
+fn opcoes_de(exe_nome: &str, args: impl Iterator<Item = String>) -> Opcoes {
+    let sou_uninstall = exe_nome.eq_ignore_ascii_case("uninstall.exe");
 
     let mut o = Opcoes {
         modo: if sou_uninstall {
@@ -78,7 +120,7 @@ fn opcoes() -> Opcoes {
         atualizacao: false,
         args_da_app: Vec::new(),
     };
-    let mut resto = std::env::args().skip(1);
+    let mut resto = args;
     while let Some(a) = resto.next() {
         match a.as_str() {
             "--uninstall" => o.modo = Modo::Desinstalar,
@@ -158,8 +200,36 @@ fn sitios_dos_dados(destino: &Path, teste: bool) -> Vec<PathBuf> {
         }
     }
     v.push(destino.join("dados"));
+    // E onde a pessoa a tiver posto à mão. Quem usa o `BRUMA_DADOS` é precisamente quem
+    // mudou a pasta de sítio — dizer-lhe que se apagou a identidade sem sequer olhar para lá
+    // seria a mesma mentira, com um passo a mais.
+    if let Some(d) = std::env::var_os("BRUMA_DADOS") {
+        let d = PathBuf::from(d);
+        if !v.contains(&d) {
+            v.push(d);
+        }
+    }
     v
 }
+
+/// Liga-se à consola de quem nos chamou, se houver uma.
+///
+/// Existe por causa do `windows_subsystem = "windows"` lá em cima: sem ele o instalador abria
+/// uma consola preta ao duplo clique; com ele, e sem isto, o CI perdia todos os `println!` — e
+/// o portão da release lê-os para saber o que aconteceu.
+///
+/// `ATTACH_PARENT_PROCESS` falha quando não há consola de pai (duplo clique no Explorador), e
+/// falhar é exactamente o comportamento certo: não se cria nenhuma.
+#[cfg(windows)]
+fn agarrar_a_consola_do_pai() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn agarrar_a_consola_do_pai() {}
 
 /* ========================================================================== elevação */
 
@@ -340,8 +410,18 @@ fn copiar_me_como_desinstalador(destino: &Path) -> Result<()> {
     let eu = std::env::current_exe()?;
     let alvo = destino.join("uninstall.exe");
     // Se já estivermos a correr DE lá (reinstalação por cima), não há nada a copiar.
-    if eu.canonicalize().ok() == alvo.canonicalize().ok() {
-        return Ok(());
+    //
+    // Os DOIS têm de responder. Isto era `eu.canonicalize().ok() == alvo.canonicalize().ok()`,
+    // e quando ambos falhavam os dois lados davam `None` — que são iguais. A função saía com
+    // `Ok` sem ter copiado nada, e a instalação ficava sem desinstalador: nada no registo o
+    // apagaria, e a pessoa só descobria no dia em que quisesse remover a app.
+    //
+    // `canonicalize` falha quando o ficheiro não existe, e o `uninstall.exe` não existe
+    // justamente na primeira instalação — o caso mais comum de todos.
+    if let (Ok(a), Ok(b)) = (eu.canonicalize(), alvo.canonicalize()) {
+        if a == b {
+            return Ok(());
+        }
     }
     std::fs::copy(&eu, &alvo).context("não consegui criar o desinstalador")?;
     Ok(())
@@ -428,7 +508,8 @@ fn instalar(
     atualizacao: bool,
     teste: bool,
     janela: Option<&tauri::WebviewWindow>,
-) -> Result<()> {
+) -> Result<Resultado> {
+    let mut r = Resultado::default();
     avisar(janela, "a fechar o Bruma, se estiver aberto");
     if !teste {
         fechar_o_bruma();
@@ -436,18 +517,45 @@ fn instalar(
     }
     extrair_a_app(destino, janela)?;
     copiar_me_como_desinstalador(destino)?;
-    // Numa atualização não se recria o atalho da área de trabalho: se a pessoa o apagou,
-    // apagado fica — reaparecer a cada versão é dos hábitos mais irritantes que há.
-    atalhos(destino, area_de_trabalho && !atualizacao, teste, janela)?;
+
+    // O DESINSTALADOR TEM DE ESTAR LÁ, E AFIRMA-SE.
+    //
+    // O `copiar_me_como_desinstalador` tem um ramo que devolve `Ok` sem copiar. Se alguma vez
+    // voltar a poder sair por engano, é aqui que se sabe — e não meses depois, quando alguém
+    // quiser remover a app e não encontrar nada.
+    let desinstalador = destino.join("uninstall.exe");
+    if !desinstalador.exists() {
+        bail!(
+            "instalei a app mas não ficou desinstalador em {}",
+            desinstalador.display()
+        );
+    }
+
+    // UM ATALHO QUE FALHA NÃO DESFAZ UMA INSTALAÇÃO QUE JÁ ACONTECEU (#182).
+    //
+    // Isto era `atalhos(...)?`. Qualquer falha do COM ou do `IPersistFile` abortava a
+    // instalação DEPOIS de o `bruma.exe` já ter sido substituído: a pessoa via o ecrã de erro,
+    // concluía que nada tinha sido instalado, e a app nova estava lá. Numa ACTUALIZAÇÃO isso é
+    // pior ainda — a versão nova já ficou, e a mensagem diz que falhou.
+    //
+    // Extrair e registar continuam fatais; o atalho é conveniência. Passa a queixar-se e a
+    // seguir — para o registo E para o ecrã, porque um aviso só no registo é um aviso que
+    // ninguém lê.
+    if let Err(e) = atalhos(destino, area_de_trabalho && !atualizacao, teste, janela) {
+        let aviso = format!("instalei, mas não consegui criar o atalho: {e:#}");
+        anotar(&aviso);
+        r.avisos.push(aviso);
+    }
     if !teste {
         avisar(janela, "a registar a instalação");
         escrever_registo(destino)?;
     }
     avisar(janela, "pronto");
-    Ok(())
+    Ok(r)
 }
 
-fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
+fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<Resultado> {
+    let mut resultado = Resultado::default();
     if !teste {
         fechar_o_bruma();
     }
@@ -476,15 +584,37 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
         // ficava convencida de que a identidade tinha desaparecido do mundo enquanto ela
         // continuava no disco. E a mentira mais grave que esta app podia contar.
         let mut queixas = Vec::new();
-        for dados in sitios_dos_dados(destino, teste) {
+        let procurados = sitios_dos_dados(destino, teste);
+        for dados in &procurados {
             if !dados.exists() {
                 continue;
             }
-            if let Err(e) = std::fs::remove_dir_all(&dados) {
+            if let Err(e) = std::fs::remove_dir_all(dados) {
                 queixas.push(format!("{}: {e}", dados.display()));
             } else if dados.exists() {
                 queixas.push(format!("{}: ficou la depois de apagar", dados.display()));
+            } else {
+                resultado.dados_apagados += 1;
             }
+        }
+
+        // E O CASO QUE FALTAVA: NAO HAVIA NADA PARA APAGAR (#183).
+        //
+        // A metade dificil ja estava feita -- uma remocao que FALHA deixou de ser silencio.
+        // Mas quando nao se encontrava nada, as queixas ficavam vazias, a funcao devolvia Ok,
+        // e a interface dizia na mesma «a identidade foi apagada, como pediste». Zero pastas
+        // encontradas e zero pastas apagadas produziam a mesma frase.
+        //
+        // Nao e erro: nao ha nada de errado em desinstalar uma app cujos dados estao noutro
+        // sitio. E um FACTO, e a pessoa esta a decidir uma coisa irreversivel -- tem de saber
+        // que ela nao aconteceu, e onde e que se procurou.
+        if resultado.dados_apagados == 0 && queixas.is_empty() {
+            let onde: Vec<String> = procurados.iter().map(|p| p.display().to_string()).collect();
+            resultado.avisos.push(format!(
+                "nao encontrei identidade nenhuma nos sitios onde ela costuma estar ({}); \
+                 se puseste os dados noutro lado, ainda la estao",
+                onde.join(", ")
+            ));
         }
         // A queixa fica para o FIM: a mensagem promete que o resto foi desinstalado, e
         // isso so e verdade depois de o resto ter sido mesmo desinstalado.
@@ -548,7 +678,10 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<()> {
             queixas.join("; ")
         );
     }
-    Ok(())
+    for a in &resultado.avisos {
+        anotar(a);
+    }
+    Ok(resultado)
 }
 
 /// Abre o Bruma tal como estamos: usado pelo processo NÃO elevado depois da instalação.
@@ -624,7 +757,7 @@ fn correr_instalacao(
     estado: tauri::State<Estado>,
     dir: String,
     atalho: bool,
-) -> Result<(), String> {
+) -> Result<Resultado, String> {
     instalar(
         &PathBuf::from(dir),
         atalho,
@@ -640,7 +773,7 @@ fn correr_desinstalacao(
     estado: tauri::State<Estado>,
     dir: String,
     apagar_dados: bool,
-) -> Result<(), String> {
+) -> Result<Resultado, String> {
     desinstalar(&PathBuf::from(dir), apagar_dados, estado.opcoes.teste)
         .map_err(|e| format!("{e:#}"))
 }
@@ -674,11 +807,21 @@ fn sair(app: tauri::AppHandle) {
 /* ========================================================================== arranque */
 
 fn main() {
+    agarrar_a_consola_do_pai();
     let o = opcoes();
 
     // Sem interface: instala ou desinstala e sai. É também o caminho da verificação
     // automática (--teste --dir=…) e o que um canal NSIS antigo invoca com /S.
     if o.silencioso {
+        // O QUE NOS PEDIRAM, ANTES DE FAZER SEJA O QUE FOR (#59).
+        //
+        // O caminho silencioso é o do auto-update: ninguém está a olhar. Sem esta linha não há
+        // como distinguir «o updater nunca me chamou» de «chamou e eu recusei» — as duas
+        // acabam com a app na versão antiga e o registo calado.
+        anotar(&format!(
+            "arranquei em silencio com: {}",
+            std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        ));
         let destino = o.dir.clone().unwrap_or_else(|| destino_por_omissao(o.modo));
         if !o.teste && !sou_administrador() {
             // O pai (não elevado) espera pelo filho elevado e é ELE que relança a app —
@@ -690,18 +833,46 @@ fn main() {
                     }
                     return;
                 }
-                Ok(codigo) => std::process::exit(codigo),
-                Err(_) => std::process::exit(1),
+                // O DESAPARECIMENTO PASSA A DEIXAR DITO ATE ONDE CHEGOU (#59).
+                //
+                // Estes dois `exit` saíam sem uma linha. O comentário do `anotar` promete
+                // exactamente o contrário — «não se consegue evitar o desaparecimento, mas
+                // consegue-se deixar dito até onde é que ele chegou» — e o caminho onde isso
+                // mais importa era o único que não o cumpria.
+                //
+                // O UAC recusado é o caso comum: a pessoa carrega em «Não», a janela some, a
+                // app reabre na versão antiga, e não há nada em lado nenhum a explicar porquê.
+                Ok(codigo) => {
+                    anotar(&format!(
+                        "o instalador elevado saiu com o codigo {codigo} -- a actualizacao NAO \
+                         foi instalada, a app continua na versao anterior"
+                    ));
+                    std::process::exit(codigo)
+                }
+                Err(e) => {
+                    anotar(&format!(
+                        "a elevacao foi recusada ou falhou ({e:#}) -- a actualizacao NAO foi \
+                         instalada, a app continua na versao anterior"
+                    ));
+                    std::process::exit(1)
+                }
             }
         }
         let r = match o.modo {
             Modo::Instalar => instalar(&destino, true, o.atualizacao, o.teste, None),
             Modo::Desinstalar => desinstalar(&destino, o.apagar_dados, o.teste),
         };
-        if let Err(e) = r {
-            eprintln!("[instalador] falhou: {e:#}");
-            anotar(&format!("FALHOU: {e:#}"));
-            std::process::exit(1);
+        match r {
+            Err(e) => {
+                eprintln!("[instalador] falhou: {e:#}");
+                anotar(&format!("FALHOU: {e:#}"));
+                std::process::exit(1);
+            }
+            Ok(resultado) => {
+                for a in &resultado.avisos {
+                    eprintln!("[instalador] aviso: {a}");
+                }
+            }
         }
         // Já elevados e sem pai à espera (--teste, ou alguém correu-nos já como admin):
         // relança-se daqui na mesma, que é melhor do que não relançar de todo.
@@ -715,7 +886,11 @@ fn main() {
 
     // Com interface: eleva primeiro, para os botões poderem cumprir o que prometem.
     if !o.teste && !sou_administrador() {
-        let _ = relancar_como_administrador(false);
+        if let Err(e) = relancar_como_administrador(false) {
+            anotar(&format!(
+                "a elevacao para a janela falhou ou foi recusada ({e:#})"
+            ));
+        }
         return; // elevado ou recusado, este processo já não tem papel
     }
 
@@ -731,4 +906,131 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("o instalador não conseguiu abrir a janela");
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    fn de(exe: &str, args: &[&str]) -> Opcoes {
+        opcoes_de(exe, args.iter().map(|a| a.to_string()))
+    }
+
+    /// O DIALECTO DO UPDATER, QUE É POR ONDE PASSAM TODAS AS ACTUALIZAÇÕES.
+    ///
+    /// O portão da release corre `--silencioso --teste --dir=…`. Mas o `tauri.conf.json`
+    /// declara `installMode: passive`, e o updater corre o nosso exe com `/P /R /UPDATE /ARGS`.
+    /// Esses quatro estavam implementados e não eram exercitados por nada — nem por um teste,
+    /// nem pelo portão. O caminho mais usado do programa era o menos verificado.
+    #[test]
+    fn o_dialecto_do_updater_le_se_todo() {
+        let o = de(
+            "Instalar-Bruma.exe",
+            &["/P", "/R", "/UPDATE", "/ARGS", "a", "b"],
+        );
+        assert!(o.silencioso, "/P é passivo: instala sem interface");
+        assert!(o.relancar, "/R relança a app no fim");
+        assert!(
+            o.atualizacao,
+            "/UPDATE é o que não recria o atalho da área de trabalho"
+        );
+        assert_eq!(o.args_da_app, vec!["a".to_string(), "b".to_string()]);
+        assert!(matches!(o.modo, Modo::Instalar));
+    }
+
+    /// TUDO o que vem depois do `/ARGS` é da app — mesmo o que parece nosso.
+    ///
+    /// Se o `/ARGS` não parasse a leitura, um argumento da app com o mesmo nome de um nosso
+    /// mudava o comportamento do instalador. `--apagar-dados` depois do `/ARGS` é o caso
+    /// extremo, e é o que torna a regra visível.
+    #[test]
+    fn depois_do_args_nada_e_nosso() {
+        let o = de(
+            "Instalar-Bruma.exe",
+            &["/ARGS", "--apagar-dados", "/UPDATE"],
+        );
+        assert!(!o.apagar_dados, "isso era para a app, não para nós");
+        assert!(!o.atualizacao, "e isto também");
+        assert_eq!(
+            o.args_da_app,
+            vec!["--apagar-dados".to_string(), "/UPDATE".to_string()]
+        );
+    }
+
+    /// O NOME DO FICHEIRO É QUE DECIDE O PAPEL. Um binário, dois papéis.
+    #[test]
+    fn o_nome_do_exe_escolhe_o_papel() {
+        assert!(matches!(de("uninstall.exe", &[]).modo, Modo::Desinstalar));
+        // O Windows não distingue maiúsculas em nomes de ficheiro, e nós também não podemos.
+        assert!(matches!(de("Uninstall.EXE", &[]).modo, Modo::Desinstalar));
+        assert!(matches!(de("Instalar-Bruma.exe", &[]).modo, Modo::Instalar));
+        // E o `--uninstall` chega para o mesmo, venha o exe com o nome que vier.
+        assert!(matches!(
+            de("Instalar-Bruma.exe", &["--uninstall"]).modo,
+            Modo::Desinstalar
+        ));
+    }
+
+    /// APAGAR A IDENTIDADE SÓ COM ESSE NOME EXACTO, e nunca por acidente.
+    ///
+    /// É a única opção irreversível que este programa tem. Um prefixo, um plural ou um erro de
+    /// escrita não podem ligá-la — e o silêncio de um `_ =>` que aceita quase-acertos é
+    /// exactamente como isso aconteceria.
+    #[test]
+    fn a_identidade_so_se_apaga_com_o_nome_exacto() {
+        assert!(de("uninstall.exe", &["--apagar-dados"]).apagar_dados);
+        for quase in [
+            "--apagar-dado",
+            "--apagar_dados",
+            "--apagar",
+            "-apagar-dados",
+        ] {
+            assert!(
+                !de("uninstall.exe", &[quase]).apagar_dados,
+                "«{quase}» não pode apagar a identidade de ninguém"
+            );
+        }
+    }
+
+    /// As duas formas de dizer a pasta, incluindo a que fala NSIS.
+    #[test]
+    fn as_duas_formas_de_dizer_a_pasta() {
+        assert_eq!(
+            de("Instalar-Bruma.exe", &["--dir=C:\\Bruma"]).dir,
+            Some(PathBuf::from("C:\\Bruma"))
+        );
+        // Instalações antigas invocam o desinstalador assim.
+        assert_eq!(
+            de("uninstall.exe", &["_?=C:\\Bruma"]).dir,
+            Some(PathBuf::from("C:\\Bruma"))
+        );
+        assert_eq!(de("Instalar-Bruma.exe", &[]).dir, None);
+    }
+
+    /// A pasta de dados que a pessoa escolheu à mão CONTA para o apagar (#183).
+    ///
+    /// Quem define o `BRUMA_DADOS` é precisamente quem mudou a pasta de sítio. Dizer-lhe que a
+    /// identidade foi apagada sem sequer olhar para lá seria a mesma mentira do #183, com um
+    /// passo a mais.
+    #[test]
+    fn o_bruma_dados_entra_nos_sitios_a_procurar() {
+        let destino = PathBuf::from("C:\\Bruma");
+        // Sem a variável: em teste, só a pasta ao lado do executável.
+        let sem = sitios_dos_dados(&destino, true);
+        assert_eq!(sem, vec![destino.join("dados")]);
+
+        // O teste corre em paralelo com outros e a variável é global ao processo, mas
+        // nenhum outro teste deste ficheiro lhe toca — e repõe-se a seguir.
+        let antes = std::env::var_os("BRUMA_DADOS");
+        std::env::set_var("BRUMA_DADOS", "C:\\outro-sitio");
+        let com = sitios_dos_dados(&destino, true);
+        match antes {
+            Some(v) => std::env::set_var("BRUMA_DADOS", v),
+            None => std::env::remove_var("BRUMA_DADOS"),
+        }
+        assert!(
+            com.contains(&PathBuf::from("C:\\outro-sitio")),
+            "a pasta escolhida à mão tem de ser procurada: {com:?}"
+        );
+    }
 }

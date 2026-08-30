@@ -137,6 +137,9 @@
     <canvas class="marca" id="marca-3" width="152" height="152"></canvas>
     <h1>Instalado.</h1>
     <p class="tag">A tua identidade nasce no primeiro arranque — neste computador, e em mais lado nenhum.</p>
+    <!-- Um atalho que não se criou não desfaz a instalação, mas tem de se ver: instalámos, e
+         a pessoa precisa de saber por onde abrir. Vazio e escondido quando corre tudo bem. -->
+    <p class="tag" id="avisos-fim" hidden></p>
     <button class="btn btn--primaria" id="btn-abrir">Abrir o Bruma</button>
     <button class="btn" id="btn-fechar">Fechar</button>
   </section>
@@ -164,6 +167,8 @@
     <canvas class="marca" id="marca-5" width="152" height="152"></canvas>
     <h1>Desinstalado.</h1>
     <p class="tag" id="texto-adeus">Os teus dados ficaram — se voltares, a tua identidade está à espera.</p>
+    <!-- «Não encontrei identidade nenhuma» vai para aqui, com a lista de onde se procurou. -->
+    <p class="tag" id="avisos-adeus" hidden></p>
     <button class="btn" id="btn-adeus">Fechar</button>
   </section>
 
@@ -253,7 +258,16 @@ $('#btn-instalar').onclick = async () => {
   $('#passos').textContent = '';
   mostrar('ecra-progresso');
   try {
-    await invoke('correr_instalacao', { dir, atalho: $('#in-atalho').checked });
+    const r = await invoke('correr_instalacao', { dir, atalho: $('#in-atalho').checked });
+    // Instalou, mas alguma conveniência falhou (hoje: o atalho). Não é erro — o ecrã de fim é
+    // o certo —, mas dizer-se-lhe onde é que ficou a faltar alguma coisa é o mínimo.
+    const av = $('#avisos-fim');
+    if (r && r.avisos && r.avisos.length) {
+      av.textContent = r.avisos.join(' · ');
+      av.hidden = false;
+    } else {
+      av.hidden = true;
+    }
     mostrar('ecra-fim');
   } catch (e) {
     mostrar('ecra-instalar');
@@ -293,8 +307,24 @@ $('#btn-desinstalar').onclick = async () => {
   $('#btn-desinstalar').disabled = true;
   const apagou = $('#in-apagar').checked;
   try {
-    await invoke('correr_desinstalacao', { dir: info.dir, apagarDados: apagou });
-    if (apagou) $('#texto-adeus').textContent = 'A identidade foi apagada, como pediste.';
+    const r = await invoke('correr_desinstalacao', { dir: info.dir, apagarDados: apagou });
+    // SÓ SE DIZ QUE FOI APAGADA SE FOI MESMO APAGADA.
+    //
+    // Isto dizia «A identidade foi apagada, como pediste» sempre que a caixa estivesse
+    // marcada — mesmo quando não se encontrou pasta nenhuma para apagar. Zero encontradas e
+    // zero apagadas davam a mesma frase, e a pessoa ficava convencida de que a identidade
+    // tinha desaparecido do mundo enquanto ela continuava no disco, noutro sítio.
+    const apagadas = (r && r.dados_apagados) || 0;
+    if (apagou && apagadas > 0) {
+      $('#texto-adeus').textContent = 'A identidade foi apagada, como pediste.';
+    }
+    const ava = $('#avisos-adeus');
+    if (r && r.avisos && r.avisos.length) {
+      ava.textContent = r.avisos.join(' · ');
+      ava.hidden = false;
+    } else {
+      ava.hidden = true;
+    }
     mostrar('ecra-adeus');
   } catch (e) {
     $('#btn-desinstalar').disabled = false;

@@ -29,4 +29,6 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_System_Registry",
   "Win32_Storage_FileSystem",
+  # Para o AttachConsole: sem consola preta ao duplo clique, mas com saida no CI (#180).
+  "Win32_System_Console",
 ] }

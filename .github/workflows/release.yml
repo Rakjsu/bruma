@@ -136,7 +136,7 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo clippy -p bruma -p instalador -p spike-common -p verificar-assinatura -p so-o-que-vai-na-release --all-targets -- -D warnings
-          cargo test -p bruma -p spike-common
+          cargo test -p bruma -p spike-common -p instalador
 
       - name: Compilar, assinar e publicar
         uses: tauri-apps/tauri-action@v0
