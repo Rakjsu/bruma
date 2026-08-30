@@ -284,9 +284,19 @@ $('#in-apagar').onchange = ev => { $('#aviso-dados').hidden = !ev.target.checked
 $('#btn-cancelar').onclick = () => invoke('sair');
 $('#btn-adeus').onclick = () => invoke('sair');
 
-/* Medição da própria interface: corre sempre, custa nada, e é o que permite verificar
-   o instalador sem alguém a olhar para ele. */
-setTimeout(() => {
+/* Medição da própria interface: é o que permite verificar o instalador sem alguém a
+   olhar para ele.
+
+   O comando `medir` só existe em debug — na release foi removido, para o nome nem sequer
+   estar no binário que as pessoas descarregam. Por isso a primeira chamada é uma SONDA: se
+   ela falhar, não há nada a medir e não se mede. Sem isto, a release ficava a atirar
+   rejeições que ninguém apanha. */
+setTimeout(async () => {
+  try {
+    await invoke('medir', { linha: `janela=${innerWidth}x${innerHeight}` });
+  } catch {
+    return;
+  }
   const medir = sel => {
     const el = document.querySelector(sel);
     if (!el) return `${sel}: NAO EXISTE`;
@@ -295,7 +305,6 @@ setTimeout(() => {
     return `${sel}: ${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
       + ` vis=${e.visibility} disp=${e.display} op=${e.opacity}`;
   };
-  invoke('medir', { linha: `janela=${innerWidth}x${innerHeight}` });
   for (const s of ['.barra-instalador', '.barra-instalador__nome', '.janela__botoes',
                    '.janela__bt', '.janela__bt--fechar']) {
     invoke('medir', { linha: medir(s) });

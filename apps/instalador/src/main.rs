@@ -794,6 +794,19 @@ fn abrir_e_sair(app: tauri::AppHandle, dir: String) {
 ///
 /// Fotografar a janela não chega: o `PrintWindow` devolve a WebView2 incompleta e
 /// trazê-la à frente a partir de outro processo é bloqueado pelo Windows.
+///
+/// # E não vai na release
+///
+/// A app já tinha esta distinção: os comandos que só servem para medir ficam atrás de
+/// `#[cfg(debug_assertions)]` — o ATRIBUTO, que remove o código, e não o `cfg!()`, que deixa
+/// o nome no binário. O instalador não a tinha, e é ele o ficheiro que toda a gente
+/// descarrega e que o auto-update corre.
+///
+/// Sozinho, o `medir` é inócuo: imprime uma linha. O que não é inócuo é a lista de comandos
+/// crescer sem ninguém olhar — foi assim que dois comandos de medição chegaram a ir na release
+/// da app. Por isso isto sai, e um portão passa a afirmá-lo (ver a ferramenta
+/// `so-o-que-vai-na-release`, perfil do instalador).
+#[cfg(debug_assertions)]
 #[tauri::command]
 fn medir(linha: String) {
     println!("[ui] {linha}");
@@ -805,6 +818,33 @@ fn sair(app: tauri::AppHandle) {
 }
 
 /* ========================================================================== arranque */
+
+/// A lista de comandos da release, e a de debug — que leva o `medir` a mais.
+///
+/// Duas funções e não um `if`: o que se quer é que o nome do comando NÃO EXISTA no binário
+/// que vai para as pessoas, e isso só se consegue removendo o código.
+#[cfg(not(debug_assertions))]
+fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        info,
+        correr_instalacao,
+        correr_desinstalacao,
+        abrir_e_sair,
+        sair
+    ]
+}
+
+#[cfg(debug_assertions)]
+fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        info,
+        correr_instalacao,
+        correr_desinstalacao,
+        medir,
+        abrir_e_sair,
+        sair
+    ]
+}
 
 fn main() {
     agarrar_a_consola_do_pai();
@@ -896,14 +936,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(Estado { opcoes: o })
-        .invoke_handler(tauri::generate_handler![
-            info,
-            correr_instalacao,
-            correr_desinstalacao,
-            medir,
-            abrir_e_sair,
-            sair
-        ])
+        .invoke_handler(handler_de_comandos())
         .run(tauri::generate_context!())
         .expect("o instalador não conseguiu abrir a janela");
 }

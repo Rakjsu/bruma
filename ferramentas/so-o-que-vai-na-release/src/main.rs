@@ -76,9 +76,55 @@ const DIAGNOSTICO_LEGITIMO: &[&str] = &["BRUMA_DADOS", "BRUMA_REGISTO"];
 /// que não queria» não distingue «está limpo» de «não olhei para nada».
 const TEM_DE_ESTAR: &[&str] = &["marcar_lido", "entrar_com_convite", "bruma"];
 
+/* ===================================================================== o INSTALADOR
+
+O `Instalar-Bruma.exe` é o ficheiro que toda a gente descarrega e o que o auto-update
+corre — e nunca era inspeccionado por nada. O portão só olhava para o `bruma.exe`.
+
+A app embutida vai comprimida lá dentro, portanto os nomes dela não aparecem aqui: o
+que se procura são os andaimes DO INSTALADOR. Corre-se antes de o payload ser
+embrulhado, pela mesma razão de sempre — depois de comprimido, uma busca de texto
+deixaria de ver seja o que for e passaria sempre, sem provar nada.
+*/
+
+/// Andaimes que não podem ir no instalador publicado.
+const ANDAIMES_DO_INSTALADOR: &[&str] = &[
+    // O comando que faz a interface descrever-se a si própria. Sozinho é inócuo — imprime
+    // uma linha —, mas a lista de comandos crescer sem ninguém olhar não é: foi assim que
+    // dois comandos de medição chegaram a ir na release da app.
+    "medir",
+];
+
+/// E o que TEM de lá estar, para não se dizer «limpo» sobre um ficheiro truncado.
+const INSTALADOR_TEM_DE_ESTAR: &[&str] = &["uninstall.exe", "bruma.exe"];
+
+/// O `--teste` FICA, e a razão tem de estar escrita.
+///
+/// É tentador metê-lo na lista de andaimes: é uma bandeira que existe para testar. Mas é ele
+/// que torna este instalador verificável — o portão da release corre
+/// `Instalar-Bruma.exe --silencioso --teste --dir=<pasta>` e prova a instalação e a
+/// desinstalação inteiras sem UAC, sem registo e sem atalhos. Sem ele, o portão teria de
+/// instalar no Program Files a sério, ou não existir.
+///
+/// E não é uma porta: em modo de teste o `sitios_dos_dados` protege o `%APPDATA%` de
+/// propósito, portanto o caminho mais destrutivo que existe é o que ele NÃO alcança.
+const INSTALADOR_LEGITIMO: &[&str] = &["--teste", "BRUMA_DADOS"];
+
 fn main() -> Result<()> {
-    let Some(caminho) = std::env::args().nth(1) else {
-        bail!("uso: so-o-que-vai-na-release <bruma.exe>");
+    let mut args = std::env::args().skip(1);
+    let Some(caminho) = args.next() else {
+        bail!("uso: so-o-que-vai-na-release <exe> [--instalador]");
+    };
+    let e_instalador = args.any(|a| a == "--instalador");
+    let (andaimes, tem_de_estar, legitimo, quem) = if e_instalador {
+        (
+            ANDAIMES_DO_INSTALADOR,
+            INSTALADOR_TEM_DE_ESTAR,
+            INSTALADOR_LEGITIMO,
+            "instalador",
+        )
+    } else {
+        (ANDAIMES, TEM_DE_ESTAR, DIAGNOSTICO_LEGITIMO, "app")
     };
     let bytes = std::fs::read(&caminho)?;
     if bytes.len() < 1_000_000 {
@@ -90,7 +136,7 @@ fn main() -> Result<()> {
 
     let contem = |agulha: &str| bytes.windows(agulha.len()).any(|j| j == agulha.as_bytes());
 
-    let em_falta: Vec<&str> = TEM_DE_ESTAR
+    let em_falta: Vec<&str> = tem_de_estar
         .iter()
         .copied()
         .filter(|a| !contem(a))
@@ -103,7 +149,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let achados: Vec<&str> = ANDAIMES.iter().copied().filter(|a| contem(a)).collect();
+    let achados: Vec<&str> = andaimes.iter().copied().filter(|a| contem(a)).collect();
     if !achados.is_empty() {
         bail!(
             "o {caminho} leva andaimes de medição lá dentro: {achados:?}\n\
@@ -114,16 +160,12 @@ fn main() -> Result<()> {
         );
     }
 
-    let diagnostico: Vec<&str> = DIAGNOSTICO_LEGITIMO
-        .iter()
-        .copied()
-        .filter(|a| contem(a))
-        .collect();
+    let diagnostico: Vec<&str> = legitimo.iter().copied().filter(|a| contem(a)).collect();
     println!(
-        "release limpa: {} bytes | {} andaimes procurados, nenhum encontrado | {} marcos presentes | diagnóstico que fica: {:?}",
+        "release limpa ({quem}): {} bytes | {} andaimes procurados, nenhum encontrado | {} marcos presentes | o que fica de propósito: {:?}",
         bytes.len(),
-        ANDAIMES.len(),
-        TEM_DE_ESTAR.len(),
+        andaimes.len(),
+        tem_de_estar.len(),
         diagnostico
     );
     Ok(())

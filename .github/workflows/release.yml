@@ -35,16 +35,38 @@ jobs:
       # tauri.conf.json. Se divergirem, o updater anuncia uma versao, instala, a app arranca
       # a dizer outra, e o updater volta a ver a nova disponivel: CICLO DE ATUALIZACAO
       # INFINITO em todas as maquinas instaladas -- e nada, ate agora, o apanhava.
-      - name: A etiqueta bate certo com a versao?
+      # E O TERCEIRO SITIO ONDE A VERSAO VIVE, QUE NINGUEM CONFERIA (#174).
+      #
+      # Isto comparava a etiqueta com o tauri.conf.json e mais nada. Mas quem decide se ha
+      # actualizacao e o tauri-plugin-updater, e ele compara o latest.json (escrito a partir
+      # da etiqueta) com o PackageInfo da app -- que vem de env!("CARGO_PKG_VERSION"), ou
+      # seja, do apps/desktop/Cargo.toml. Os tres numeros sao escritos a mao em tres sitios.
+      #
+      # Se o Cargo.toml divergir, o portao antigo passava e o estrago era o mesmo que ele
+      # existe para impedir: o updater anuncia uma versao, instala, a app arranca a dizer
+      # outra, e ele volta a ver a nova disponivel. Ciclo de actualizacao infinito.
+      - name: As tres versoes batem certo com a etiqueta?
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'.TrimStart('v')
-          $app = (Get-Content apps/desktop/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ($tag -ne $app) {
-            Write-Error "a etiqueta diz $tag e o tauri.conf.json diz $app; corrige um dos dois antes de publicar"
+          $conf = (Get-Content apps/desktop/tauri.conf.json -Raw | ConvertFrom-Json).version
+
+          # Ancorado ao inicio da linha e exigindo EXACTAMENTE uma: o Cargo.toml tem outras
+          # linhas com `version` (as das dependencias), e apanhar a errada era pior do que
+          # nao conferir nada.
+          $linhas = @(Get-Content apps/desktop/Cargo.toml | Where-Object { $_ -match '^version = "' })
+          if ($linhas.Count -ne 1) {
+            Write-Error "encontrei $($linhas.Count) linhas 'version = ' no apps/desktop/Cargo.toml e esperava exactamente uma"
             exit 1
           }
-          "etiqueta e versao batem certo: $app"
+          $cargo = ($linhas[0] -replace '^version = "', '') -replace '"$', ''
+
+          if ($tag -ne $conf -or $tag -ne $cargo) {
+            Write-Error "a etiqueta diz $tag, o tauri.conf.json diz $conf e o Cargo.toml diz $cargo; os tres tem de ser iguais antes de publicar"
+            exit 1
+          }
+          "etiqueta, tauri.conf.json e Cargo.toml dizem todos: $tag"
 
       # OS TESTES CORREM ANTES DE PUBLICAR.
       #
@@ -195,6 +217,31 @@ jobs:
           set -euo pipefail
           cargo run -q -p so-o-que-vai-na-release -- target/release/bruma.exe
 
+      # O PORTAO DOS ANDAIMES PROVA QUE AINDA SABE REPROVAR (#58).
+      #
+      # Ate aqui as duas ferramentas de portao so eram exercitadas no caso em que PASSAM. E
+      # um portao que so foi visto a dizer que sim nao se distingue de um portao avariado --
+      # o verificar-assinatura ja foi reescrito uma vez precisamente por isso: a primeira
+      # versao passava em todos os testes e estava errada.
+      #
+      # Sabota-se uma COPIA e exige-se vermelho. Concatenar os bytes no fim chega, porque o
+      # que a ferramenta faz e uma busca de texto: se ela disser que uma copia com
+      # "BRUMA_ESTRANHO" la dentro esta limpa, deixou de procurar seja o que for.
+      - name: O portao dos andaimes ainda sabe reprovar?
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp target/release/bruma.exe sabotado.exe
+          printf 'BRUMA_ESTRANHO' >> sabotado.exe
+          if cargo run -q -p so-o-que-vai-na-release -- sabotado.exe; then
+            echo "O PORTAO DISSE QUE ESTA LIMPO UM BINARIO COM 'BRUMA_ESTRANHO' LA DENTRO."
+            echo "Ele deixou de procurar: nao publiques nada ate perceber porque."
+            rm -f sabotado.exe
+            exit 1
+          fi
+          echo "o portao reprovou a copia sabotada, como devia"
+          rm -f sabotado.exe
+
       - name: Instalador proprio (download e auto-update)
         shell: pwsh
         env:
@@ -253,8 +300,32 @@ jobs:
           if (-not (Test-Path (Join-Path $prova 'tese.docx'))) { Write-Error 'o desinstalador APAGOU um ficheiro do utilizador'; exit 1 }
           if (-not (Test-Path (Join-Path $prova 'fotos/praia.jpg'))) { Write-Error 'o desinstalador apagou uma subpasta do utilizador'; exit 1 }
           Write-Host 'desinstalou o que era dele e deixou o resto'
+
+          # O PORTAO PASSA A OLHAR PARA O QUE A PESSOA TEM MESMO (#177).
+          #
+          # O passo dos andaimes le `target/release/bruma.exe` -- um caminho ASSUMIDO. O
+          # rust-cache restaura o `target/`, e se por qualquer razao o tauri-action escrever
+          # noutro sitio ou falhar sem parar a corrida, aquele passo inspecciona um binario
+          # de outra corrida e diz "release limpa" sobre uma coisa que nao vai na release.
+          #
+          # Este ficheiro nao e assumido: saiu do payload embutido, foi descomprimido pelo
+          # instalador, e e byte a byte aquilo que fica na pasta de quem instalar. Corre-se
+          # ANTES da limpeza da pasta de prova, que e enquanto ele ainda existe.
+          cargo run -q -p so-o-que-vai-na-release -- $app
+          if ($LASTEXITCODE -ne 0) { Write-Error 'o bruma.exe REALMENTE instalado leva andaimes'; exit 1 }
+
           Remove-Item -Recurse -Force $prova -ErrorAction SilentlyContinue
           # ----------------------------------------------------------------------------
+
+          # E O INSTALADOR TAMBEM PASSA PELO PORTAO (#57).
+          #
+          # Ate aqui so o bruma.exe era inspeccionado. O Instalar-Bruma.exe -- o ficheiro que
+          # toda a gente descarrega, e o que o auto-update corre -- nunca era visto por nada,
+          # apesar de ter la dentro a mesma classe de coisa que a ferramenta existe para
+          # apanhar. Corre-se AQUI, com o exe ja construido e antes de ser assinado: assinar
+          # um binario que nao passou no portao seria dar-lhe a unica credencial que importa.
+          cargo run -q -p so-o-que-vai-na-release -- Instalar-Bruma.exe --instalador
+          if ($LASTEXITCODE -ne 0) { Write-Error 'o instalador leva andaimes de medicao'; exit 1 }
 
           # A assinatura le a chave das MESMAS variaveis de ambiente que o tauri-action.
           npx --yes "@tauri-apps/cli@^2" signer sign Instalar-Bruma.exe
@@ -315,6 +386,59 @@ jobs:
             prova-assinatura/Instalar-Bruma.exe \
             prova-assinatura/latest.json \
             apps/desktop/tauri.conf.json
+
+      # E O PORTAO DA ASSINATURA TAMBEM PROVA QUE REPROVA (#58).
+      #
+      # O passo acima acabou de dizer que a assinatura confere. Isso e metade: falta saber se
+      # ele conferia SEJA O QUE FOSSE. Troca-se um byte a MEIO do ficheiro -- e nao no
+      # cabecalho PE, que um verificador podia estar a saltar por outra razao -- e exige-se
+      # que ele recuse.
+      #
+      # Se este passo ficar verde, o `verificar-assinatura` nao esta a verificar nada, e a
+      # unica coisa que separa uma actualizacao nossa de uma actualizacao de outra pessoa
+      # deixou de existir. Vale a pena bloquear a publicacao por isso.
+      - name: O portao da assinatura ainda sabe reprovar?
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp prova-assinatura/Instalar-Bruma.exe sabotado.exe
+          # So com `dd` e `od`, que o Git Bash traz: depender do python aqui era acrescentar
+          # uma forma de este passo falhar por uma razao que nada tem a ver com assinaturas.
+          #
+          # E o byte novo calcula-se a partir do antigo (+1) em vez de ser um valor fixo:
+          # escrever 0xFF por cima de um byte que ja fosse 0xFF nao mudava nada, o ficheiro
+          # continuava valido, e o passo acusava o verificador de estar avariado quando o
+          # avariado era o teste.
+          tam=$(stat -c%s sabotado.exe)
+          meio=$(( tam / 2 ))
+          antigo=$(dd if=sabotado.exe bs=1 skip=$meio count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+          novo=$(( (antigo + 1) % 256 ))
+          printf "\x$(printf %02x $novo)" | dd of=sabotado.exe bs=1 seek=$meio count=1 conv=notrunc 2>/dev/null
+
+          # E CONFIRMA-SE QUE A SABOTAGEM PEGOU, antes de tirar conclusoes dela.
+          #
+          # Da primeira vez que corri isto a mao, o `printf` falhou por um escape mal posto,
+          # o `dd` escreveu zero bytes, e o teste disse "recusou" na mesma -- por o ficheiro
+          # nem sequer existir. Uma sabotagem que nao pegou faz um portao avariado parecer
+          # bom, que e exactamente a falha que este passo existe para apanhar.
+          lido=$(dd if=sabotado.exe bs=1 skip=$meio count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+          if [ "$lido" != "$novo" ] || [ "$(stat -c%s sabotado.exe)" != "$tam" ]; then
+            echo "A SABOTAGEM NAO PEGOU (queria $novo, esta $lido) -- este passo nao mede nada."
+            rm -f sabotado.exe
+            exit 1
+          fi
+          echo "byte no offset $meio de $tam: $antigo -> $novo (confirmado)"
+          if cargo run -q -p verificar-assinatura -- \
+               sabotado.exe \
+               prova-assinatura/latest.json \
+               apps/desktop/tauri.conf.json; then
+            echo "A ASSINATURA CONFERIU PARA UM FICHEIRO COM UM BYTE TROCADO."
+            echo "O verificador nao esta a verificar nada. Nao publiques."
+            rm -f sabotado.exe
+            exit 1
+          fi
+          echo "o portao da assinatura recusou a copia sabotada, como devia"
+          rm -f sabotado.exe
 
       # O ULTIMO passo, e so agora: a partir daqui o updater de toda a gente ve isto.
       - name: Publicar a release
