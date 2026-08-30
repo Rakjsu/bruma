@@ -1,23 +1,20 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Instalar o Bruma",
-  "version": "0.1.0",
-  "identifier": "dev.bruma.instalador",
   "app": {
-    "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Bruma",
-        "width": 560,
-        "height": 480,
-        "resizable": false,
-        "maximizable": false,
         "center": true,
-        "label": "main",
         "decorations": false,
-        "shadow": true
+        "height": 480,
+        "label": "main",
+        "maximizable": false,
+        "resizable": false,
+        "shadow": true,
+        "title": "Bruma",
+        "width": 560
       }
-    ]
+    ],
+    "withGlobalTauri": true
   },
   "build": {
     "frontendDist": "ui"
@@ -27,5 +24,8 @@
     "icon": [
       "../desktop/icons/icon.ico"
     ]
-  }
+  },
+  "identifier": "dev.bruma.instalador",
+  "productName": "Instalar o Bruma",
+  "version": "0.18.3"
 }

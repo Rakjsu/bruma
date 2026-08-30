@@ -1263,6 +1263,14 @@ const PAINEIS = {
         s1.append(elemento('p', 'nota',
           'Quando alguma coisa corre mal, o rasto fica aqui — e é a primeira coisa a olhar:'));
         s1.append(elemento('div', 'def__valor', sobre.registo));
+        // O rasto do INSTALADOR pode estar noutra pasta (#178): a app escolhe onde regista
+        // conforme onde vivem os dados, e o instalador escreve sempre ao lado do exe. Dizer
+        // «olha para o registo» a apontar só para um deles escondia metade da história —
+        // justamente a metade das actualizações.
+        if (sobre.registo_do_instalador) {
+          s1.append(elemento('p', 'nota', 'E o que o instalador fez a esta instalação:'));
+          s1.append(elemento('div', 'def__valor', sobre.registo_do_instalador));
+        }
       }
       const a1 = elemento('div', 'caixa__acoes');
       a1.style.justifyContent = 'flex-start';
@@ -2385,14 +2393,34 @@ document.addEventListener('visibilitychange', () => {
  *  versão nova» e «não consegui saber» são coisas diferentes para quem carregou no botão.
  *  Enquanto isto devolvia `false` nos dois casos, as Definições diziam "já estás na versão
  *  mais recente" a alguém que estava sem rede. */
-async function procurarAtualizacao() {
+/* A versão que a pessoa adiou NESTA sessão. As procuras automáticas respeitam-na — quem
+   disse «agora não» não quer a mesma faixa de quatro em quatro horas —, mas o botão das
+   Definições ignora-a: quem pergunta quer resposta. Uma versão MAIS nova volta a aparecer,
+   porque já não é a que se adiou. */
+let versaoAdiada = null;
+
+async function procurarAtualizacao(automatica = false) {
   try {
     const { check } = window.__TAURI__.updater;
     const nova = await check();
     if (!nova) return 'nao';
-    $('#texto-update').textContent = `Há uma versão nova do Bruma (${nova.version}).`;
+    if (automatica && nova.version === versaoAdiada) return 'ha';
+    // A primeira linha das notas é o assunto da versão — «uma sala grande volta a poder
+    // sincronizar» — e é o que permite decidir se vale a pena reiniciar já (#62). Antes
+    // dizia só o número, e ninguém decide nada com um número. O resto fica no tooltip.
+    // A primeira linha da anotação começa por «Bruma vX.Y.Z --», e a frase à volta já diz
+    // as duas coisas: apara-se, senão a faixa gaguejava o nome e o número.
+    const primeira = (nova.body || '').split('\n').map(l => l.trim()).find(l => l) || '';
+    const resumo = primeira.replace(/^Bruma\s+v?[\d.]+\s*(--|—|-)\s*/i, '');
+    $('#texto-update').textContent = resumo
+      ? `Há uma versão nova do Bruma (${nova.version}): ${resumo}`
+      : `Há uma versão nova do Bruma (${nova.version}).`;
+    $('#texto-update').title = nova.body || '';
     $('#faixa-update').hidden = false;
-    $('#adiar-update').onclick = () => { $('#faixa-update').hidden = true; };
+    $('#adiar-update').onclick = () => {
+      versaoAdiada = nova.version;
+      $('#faixa-update').hidden = true;
+    };
     $('#btn-update').onclick = async () => {
       $('#btn-update').disabled = true;
       $('#texto-update').textContent = 'A descarregar…';
@@ -4299,7 +4327,30 @@ function pararDeAssistir() {
     abrir('veu-bemvindo');
     $('#in-nome').focus();
   }
-  procurarAtualizacao();
+  (async () => {
+    // Se a última actualização morreu a meio, é a primeira coisa a dizer (#121). O
+    // instalador deixa um carimbo; a app lê-o uma vez e apaga-o. Sem isto, o UAC recusado
+    // acabava com a app a reabrir na versão antiga sem uma palavra.
+    const incompleta = await invoke('actualizacao_incompleta').catch(() => null);
+    const houve = await procurarAtualizacao(true);
+    if (incompleta) {
+      if (houve === 'ha') {
+        // A faixa já está montada pela procura: junta-se o contexto à frente.
+        $('#texto-update').textContent = `${incompleta} ${$('#texto-update').textContent}`;
+      } else {
+        // Sem rede, ou já não há nada para instalar: diz-se o facto na mesma, e o botão
+        // fica a repetir a procura — é o gesto certo quando a rede voltar.
+        $('#texto-update').textContent = incompleta;
+        $('#faixa-update').hidden = false;
+        $('#adiar-update').onclick = () => { $('#faixa-update').hidden = true; };
+        $('#btn-update').onclick = () => procurarAtualizacao();
+      }
+    }
+  })();
+  // E volta-se a procurar de tempos a tempos (#62): quem deixa a app aberta dias a fio
+  // nunca via o aviso, porque a procura só acontecia no arranque. Quatro horas — não é
+  // urgente, e o adiamento por versão garante que isto nunca vira insistência.
+  setInterval(() => procurarAtualizacao(true), 4 * 60 * 60 * 1000);
   verJogo();
   desenharRodape();
 })();

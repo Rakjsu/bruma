@@ -122,6 +122,7 @@ macro_rules! handler_com {
             comandos::autoteste_fonte,
             comandos::medir_som,
             comandos::sobre_esta_instalacao,
+            comandos::actualizacao_incompleta,
             comandos::abrir_pasta_de_dados,
             comandos::palavras_da_identidade,
             comandos::restaurar_identidade,

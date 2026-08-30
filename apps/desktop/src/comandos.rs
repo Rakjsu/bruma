@@ -1167,7 +1167,56 @@ pub fn sobre_esta_instalacao() -> serde_json::Value {
         "versao": env!("CARGO_PKG_VERSION"),
         "pasta": crate::estado::raiz().display().to_string(),
         "registo": crate::registo::caminho().display().to_string(),
+        // O rasto do INSTALADOR, quando existe (#178). Vive sempre ao lado do exe — é o
+        // instalador que o escreve —, enquanto o `registo` da app pode estar noutra pasta.
+        // As Definições diziam «o rasto fica aqui, é a primeira coisa a olhar» a apontar
+        // para um ficheiro onde o instalador nunca escreveu uma linha.
+        "registo_do_instalador": std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.join("instalador.log")))
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string()),
     })
+}
+
+/// A actualização que morreu a meio, se a última morreu a meio (#121).
+///
+/// O instalador escreve um carimbo em `%APPDATA%\Bruma\actualizacao.json` antes de mexer
+/// em seja o que for, e marca-o «pronto» no fim. Se a app arranca e o carimbo diz que uma
+/// versão DIFERENTE ficou por instalar, é porque a actualização falhou — UAC recusado,
+/// extracção morta — e até aqui ninguém dizia nada: a app reabria na versão antiga, calada.
+///
+/// Lê-se UMA vez e apaga-se: um aviso é um aviso, não um eco a cada arranque. E um carimbo
+/// com mais de uma semana ignora-se — um resto esquecido não deve assustar ninguém.
+#[tauri::command]
+pub fn actualizacao_incompleta() -> Option<String> {
+    let base = std::env::var_os("APPDATA")?;
+    let caminho = std::path::PathBuf::from(base)
+        .join("Bruma")
+        .join("actualizacao.json");
+    let texto = std::fs::read_to_string(&caminho).ok()?;
+    let _ = std::fs::remove_file(&caminho);
+    let j: serde_json::Value = serde_json::from_str(&texto).ok()?;
+    if j["estado"].as_str() == Some("pronto") {
+        return None;
+    }
+    let alvo = j["alvo"].as_str()?;
+    // Se JÁ SOMOS a versão do carimbo, a instalação aconteceu — só o «pronto» se perdeu.
+    if alvo == env!("CARGO_PKG_VERSION") {
+        return None;
+    }
+    let instante = j["instante"].as_u64().unwrap_or(0);
+    let agora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if agora.saturating_sub(instante) > 7 * 86_400 {
+        return None;
+    }
+    Some(format!(
+        "A última actualização (para a {alvo}) não chegou ao fim — continuas na {}.",
+        env!("CARGO_PKG_VERSION")
+    ))
 }
 
 /// Abre a pasta dos dados no Explorador.
@@ -1419,6 +1468,69 @@ pub fn medir_ui_pedido() -> bool {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// O carimbo da actualização é lido UMA vez, e só avisa quando deve (#121).
+    ///
+    /// Os quatro cenários num teste só, de propósito: o ficheiro é um caminho fixo no
+    /// `%APPDATA%` — partilhado com a app real e com os outros testes — e um teste por
+    /// cenário a correr em paralelo pisava-se a si próprio. Aqui cada cenário escreve,
+    /// pergunta, e a própria função apaga.
+    #[test]
+    fn o_carimbo_da_actualizacao_avisa_quando_deve() {
+        let caminho = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .join("Bruma")
+            .join("actualizacao.json");
+        std::fs::create_dir_all(caminho.parent().unwrap()).unwrap();
+        let agora = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let escreve = |j: serde_json::Value| std::fs::write(&caminho, j.to_string()).unwrap();
+
+        // Sem carimbo nenhum: nada a dizer. (E deixa o terreno limpo para os seguintes.)
+        let _ = std::fs::remove_file(&caminho);
+        assert_eq!(actualizacao_incompleta(), None, "sem carimbo não há aviso");
+
+        // «Pronto» é a actualização a acabar bem: silêncio, e o ficheiro desaparece.
+        escreve(serde_json::json!({"alvo": "9.9.9", "instante": agora, "estado": "pronto"}));
+        assert_eq!(actualizacao_incompleta(), None, "pronto não é aviso");
+        assert!(!caminho.exists(), "o carimbo tem de ser apagado ao ler");
+
+        // O alvo é a NOSSA versão: a instalação aconteceu, só o «pronto» se perdeu.
+        escreve(serde_json::json!({
+            "alvo": env!("CARGO_PKG_VERSION"), "instante": agora, "estado": "a-instalar"
+        }));
+        assert_eq!(
+            actualizacao_incompleta(),
+            None,
+            "já somos o alvo: não falhou nada"
+        );
+
+        // Um carimbo velho de mais ignora-se: um resto esquecido não assusta ninguém.
+        escreve(serde_json::json!({
+            "alvo": "9.9.9", "instante": agora - 8 * 86_400, "estado": "a-instalar"
+        }));
+        assert_eq!(
+            actualizacao_incompleta(),
+            None,
+            "mais de uma semana: ignora-se"
+        );
+
+        // E o caso real: outra versão, por acabar, recente — AVISA, com as duas versões.
+        escreve(serde_json::json!({"alvo": "9.9.9", "instante": agora, "estado": "a-instalar"}));
+        let aviso = actualizacao_incompleta().expect("tinha de avisar");
+        assert!(aviso.contains("9.9.9"), "o aviso diz o alvo: {aviso}");
+        assert!(
+            aviso.contains(env!("CARGO_PKG_VERSION")),
+            "e diz onde ficámos: {aviso}"
+        );
+        assert!(
+            !caminho.exists(),
+            "um aviso, não um eco: o carimbo apaga-se"
+        );
+        // Segunda leitura: o aviso não se repete.
+        assert_eq!(actualizacao_incompleta(), None, "o aviso é um só");
+    }
 
     /// O NOME TEM TECTO — e o tecto conta caracteres, não bytes.
     ///

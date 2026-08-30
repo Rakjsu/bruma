@@ -266,7 +266,33 @@ fn sou_administrador() -> bool {
 /// administrador. O pai fica à espera do filho elevado acabar de instalar, e é ele que
 /// abre o Bruma novo, já sem poderes nenhuns.
 #[cfg(windows)]
-fn relancar_como_administrador(esperar: bool) -> Result<i32> {
+/// Os argumentos que vão para o filho elevado: os nossos, com a pasta tornada EXPLÍCITA.
+///
+/// # A avaria que isto corrige
+///
+/// O updater corre-nos com `/P /R /UPDATE /ARGS …` — sem `--dir`. O pai não elevado eleva-se
+/// e espera; o filho herda os argumentos tal e qual, instala, e chega ao fim com `/R` posto,
+/// `sou_administrador()` verdadeiro e `o.dir.is_none()` — a heurística de «não há pai à
+/// espera» — também verdadeira, porque a heurística lia a AUSÊNCIA de `--dir` como ausência
+/// de pai. O filho relançava o Bruma pelo explorer; o pai acordava e relançava outra vez.
+/// **Duas janelas, a mesma pasta de dados, a escreverem por cima uma da outra** — o estado é
+/// protegido por Mutex dentro do processo, não entre processos.
+///
+/// A pasta vai agora explícita: o pai já a calculou, e com `--dir` presente o filho sabe que
+/// alguém decidiu por ele — a pessoa ou o pai — e não relança. À FRENTE, nunca no fim: tudo o
+/// que vem depois de `/ARGS` pertence à app, e um `--dir` colado ao fim mudava de dono.
+fn args_para_o_filho(destino: &Path, args: impl Iterator<Item = String>) -> Vec<String> {
+    let restantes: Vec<String> = args.collect();
+    let ja_tem = restantes.iter().any(|a| a.starts_with("--dir="));
+    let mut v = Vec::with_capacity(restantes.len() + 1);
+    if !ja_tem {
+        v.push(format!("--dir={}", destino.display()));
+    }
+    v.extend(restantes);
+    v
+}
+
+fn relancar_como_administrador(esperar: bool, destino: Option<&Path>) -> Result<i32> {
     use windows::core::{w, PCWSTR};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -274,7 +300,10 @@ fn relancar_como_administrador(esperar: bool) -> Result<i32> {
 
     let exe = std::env::current_exe()?;
     let exe_w: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match destino {
+        Some(d) => args_para_o_filho(d, std::env::args().skip(1)),
+        None => std::env::args().skip(1).collect(),
+    };
     // Argumentos com espaços voltam entre aspas, senão chegam partidos ao filho.
     let juntos = args
         .iter()
@@ -332,7 +361,42 @@ fn avisar(janela: Option<&tauri::WebviewWindow>, passo: &str) {
 ///
 /// A falha típica era "cliquei em Atualizar e o Bruma desapareceu". Não se consegue evitar
 /// o desaparecimento — mas consegue-se deixar dito até onde é que ele chegou.
+/// A pasta da instalação em curso, para o registo poder ir para os DOIS sítios (#178).
+///
+/// O `anotar` escrevia sempre no `%APPDATA%\Bruma\bruma.log`. Mas a app pode estar a
+/// registar noutro sítio — o `raiz()` dela prefere a pasta `dados` ao lado do exe quando lá
+/// vive uma identidade — e as Definições apontam para ESSE ficheiro como «a primeira coisa a
+/// olhar». Quem seguisse o conselho não encontrava uma única linha do instalador.
+///
+/// A partir de agora o instalador escreve também em `<destino>\instalador.log`, sempre ao
+/// lado do exe que instalou, e as Definições da app mostram os dois caminhos.
+static DESTINO_DO_REGISTO: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn registar_destino(destino: &Path) {
+    let _ = DESTINO_DO_REGISTO.set(destino.to_path_buf());
+}
+
 fn anotar(linha: &str) {
+    // O ficheiro ao lado do exe primeiro: é o que sobrevive a um %APPDATA% doutro
+    // utilizador (a elevação pode trocar de conta) e o que a app sabe mostrar.
+    if let Some(destino) = DESTINO_DO_REGISTO.get() {
+        anotar_em(&destino.join("instalador.log"), linha);
+    }
+    anotar_appdata(linha);
+}
+
+fn anotar_em(caminho: &Path, linha: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(caminho)
+    {
+        let _ = writeln!(f, "[instalador] {linha}");
+    }
+}
+
+fn anotar_appdata(linha: &str) {
     use std::io::Write;
     let Some(base) = std::env::var_os("APPDATA") else {
         return;
@@ -350,6 +414,31 @@ fn anotar(linha: &str) {
     {
         let _ = writeln!(f, "[instalador] {linha}");
     }
+}
+
+/// O carimbo da actualização: escreve-se ANTES de mexer em seja o que for (#121).
+///
+/// O rasto de uma actualização falhada existia (o instalador anota, a app escreve o banner
+/// de arranque) mas ninguém o lia: se a actualização morresse a meio — UAC recusado,
+/// extracção falhada — a pessoa reabria a app pelo atalho, ela abria na versão antiga, e
+/// não dizia nada. O carimbo é o que permite à app do arranque seguinte DIZER «a
+/// actualização para X não chegou ao fim».
+///
+/// `estado: "pronto"` escreve-se no fim, só se tudo correu bem. A app lê o ficheiro uma vez
+/// e apaga-o — um aviso, não um eco eterno — e ignora carimbos com mais de uma semana, para
+/// um resto esquecido não assustar ninguém meses depois.
+fn carimbo_de_actualizacao(estado: &str) {
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let pasta = PathBuf::from(base).join("Bruma");
+    let _ = std::fs::create_dir_all(&pasta);
+    let instante = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let j = serde_json::json!({ "alvo": VERSAO, "instante": instante, "estado": estado });
+    let _ = std::fs::write(pasta.join("actualizacao.json"), j.to_string());
 }
 
 fn fechar_o_bruma() {
@@ -427,6 +516,14 @@ fn copiar_me_como_desinstalador(destino: &Path) -> Result<()> {
     Ok(())
 }
 
+/// O total instalado, em KiB — a unidade que o registo pede.
+///
+/// À parte para se poder afirmar num teste: a app descomprimida MAIS o desinstalador, e não
+/// o payload comprimido, que era o que se anunciava e é metade da verdade.
+fn tamanho_estimado_kb(app: u64, desinstalador: u64) -> u32 {
+    ((app + desinstalador) / 1024) as u32
+}
+
 fn escrever_registo(destino: &Path) -> Result<()> {
     use winreg::enums::*;
     let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -444,8 +541,19 @@ fn escrever_registo(destino: &Path) -> Result<()> {
     chave.set_value("MainBinaryName", &"bruma.exe")?;
     chave.set_value("NoModify", &1u32)?;
     chave.set_value("NoRepair", &1u32)?;
-    let kb = (PAYLOAD.len() as u32) / 1024;
-    chave.set_value("EstimatedSize", &kb)?;
+    // O QUE A INSTALAÇÃO OCUPA MESMO, e não o payload comprimido (#181).
+    //
+    // Isto dividia o `PAYLOAD.len()` — o zstd, ~7 MB — quando o que fica no disco é o
+    // bruma.exe descomprimido MAIS a cópia deste exe como desinstalador. O
+    // Adicionar/Remover Programas mostrava metade da verdade.
+    let desinstalador = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let app: u64 = env!("TAMANHO_DA_APP")
+        .parse()
+        .unwrap_or(PAYLOAD.len() as u64);
+    chave.set_value("EstimatedSize", &tamanho_estimado_kb(app, desinstalador))?;
     Ok(())
 }
 
@@ -645,7 +753,17 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<Result
     // O `rmdir` sem `/S` e de proposito: so remove a pasta se ela ficar vazia. Se la
     // estiver mais alguma coisa -- a pasta `dados`, ou o que a pessoa la tinha -- a
     // pasta fica, e e isso que tem de acontecer.
-    let nossos = ["bruma.exe", "bruma.exe.novo", "uninstall.exe", "Bruma.lnk"];
+    // O instalador.log é nosso — é o instalador que o escreve — e por isso sai com o
+    // resto. Sem esta linha, o `rmdir` (sem /S, de propósito) encontrava a pasta não-vazia
+    // e deixava-a para trás com um log lá dentro: a desinstalação «não limpou tudo» por
+    // causa de um ficheiro que nós próprios lá pusemos.
+    let nossos = [
+        "bruma.exe",
+        "bruma.exe.novo",
+        "uninstall.exe",
+        "Bruma.lnk",
+        "instalador.log",
+    ];
     let mut linhas = vec![
         "@echo off".to_string(),
         "set n=0".to_string(),
@@ -758,6 +876,7 @@ fn correr_instalacao(
     dir: String,
     atalho: bool,
 ) -> Result<Resultado, String> {
+    registar_destino(Path::new(&dir));
     instalar(
         &PathBuf::from(dir),
         atalho,
@@ -774,6 +893,7 @@ fn correr_desinstalacao(
     dir: String,
     apagar_dados: bool,
 ) -> Result<Resultado, String> {
+    registar_destino(Path::new(&dir));
     desinstalar(&PathBuf::from(dir), apagar_dados, estado.opcoes.teste)
         .map_err(|e| format!("{e:#}"))
 }
@@ -863,11 +983,23 @@ fn main() {
             std::env::args().skip(1).collect::<Vec<_>>().join(" ")
         ));
         let destino = o.dir.clone().unwrap_or_else(|| destino_por_omissao(o.modo));
+        registar_destino(&destino);
+        // O carimbo nasce aqui, no processo NÃO elevado: se a elevação trocar de conta, o
+        // %APPDATA% do filho é o do administrador — e o aviso tem de ficar no da pessoa
+        // que usa a app.
+        if o.atualizacao && o.modo == Modo::Instalar {
+            carimbo_de_actualizacao("a-instalar");
+        }
         if !o.teste && !sou_administrador() {
             // O pai (não elevado) espera pelo filho elevado e é ELE que relança a app —
             // de propósito, para o Bruma novo nascer sem privilégios de administrador.
-            match relancar_como_administrador(true) {
+            match relancar_como_administrador(true, Some(&destino)) {
                 Ok(0) => {
+                    // O filho elevado disse que sim: é o pai que carimba o «pronto»,
+                    // porque é o pai que está no %APPDATA% certo.
+                    if o.atualizacao {
+                        carimbo_de_actualizacao("pronto");
+                    }
                     if o.relancar {
                         abrir_a_app(&destino, &o.args_da_app);
                     }
@@ -912,10 +1044,19 @@ fn main() {
                 for a in &resultado.avisos {
                     eprintln!("[instalador] aviso: {a}");
                 }
+                // Já elevados, ou em teste: não há pai para carimbar por nós.
+                if o.atualizacao && o.modo == Modo::Instalar {
+                    carimbo_de_actualizacao("pronto");
+                }
             }
         }
         // Já elevados e sem pai à espera (--teste, ou alguém correu-nos já como admin):
         // relança-se daqui na mesma, que é melhor do que não relançar de todo.
+        //
+        // O `o.dir.is_none()` é a heurística de «não há pai à espera» — e só funciona porque
+        // um pai que eleva passa SEMPRE a pasta ao filho (ver `args_para_o_filho`). Sem isso,
+        // o filho elevado do updater relançava aqui E o pai relançava ao acordar: duas
+        // janelas do Bruma na mesma pasta de dados.
         if o.relancar && o.teste {
             abrir_a_app(&destino, &o.args_da_app);
         } else if o.relancar && sou_administrador() && o.dir.is_none() {
@@ -926,7 +1067,8 @@ fn main() {
 
     // Com interface: eleva primeiro, para os botões poderem cumprir o que prometem.
     if !o.teste && !sou_administrador() {
-        if let Err(e) = relancar_como_administrador(false) {
+        // Sem pasta: na janela, quem escolhe a pasta é a pessoa, no ecrã do filho elevado.
+        if let Err(e) = relancar_como_administrador(false, None) {
             anotar(&format!(
                 "a elevacao para a janela falhou ou foi recusada ({e:#})"
             ));
@@ -1038,6 +1180,51 @@ mod testes {
             Some(PathBuf::from("C:\\Bruma"))
         );
         assert_eq!(de("Instalar-Bruma.exe", &[]).dir, None);
+    }
+
+    /// O tamanho anunciado é o INSTALADO, não o comprimido (#181).
+    ///
+    /// O registo anunciava o payload zstd — ~7 MB — quando a instalação ocupa a app
+    /// descomprimida mais o desinstalador. O Adicionar/Remover Programas é onde as pessoas
+    /// decidem o que apagar quando falta espaço; era mentir no sítio da decisão.
+    #[test]
+    fn o_tamanho_anunciado_e_o_instalado() {
+        // 26 MiB de app + 15 MiB de desinstalador: ~41984 KiB, e nunca os ~7000 do zstd.
+        let kb = tamanho_estimado_kb(26 * 1024 * 1024, 15 * 1024 * 1024);
+        assert_eq!(kb, 41 * 1024);
+        // E o env do build tem de ser um número — é ele que alimenta isto em produção.
+        let _: u64 = env!("TAMANHO_DA_APP")
+            .parse()
+            .expect("TAMANHO_DA_APP não é um número");
+    }
+
+    /// O filho elevado recebe a pasta EXPLÍCITA — e à frente do /ARGS, nunca depois.
+    ///
+    /// É o que impede as duas instâncias: com `--dir` presente, o filho sabe que há um pai à
+    /// espera e não relança a app por sua conta. E a posição importa — tudo depois de `/ARGS`
+    /// é da app, portanto um `--dir` no fim mudava de dono e o filho voltava a não o ver.
+    #[test]
+    fn o_filho_elevado_recebe_a_pasta_antes_do_args() {
+        let d = Path::new("C:\\Bruma");
+        let v = args_para_o_filho(
+            d,
+            ["/P", "/R", "/UPDATE", "/ARGS", "a"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert_eq!(v[0], "--dir=C:\\Bruma", "a pasta vai à frente");
+        // E o parse do filho vê-a como nossa, não da app.
+        let o = opcoes_de("Instalar-Bruma.exe", v.into_iter());
+        assert_eq!(o.dir, Some(PathBuf::from("C:\\Bruma")));
+        assert_eq!(
+            o.args_da_app,
+            vec!["a".to_string()],
+            "o /ARGS continua intacto"
+        );
+
+        // Quem já traz --dir não o vê duplicado.
+        let v2 = args_para_o_filho(d, ["--dir=D:\\x".to_string()].into_iter());
+        assert_eq!(v2, vec!["--dir=D:\\x".to_string()]);
     }
 
     /// A pasta de dados que a pessoa escolheu à mão CONTA para o apagar (#183).

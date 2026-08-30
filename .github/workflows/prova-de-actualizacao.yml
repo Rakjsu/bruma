@@ -1,0 +1,93 @@
+name: Prova de actualizacao
+
+# Prova que uma instalacao da versao N-1 se actualiza MESMO para a versao N (#135).
+#
+# A cadeia de portoes da release cobre uma metade: o que foi publicado esta coerente --
+# etiqueta = versao, ficheiros presentes, assinatura a verificar com a chave da app. Isto
+# cobre a outra: pega no instalador REALMENTE PUBLICADO da versao anterior, instala-o,
+# poe-lhe dados dentro, corre-lhe por cima o instalador da versao nova com o dialecto do
+# updater (/P /UPDATE), e exige tres coisas -- que a app passe a dizer a versao nova, que
+# os dados sobrevivam byte a byte, e que o desinstalador tenha sido substituido.
+#
+# E manual (workflow_dispatch) e corre DEPOIS de a release existir: nao e um portao da
+# publicacao, e a prova de que a publicacao serve a quem ja tem a anterior. Correr depois
+# de cada release custa um clique; nao correr custa descobrir na maquina da amiga.
+on:
+  workflow_dispatch:
+    inputs:
+      de:
+        description: "A etiqueta ANTIGA (ex.: v0.18.2) -- a instalacao que se actualiza"
+        required: true
+      para:
+        description: "A etiqueta NOVA (ex.: v0.18.3) -- o que ela deve passar a ser"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  actualizar:
+    name: "${{ inputs.de }} -> ${{ inputs.para }}"
+    runs-on: windows-latest
+    steps:
+      - name: Instalar a versao antiga e actualizar por cima
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # O INSTALADOR É AGORA UMA APLICAÇÃO DE JANELA (subsistema GUI, para a consola
+          # preta não abrir ao duplo clique) — e o PowerShell NÃO ESPERA por aplicações de
+          # janela invocadas com `&`, nem lhes lê o código de saída: o $LASTEXITCODE fica
+          # com o valor do comando ANTERIOR, e o teste seguinte corre contra um instalador
+          # ainda a arrancar. Todos os portões deste passo ficavam ocos — a dizer «saiu com
+          # 0» sobre um código que nunca leram. Por isso NUNCA se invoca o instalador com
+          # `&` aqui: passa tudo por isto, que espera e devolve o código verdadeiro.
+          function Correr {
+            param([string]$Exe, [string[]]$Argumentos)
+            $saida = [System.IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -Wait -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            Get-Content $saida -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            Remove-Item $saida -ErrorAction SilentlyContinue
+            return $p.ExitCode
+          }
+
+          $de = '${{ inputs.de }}'
+          $para = '${{ inputs.para }}'
+
+          # Os DOIS instaladores publicados -- nada compilado aqui, so o que as pessoas tem.
+          New-Item -ItemType Directory -Force velho, novo | Out-Null
+          gh release download $de -R "$env:GITHUB_REPOSITORY" -p 'Instalar-Bruma.exe' -D velho
+          if ($LASTEXITCODE -ne 0) { Write-Error "nao consegui descarregar o instalador da $de"; exit 1 }
+          gh release download $para -R "$env:GITHUB_REPOSITORY" -p 'Instalar-Bruma.exe' -D novo
+          if ($LASTEXITCODE -ne 0) { Write-Error "nao consegui descarregar o instalador da $para"; exit 1 }
+
+          # A instalacao antiga, com vida la dentro: uma pasta de dados como a de quem usa
+          # a app ha meses. E o que NAO pode desaparecer na actualizacao.
+          $prova = Join-Path $env:RUNNER_TEMP 'prova-n1'
+          New-Item -ItemType Directory -Force $prova | Out-Null
+          $c = Correr ./velho/Instalar-Bruma.exe @('--silencioso', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "o instalador da $de saiu com $c"; exit 1 }
+          $app = Join-Path $prova 'bruma.exe'
+          $antes = (Get-Item $app).VersionInfo.ProductVersion
+          "instalada a $de (a app diz $antes)"
+          New-Item -ItemType Directory -Force (Join-Path $prova 'dados') | Out-Null
+          'a identidade e o historico de meses' | Out-File -Encoding utf8 (Join-Path $prova 'dados/identidade.key')
+          $hash_antes = (Get-FileHash (Join-Path $prova 'dados/identidade.key')).Hash
+          $uninstall_antes = (Get-FileHash (Join-Path $prova 'uninstall.exe')).Hash
+
+          # A actualizacao, pelo dialecto que o updater usa de verdade.
+          $c = Correr ./novo/Instalar-Bruma.exe @('/P', '/UPDATE', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "a actualizacao para a $para saiu com $c"; exit 1 }
+
+          # 1. A app passou a ser a nova.
+          $depois = (Get-Item $app).VersionInfo.ProductVersion
+          if ("v$depois" -ne $para) { Write-Error "a app diz $depois e devia dizer $($para.TrimStart('v'))"; exit 1 }
+          # 2. Os dados sobreviveram byte a byte.
+          $hash_depois = (Get-FileHash (Join-Path $prova 'dados/identidade.key')).Hash
+          if ($hash_antes -ne $hash_depois) { Write-Error 'a actualizacao TOCOU nos dados'; exit 1 }
+          # 3. O desinstalador foi substituido pelo novo.
+          $uninstall_depois = (Get-FileHash (Join-Path $prova 'uninstall.exe')).Hash
+          if ($uninstall_antes -eq $uninstall_depois) { Write-Error 'o uninstall.exe ficou o da versao antiga'; exit 1 }
+
+          "PROVADO: $de -> $para com os dados intactos e o desinstalador novo"

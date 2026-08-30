@@ -25,9 +25,37 @@ jobs:
     name: Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.98.0   # a mesma do rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      # FIXADAS POR SHA (#176): estes passos correm com a chave de assinatura no
+      # ambiente, e `@v0`/`@v2` sao alvos moveis -- uma versao nova publicada entre duas
+      # releases nossas corria com a unica raiz de confianca que este projecto tem, e e uma
+      # raiz sem revogacao. O numero legivel fica no comentario; subir de versao passa a
+      # ser uma decisao com commit, nao um acaso.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.98.0" # a mesma do rust-toolchain.toml; explicita porque o SHA ja nao a diz
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # A PROVA DO PAR DE CHAVES, ANTES DA MEIA HORA DE COMPILACAO (#175).
+      #
+      # O verificar-assinatura e o portao certo, mas corria DEPOIS do tauri-action e do
+      # instalador: se a chave do segredo e a pubkey do tauri.conf.json nao forem par --
+      # rotacao de uma sem a outra, segredo colado com um \n a mais, password errada --
+      # gastavam-se trinta minutos para descobrir. Assina-se um rascunho com o MESMO comando
+      # do passo real e verifica-se ja: uma recusa custa segundos e diz o que corrigir.
+      # O rascunho e o .sig apagam-se; nada disto sobe para lado nenhum.
+      - name: A chave privada e a publica sao mesmo par?
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "rascunho para provar o par de chaves" > rascunho.bin
+          npx --yes "@tauri-apps/cli@2.11.4" signer sign rascunho.bin
+          cargo run -q -p verificar-assinatura -- rascunho.bin rascunho.bin.sig apps/desktop/tauri.conf.json
+          rm -f rascunho.bin rascunho.bin.sig
+          echo "a chave do segredo e a pubkey da app sao par"
 
       # A ETIQUETA TEM DE BATER CERTO COM A VERSAO DA APP.
       #
@@ -45,7 +73,7 @@ jobs:
       # Se o Cargo.toml divergir, o portao antigo passava e o estrago era o mesmo que ele
       # existe para impedir: o updater anuncia uma versao, instala, a app arranca a dizer
       # outra, e ele volta a ver a nova disponivel. Ciclo de actualizacao infinito.
-      - name: As tres versoes batem certo com a etiqueta?
+      - name: A versao bate certo em todo o lado?
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -62,11 +90,17 @@ jobs:
           }
           $cargo = ($linhas[0] -replace '^version = "', '') -replace '"$', ''
 
-          if ($tag -ne $conf -or $tag -ne $cargo) {
-            Write-Error "a etiqueta diz $tag, o tauri.conf.json diz $conf e o Cargo.toml diz $cargo; os tres tem de ser iguais antes de publicar"
+          # E o QUARTO sitio (#181): o tauri.conf.json do INSTALADOR, que e o que o
+          # tauri-build carimba no recurso de versao do Instalar-Bruma.exe -- o numero que
+          # as Propriedades do ficheiro mostram a quem descarrega. O build.rs sincroniza-o
+          # sozinho; isto garante que a sincronizacao foi COMMITADA.
+          $inst = (Get-Content apps/instalador/tauri.conf.json -Raw | ConvertFrom-Json).version
+
+          if ($tag -ne $conf -or $tag -ne $cargo -or $tag -ne $inst) {
+            Write-Error "a etiqueta diz $tag, o tauri.conf.json diz $conf, o Cargo.toml diz $cargo e o instalador diz $inst; os quatro tem de ser iguais antes de publicar"
             exit 1
           }
-          "etiqueta, tauri.conf.json e Cargo.toml dizem todos: $tag"
+          "etiqueta, tauri.conf.json, Cargo.toml e instalador dizem todos: $tag"
 
       # OS TESTES CORREM ANTES DE PUBLICAR.
       #
@@ -158,10 +192,14 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo clippy -p bruma -p instalador -p spike-common -p verificar-assinatura -p so-o-que-vai-na-release --all-targets -- -D warnings
-          cargo test -p bruma -p spike-common -p instalador
+          cargo test -p bruma -p spike-common -p instalador -p so-o-que-vai-na-release
+          # A lista de andaimes deixa de ser memoria (#120): nenhum nome BRUMA_* pode
+          # existir nas fontes sem estar classificado no portao. Foi assim que nove nomes
+          # escaparam a primeira lista e um decimo a segunda.
+          cargo run -q -p so-o-que-vai-na-release -- --fontes .
 
       - name: Compilar, assinar e publicar
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # A chave privada vive so aqui e em ~/.tauri na maquina do dono.
@@ -250,6 +288,22 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # O INSTALADOR É AGORA UMA APLICAÇÃO DE JANELA (subsistema GUI, para a consola
+          # preta não abrir ao duplo clique) — e o PowerShell NÃO ESPERA por aplicações de
+          # janela invocadas com `&`, nem lhes lê o código de saída: o $LASTEXITCODE fica
+          # com o valor do comando ANTERIOR, e o teste seguinte corre contra um instalador
+          # ainda a arrancar. Todos os portões deste passo ficavam ocos — a dizer «saiu com
+          # 0» sobre um código que nunca leram. Por isso NUNCA se invoca o instalador com
+          # `&` aqui: passa tudo por isto, que espera e devolve o código verdadeiro.
+          function Correr {
+            param([string]$Exe, [string[]]$Argumentos)
+            $saida = [System.IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -Wait -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            Get-Content $saida -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            Remove-Item $saida -ErrorAction SilentlyContinue
+            return $p.ExitCode
+          }
+
           cargo build -p instalador --release
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item target/release/instalador.exe Instalar-Bruma.exe
@@ -273,8 +327,8 @@ jobs:
           New-Item -ItemType Directory -Force (Join-Path $prova 'fotos') | Out-Null
           'ferias' | Out-File -Encoding utf8 (Join-Path $prova 'fotos/praia.jpg')
 
-          & ./Instalar-Bruma.exe --silencioso --teste "--dir=$prova"
-          if ($LASTEXITCODE -ne 0) { Write-Error "o instalador saiu com $LASTEXITCODE"; exit 1 }
+          $c = Correr ./Instalar-Bruma.exe @('--silencioso', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "o instalador saiu com $c"; exit 1 }
 
           $app = Join-Path $prova 'bruma.exe'
           if (-not (Test-Path $app)) { Write-Error 'o instalador nao pos la o bruma.exe'; exit 1 }
@@ -283,8 +337,23 @@ jobs:
           if (-not (Test-Path (Join-Path $prova 'uninstall.exe'))) { Write-Error 'sem desinstalador'; exit 1 }
           Write-Host "instalou: bruma.exe com $mb MB"
 
-          & (Join-Path $prova 'uninstall.exe') --silencioso --teste "--dir=$prova"
-          if ($LASTEXITCODE -ne 0) { Write-Error "o desinstalador saiu com $LASTEXITCODE"; exit 1 }
+          # O PORTAO PASSA A OLHAR PARA O QUE A PESSOA TEM MESMO (#177).
+          #
+          # O passo dos andaimes le `target/release/bruma.exe` -- um caminho ASSUMIDO. O
+          # rust-cache restaura o `target/`, e se por qualquer razao o tauri-action escrever
+          # noutro sitio ou falhar sem parar a corrida, aquele passo inspecciona um binario
+          # de outra corrida e diz "release limpa" sobre uma coisa que nao vai na release.
+          #
+          # Este ficheiro nao e assumido: saiu do payload embutido, foi descomprimido pelo
+          # instalador, e e byte a byte aquilo que fica na pasta de quem instalar. E corre
+          # AGORA, antes da desinstalacao -- a primeira versao deste passo estava depois
+          # dela, a apontar para um ficheiro ja apagado, e so nao rebentou uma release
+          # porque foi apanhada antes de haver uma.
+          cargo run -q -p so-o-que-vai-na-release -- $app
+          if ($LASTEXITCODE -ne 0) { Write-Error 'o bruma.exe REALMENTE instalado leva andaimes'; exit 1 }
+
+          $c = Correr (Join-Path $prova 'uninstall.exe') @('--silencioso', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "o desinstalador saiu com $c"; exit 1 }
           # A limpeza final e feita por um .cmd solto, e o que ele tem de tirar por ultimo
           # e o PROPRIO uninstall.exe -- o bruma.exe ja foi apagado antes, pelo Rust, de
           # forma sincrona. Esperar pelo bruma.exe era esperar por uma coisa que ja tinha
@@ -301,18 +370,68 @@ jobs:
           if (-not (Test-Path (Join-Path $prova 'fotos/praia.jpg'))) { Write-Error 'o desinstalador apagou uma subpasta do utilizador'; exit 1 }
           Write-Host 'desinstalou o que era dele e deixou o resto'
 
-          # O PORTAO PASSA A OLHAR PARA O QUE A PESSOA TEM MESMO (#177).
+          # O DIALECTO DO UPDATER, CORRIDO A SERIO (#60, #68).
           #
-          # O passo dos andaimes le `target/release/bruma.exe` -- um caminho ASSUMIDO. O
-          # rust-cache restaura o `target/`, e se por qualquer razao o tauri-action escrever
-          # noutro sitio ou falhar sem parar a corrida, aquele passo inspecciona um binario
-          # de outra corrida e diz "release limpa" sobre uma coisa que nao vai na release.
+          # O portao instalava com `--silencioso --teste` -- o dialecto NOSSO. Mas todas as
+          # actualizacoes existentes chegam por outro: o updater do Tauri corre este exe com
+          # /P /R /UPDATE /ARGS. Os testes de unidade provam que o parse esta certo; isto
+          # prova que o caminho INTEIRO responde -- instalar por cima, deixar o carimbo
+          # fechado, e relancar a app com os argumentos que vem depois do /ARGS.
           #
-          # Este ficheiro nao e assumido: saiu do payload embutido, foi descomprimido pelo
-          # instalador, e e byte a byte aquilo que fica na pasta de quem instalar. Corre-se
-          # ANTES da limpeza da pasta de prova, que e enquanto ele ainda existe.
-          cargo run -q -p so-o-que-vai-na-release -- $app
-          if ($LASTEXITCODE -ne 0) { Write-Error 'o bruma.exe REALMENTE instalado leva andaimes'; exit 1 }
+          # Duas corridas, cada uma a provar uma coisa. Sem /R primeiro, porque o carimbo
+          # tem de ser lido ANTES de alguma app arrancar -- a app apaga-o ao arrancar, e uma
+          # corrida so teria uma corrida entre o teste e ela.
+          Remove-Item "$env:APPDATA\Bruma\actualizacao.json" -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force (Join-Path $prova 'dados') | Out-Null
+          'historico' | Out-File -Encoding utf8 (Join-Path $prova 'dados/sala.json')
+          $c = Correr ./Instalar-Bruma.exe @('/P', '/UPDATE', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "a actualizacao /P /UPDATE saiu com $c"; exit 1 }
+          if (-not (Test-Path $app)) { Write-Error 'a actualizacao levou o bruma.exe'; exit 1 }
+          if (-not (Test-Path (Join-Path $prova 'dados/sala.json'))) { Write-Error 'a actualizacao APAGOU os dados'; exit 1 }
+          $carimbo = Get-Content "$env:APPDATA\Bruma\actualizacao.json" -Raw | ConvertFrom-Json
+          if ($carimbo.estado -ne 'pronto') { Write-Error "o carimbo diz '$($carimbo.estado)' e devia dizer 'pronto'"; exit 1 }
+          Remove-Item "$env:APPDATA\Bruma\actualizacao.json" -Force -ErrorAction SilentlyContinue
+          Write-Host 'actualizou por cima, dados intactos, carimbo fechado'
+
+          # E agora com /R: o processo relancado tem de existir COM os argumentos do /ARGS.
+          # A app pode nem conseguir abrir a janela num runner sem cabeca -- nao interessa:
+          # o que se afirma e que o processo arrancou com a linha de comandos certa.
+          $c = Correr ./Instalar-Bruma.exe @('/P', '/R', '/UPDATE', '--teste', "--dir=$prova", '/ARGS', '--marcador-do-portao')
+          if ($c -ne 0) { Write-Error "a actualizacao com /R saiu com $c"; exit 1 }
+          $cl = $null
+          for ($i = 0; $i -lt 20 -and -not $cl; $i++) {
+            Start-Sleep -Seconds 1
+            $cl = (Get-CimInstance Win32_Process -Filter "Name='bruma.exe'" |
+                   Where-Object { $_.CommandLine -match 'marcador-do-portao' }).CommandLine
+          }
+          Stop-Process -Name bruma -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:APPDATA\Bruma\actualizacao.json" -Force -ErrorAction SilentlyContinue
+          if (-not $cl) { Write-Error 'o /R nao relancou a app com os argumentos do /ARGS'; exit 1 }
+          Write-Host "o /R relancou: $cl"
+
+          $c = Correr (Join-Path $prova 'uninstall.exe') @('--silencioso', '--teste', "--dir=$prova")
+          if ($c -ne 0) { Write-Error "a segunda desinstalacao saiu com $c"; exit 1 }
+          Start-Sleep -Seconds 5
+
+          # A ESCOLHA AUTOMATICA DE PASTA, QUE O --dir SALTAVA SEMPRE (#179).
+          #
+          # A escolha de onde desinstalar ja correu mal uma vez -- o teste apontou ao
+          # Program Files verdadeiro e so as permissoes o travaram. A correccao foi o
+          # destino_por_omissao usar a pasta do proprio exe; mas o portao passava sempre
+          # --dir, saltando essa funcao por completo. Corre-se de uma COPIA numa pasta
+          # descartavel, com uma testemunha na pasta irma: limpa a sua, e mais nenhuma.
+          $desc = Join-Path $env:RUNNER_TEMP 'descartavel/dentro'
+          $irma = Join-Path $env:RUNNER_TEMP 'descartavel/irma'
+          New-Item -ItemType Directory -Force $desc, $irma | Out-Null
+          'sobrevivo' | Out-File -Encoding utf8 (Join-Path $irma 'testemunha.txt')
+          Copy-Item ./Instalar-Bruma.exe (Join-Path $desc 'uninstall.exe')
+          $c = Correr (Join-Path $desc 'uninstall.exe') @('--silencioso', '--teste')
+          if ($c -ne 0) { Write-Error "a desinstalacao sem --dir saiu com $c"; exit 1 }
+          for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $desc 'uninstall.exe')); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path (Join-Path $desc 'uninstall.exe')) { Write-Error 'sem --dir, o desinstalador nao se limpou a si proprio'; exit 1 }
+          if (-not (Test-Path (Join-Path $irma 'testemunha.txt'))) { Write-Error 'sem --dir, o desinstalador saiu da sua pasta'; exit 1 }
+          Write-Host 'sem --dir: limpou a propria pasta e nao tocou na irma'
+          Remove-Item -Recurse -Force (Join-Path $env:RUNNER_TEMP 'descartavel') -ErrorAction SilentlyContinue
 
           Remove-Item -Recurse -Force $prova -ErrorAction SilentlyContinue
           # ----------------------------------------------------------------------------
@@ -328,22 +447,47 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error 'o instalador leva andaimes de medicao'; exit 1 }
 
           # A assinatura le a chave das MESMAS variaveis de ambiente que o tauri-action.
-          npx --yes "@tauri-apps/cli@^2" signer sign Instalar-Bruma.exe
+          # Versao EXACTA (#176): o ^2 descarregava o que quer que fosse o ultimo 2.x no
+          # momento, e a chave privada passa por este processo.
+          npx --yes "@tauri-apps/cli@2.11.4" signer sign Instalar-Bruma.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           $tag = '${{ github.ref_name }}'
           $ver = $tag.TrimStart('v')
           $sig = (Get-Content Instalar-Bruma.exe.sig -Raw).Trim()
           $data = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          @{
+
+          # AS NOTAS PASSAM A DIZER O QUE MUDA (#62).
+          #
+          # O campo notes era "Bruma $ver" -- um numero. E a faixa da app mostrava esse
+          # numero a alguem que tem de decidir se vale a pena reiniciar A MEIO DE UMA
+          # CHAMADA. A anotacao da etiqueta ja conta o que a versao traz, com o cuidado de
+          # sempre; e dai que a faixa passa a falar. O fetch e explicito porque o checkout
+          # das Actions nem sempre traz o OBJECTO da etiqueta anotada, so o commit.
+          git fetch origin "+refs/tags/${tag}:refs/tags/${tag}" --no-tags --force 2>$null
+          # SO de uma etiqueta ANOTADA: numa etiqueta leve o %(contents) devolve a mensagem
+          # do COMMIT -- o fallback "-not $notas" nunca disparava, e a faixa da app mostrava
+          # um assunto de commit a quem decide se reinicia a meio de uma chamada.
+          $tipo = (git cat-file -t $tag 2>$null)
+          $notas = if ($tipo -eq 'tag') { (git tag -l $tag --format='%(contents)') } else { '' }
+          if ($notas -is [array]) { $notas = $notas -join "`n" }
+          if (-not $notas -or -not $notas.Trim()) { $notas = "Bruma $ver" }
+          $notas = $notas.Trim()
+          if ($notas.Length -gt 3500) { $notas = $notas.Substring(0, 3500) + "`n[...]" }
+
+          $json = @{
             version = $ver
-            notes = "Bruma $ver"
+            notes = $notas
             pub_date = $data
             platforms = @{ 'windows-x86_64' = @{
               signature = $sig
               url = "https://github.com/Rakjsu/bruma/releases/download/$tag/Instalar-Bruma.exe"
             } }
-          } | ConvertTo-Json -Depth 5 | Out-File latest.json -Encoding ascii
+          } | ConvertTo-Json -Depth 5
+          # UTF-8 SEM BOM, escrito a mao: o -Encoding ascii transformava os acentos das
+          # notas em pontos de interrogacao, o utf8 do PowerShell 5.1 poe um BOM, e um BOM
+          # a frente de JSON e o updater a recusar o ficheiro inteiro.
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'latest.json'), $json, [System.Text.UTF8Encoding]::new($false))
 
           gh release upload $tag Instalar-Bruma.exe Instalar-Bruma.exe.sig latest.json --clobber
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -469,6 +613,29 @@ jobs:
           if ($j.version -ne $tag.TrimStart('v')) {
             Write-Error "o latest.json diz $($j.version) e a etiqueta e $tag -- fica rascunho"
             exit 1
+          }
+
+          # E a pagina da release conta a mesma historia que a etiqueta (#62): quem chega
+          # pelo browser le o que muda, nao um texto generico igual em todas as versoes.
+          # O paragrafo do download fica em cima, porque e o que quem chega ali procura.
+          git fetch origin "+refs/tags/${tag}:refs/tags/${tag}" --no-tags --force 2>$null
+          $tipo = (git cat-file -t $tag 2>$null)
+          $notas = if ($tipo -eq 'tag') { (git tag -l $tag --format='%(contents)') } else { '' }
+          if ($notas -is [array]) { $notas = $notas -join "`n" }
+          if ($notas -and $notas.Trim()) {
+            $corpo = @"
+          **Descarrega o ``Instalar-Bruma.exe``** — e o unico instalador: o mesmo que instala e o mesmo que o auto-update usa.
+
+          > O Windows vai avisar que o editor e desconhecido — *Mais informacoes* → *Executar mesmo assim*.
+
+          ---
+
+          $($notas.Trim())
+          "@
+            [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'corpo-da-release.md'), $corpo, [System.Text.UTF8Encoding]::new($false))
+            gh release edit $tag --notes-file corpo-da-release.md
+            if ($LASTEXITCODE -ne 0) { Write-Error 'nao consegui escrever as notas da release'; exit 1 }
+            Remove-Item corpo-da-release.md -ErrorAction SilentlyContinue
           }
 
           # `--latest` explicito: e este que o endpoint do updater vai buscar, e nao se
