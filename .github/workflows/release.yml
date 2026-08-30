@@ -24,6 +24,10 @@ jobs:
   build:
     name: Windows
     runs-on: windows-latest
+    # Um portao pendurado tem de custar minutos, nao as 6 horas do tecto por omissao: a
+    # primeira corrida da v0.18.3 ficou 5h39m presa num Wait antes de o runner a matar.
+    # Com a cache quente isto demora ~20 min; 90 e folga a seria, nao tolerancia.
+    timeout-minutes: 90
     steps:
       # FIXADAS POR SHA (#176): estes passos correm com a chave de assinatura no
       # ambiente, e `@v0`/`@v2` sao alvos moveis -- uma versao nova publicada entre duas
@@ -298,7 +302,18 @@ jobs:
           function Correr {
             param([string]$Exe, [string[]]$Argumentos)
             $saida = [System.IO.Path]::GetTempFileName()
-            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -Wait -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            # WaitForExit() e NAO o -Wait do Start-Process: o -Wait espera pelo processo E
+            # POR TODOS OS DESCENDENTES. A corrida com /R relanca o bruma.exe -- que num
+            # runner ninguem fecha -- e o -Wait ficou pendurado nele 5h39m ate o tecto das
+            # 6 horas matar o job inteiro. O WaitForExit espera SO pelo instalador, que e o
+            # unico cujo codigo de saida aqui interessa; o filho relancado e verificado (e
+            # morto) pelos passos seguintes.
+            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            # Tocar no Handle ANTES da saida, senao o .NET nao guarda o ExitCode e ele vem
+            # NULO -- e um "if ($null -ne 0)" e verdadeiro: o portao falhava um instalador
+            # que saiu com 0. Visto acontecer na prova local, nao e teoria.
+            $null = $p.Handle
+            $p.WaitForExit()
             Get-Content $saida -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
             Remove-Item $saida -ErrorAction SilentlyContinue
             return $p.ExitCode

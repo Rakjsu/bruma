@@ -29,6 +29,8 @@ jobs:
   actualizar:
     name: "${{ inputs.de }} -> ${{ inputs.para }}"
     runs-on: windows-latest
+    # Dois downloads e duas instalacoes: minutos. Um tecto curto para nunca custar um dia.
+    timeout-minutes: 30
     steps:
       - name: Instalar a versao antiga e actualizar por cima
         shell: pwsh
@@ -46,7 +48,18 @@ jobs:
           function Correr {
             param([string]$Exe, [string[]]$Argumentos)
             $saida = [System.IO.Path]::GetTempFileName()
-            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -Wait -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            # WaitForExit() e NAO o -Wait do Start-Process: o -Wait espera pelo processo E
+            # POR TODOS OS DESCENDENTES. A corrida com /R relanca o bruma.exe -- que num
+            # runner ninguem fecha -- e o -Wait ficou pendurado nele 5h39m ate o tecto das
+            # 6 horas matar o job inteiro. O WaitForExit espera SO pelo instalador, que e o
+            # unico cujo codigo de saida aqui interessa; o filho relancado e verificado (e
+            # morto) pelos passos seguintes.
+            $p = Start-Process -FilePath $Exe -ArgumentList $Argumentos -PassThru -NoNewWindow -RedirectStandardOutput $saida
+            # Tocar no Handle ANTES da saida, senao o .NET nao guarda o ExitCode e ele vem
+            # NULO -- e um "if ($null -ne 0)" e verdadeiro: o portao falhava um instalador
+            # que saiu com 0. Visto acontecer na prova local, nao e teoria.
+            $null = $p.Handle
+            $p.WaitForExit()
             Get-Content $saida -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
             Remove-Item $saida -ErrorAction SilentlyContinue
             return $p.ExitCode
