@@ -298,6 +298,35 @@ impl Servidor {
     }
 }
 
+/// Se as entradas novas vão presas ao autor. **Ainda não — e a razão é o outro lado.**
+///
+/// # A travessia, e porque é que ela tem dois passos
+///
+/// Prender a cifra ao autor (#197) muda o formato: uma entrada selada assim **não abre** numa
+/// versão que não conheça o truque. E a versão anterior não conhece — o `merge_verificado`
+/// dela filtra por um `crypto::open` sem dados associados, e o que não abre é deitado fora
+/// sem uma linha em lado nenhum.
+///
+/// Ou seja: se esta versão começasse já a escrever assim, cada mensagem que eu escrevesse
+/// desaparecia no caminho para quem ainda não tivesse actualizado. Não «chegava com erro» —
+/// desaparecia. Numa app de duas pessoas em dois continentes, isso é a pior avaria possível,
+/// e é exactamente a que este projecto passou versões a fechar.
+///
+/// O procedimento está escrito no plano de transição do `canonical()` e vale aqui tal e qual:
+///
+/// 1. **Primeiro publica-se uma versão que LÊ as duas formas e escreve a antiga.** É esta.
+///    A defesa contra o `ciphertext` copiado já está de pé para tudo o que chegue selado —
+///    o que falta é só passar a selar.
+/// 2. **Confirma-se que as duas máquinas estão nela.** A app diz a versão do outro lado
+///    desde a v0.18.0, e foi para isto que essa funcionalidade serve.
+/// 3. **Só então se põe isto a `true` e se publica.** A partir daí, quem não actualizou
+///    deixa de ler o que é novo — mas com a versão à frente dele no ecrã a dizer porquê, em
+///    vez de mensagens a evaporarem-se.
+///
+/// Deixar isto a `false` para sempre seria deixar o buraco aberto para sempre. É uma linha,
+/// e o dia de a mudar é o dia em que as duas casas estiverem na mesma versão.
+const ESCREVER_PRESO_AO_AUTOR: bool = false;
+
 /// Decifra a carga de uma entrada, aceitando as duas formas — e a leitura dupla é SEGURA.
 ///
 /// # Porque é que a alternativa não abre uma porta (#197)
@@ -540,12 +569,20 @@ impl Servidor {
     /// Cifra uma carga e junta-a ao log. Devolve a entrada para ser difundida aos peers.
     pub fn escrever(&mut self, signing: &SigningKey, carga: &Carga) -> Result<blog::Entry> {
         let claro = serde_json::to_vec(carga)?;
-        // Preso a QUEM escreve (#197): o mesmo ciphertext deixa de abrir sob outro nome.
-        let (nonce, ct) = crypto::seal_com(
-            &self.chave,
-            &claro,
-            signing.verifying_key().as_bytes().as_slice(),
-        )?;
+        // AINDA SEM O AUTOR — e a data de mudar isto é uma decisão, não um esquecimento.
+        //
+        // Ver [`ESCREVER_PRESO_AO_AUTOR`]. Esta versão LÊ as duas formas e ESCREVE a antiga,
+        // de propósito: escrever a nova hoje fazia a outra máquina — que ainda corre a
+        // versão anterior — deitar fora cada mensagem minha, em silêncio.
+        let (nonce, ct) = if ESCREVER_PRESO_AO_AUTOR {
+            crypto::seal_com(
+                &self.chave,
+                &claro,
+                signing.verifying_key().as_bytes().as_slice(),
+            )?
+        } else {
+            crypto::seal(&self.chave, &claro)?
+        };
         let e = self.log.append_local(signing, nonce, ct, agora_ms())?;
         self.provados.insert(e.author.clone());
         Ok(e)
@@ -1521,16 +1558,25 @@ mod testes {
             )
         };
 
+        // Selada COM o autor, à mão: é o que uma versão com o `ESCREVER_PRESO_AO_AUTOR`
+        // ligado produz. Esta versão ainda escreve à moda antiga (ver a nota lá em cima),
+        // mas a DEFESA — que é do lado da leitura — já está de pé, e é ela que se mede aqui.
+        let claro = serde_json::to_vec(&crate::modelo::Carga::Mensagem {
+            canal: "geral".into(),
+            texto: "olá a todos".into(),
+        })
+        .unwrap();
+        let (nonce_o, ct_o) = crypto::seal_com(
+            &chave,
+            &claro,
+            membro.signing.verifying_key().as_bytes().as_slice(),
+        )
+        .unwrap();
+
         let c1 = tmp("a");
-        let mut sala = sala_nova(&c1);
-        let original = sala
-            .escrever(
-                &membro.signing,
-                &crate::modelo::Carga::Mensagem {
-                    canal: "geral".into(),
-                    texto: "olá a todos".into(),
-                },
-            )
+        let mut log_dela = blog::Log::load(&c1).unwrap();
+        let original = log_dela
+            .append_local(&membro.signing, nonce_o, ct_o, 1000)
             .unwrap();
 
         // O forasteiro copia o `nonce` e o `ciphertext` — que é tudo o que ele vê no log — e
@@ -1573,6 +1619,64 @@ mod testes {
         for c in [c1, c2, c3, c4] {
             let _ = std::fs::remove_file(&c);
         }
+    }
+
+    /// O QUE ESTA VERSÃO ESCREVE CONTINUA A SER LEGÍVEL PELA ANTERIOR (#197).
+    ///
+    /// # Porque é que este teste é o mais importante dos três
+    ///
+    /// Os outros dois provam que a defesa funciona e que o passado continua a abrir. Este
+    /// prova que **a outra máquina continua a receber as minhas mensagens** — e é o que
+    /// impede esta correcção de ser uma avaria muito pior do que o defeito que fecha.
+    ///
+    /// Uma entrada selada com o autor não abre numa versão que não conheça o truque: o
+    /// `merge_verificado` da v0.18.3 filtra por um `crypto::open` sem dados associados, e o
+    /// que não abre é deitado fora sem uma linha em lado nenhum. Se esta versão já escrevesse
+    /// assim, cada mensagem minha desaparecia no caminho para quem ainda não actualizou.
+    ///
+    /// Por isso o `ESCREVER_PRESO_AO_AUTOR` está a `false`, e este teste é o portão que o
+    /// segura: no dia em que alguém o puser a `true`, isto falha e obriga a perguntar se as
+    /// duas casas já estão na mesma versão. É uma pergunta que tem de ser feita, e um teste
+    /// vermelho é a única forma de garantir que é.
+    #[test]
+    fn a_versao_anterior_continua_a_ler_o_que_esta_escreve() {
+        let chave = [13u8; 32];
+        let autor = crypto::Identity::from_seed(&[4u8; 32]);
+        let caminho =
+            std::env::temp_dir().join(format!("bruma-compat-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&caminho);
+
+        let mut srv = Servidor::novo(
+            "sala".into(),
+            chave,
+            blog::Log::load(&caminho).unwrap(),
+            Vec::new(),
+            None,
+            None,
+        );
+        let e = srv
+            .escrever(
+                &autor.signing,
+                &crate::modelo::Carga::Mensagem {
+                    canal: "geral".into(),
+                    texto: "a amiga tem de ler isto".into(),
+                },
+            )
+            .unwrap();
+
+        // Exactamente o que a v0.18.3 faz: `crypto::open` sem dados associados nenhuns.
+        let nonce = hex24(&e.nonce).unwrap();
+        let ct = HEXLOWER.decode(e.ciphertext.as_bytes()).unwrap();
+        let claro = crypto::open(&chave, &nonce, &ct).expect(
+            "a versao anterior TEM de conseguir abrir isto -- se falhou, o              ESCREVER_PRESO_AO_AUTOR foi ligado antes de as duas casas actualizarem",
+        );
+        let carga: crate::modelo::Carga = serde_json::from_slice(&claro).unwrap();
+        assert!(
+            matches!(carga, crate::modelo::Carga::Mensagem { ref texto, .. } if texto.contains("amiga")),
+            "e com o texto certo"
+        );
+
+        let _ = std::fs::remove_file(&caminho);
     }
 
     /// O HISTÓRICO ANTERIOR A ESTA VERSÃO CONTINUA A ABRIR (#197).
