@@ -1,0 +1,12 @@
+[package]
+name = "sonda-do-porteiro"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# Uma sonda que se liga ao Bruma e NAO colabora. Ver src/main.rs para o porque.
+
+[dependencies]
+iroh = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
