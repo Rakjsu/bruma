@@ -2662,10 +2662,27 @@ async function desenharDiagnostico() {
     const linha = elemento('div', 'diag__linha');
     linha.append(elemento('span', 'diag__quem', nomeDoPeer(e.peer)));
     const caminho = e.relay ? 'por relay' : 'direta';
-    const ms = e.ms ? ` · ${Math.round(e.ms)} ms` : '';
-    const voz_ = `voz ↑${e.enviados} ↓${e.recebidos}`;
-    const d = elemento('span', e.recebidos === 0 && e.enviados > 0 ? 'diag__mudo' : null,
-      `${caminho}${ms} · ${voz_}`);
+    // `null` é «ninguém mediu», e é diferente de zero (#171).
+    // «<1 ms» e não «0 ms»: um RTT medido que arredonda a zero escrevia exactamente o mesmo
+    // que um RTT inexistente, que é a confusão que o #171 existe para desfazer.
+    const ms = typeof e.ms === 'number' && e.ms > 0
+      ? ` · ${e.ms < 0.5 ? '<1' : Math.round(e.ms)} ms`
+      : ' · RTT por medir';
+    // O ACUMULADO E O AGORA (#33). Os totais só crescem: com «↑30000 ↓29000» o painel
+    // parecia saudável para sempre, mesmo que a voz dela tivesse morrido ao minuto dez. Os
+    // pacotes por segundo e o «há quanto tempo» dizem o presente.
+    const voz_ = `voz ↑${e.enviados} ↓${e.recebidos} (${e.envS}/s ↑, ${e.recS}/s ↓)`;
+    const mudoDesdeSempre = e.recebidos === 0 && e.enviados > 0;
+    const calouSeAgora = e.recebidos > 0 && e.recS === 0
+      && typeof e.haQuantoRec === 'number' && e.haQuantoRec > 3000;
+    const recusado = e.vozFalhados > 0 ? ` · ${e.vozFalhados} recusados pelo transporte` : '';
+    // A PERDA (#124). Até aqui era impossível: o receptor não tinha como distinguir «ele
+    // calou-se» de «perdi trinta pacotes». Agora o outro lado diz quantos mandou.
+    const perda = typeof e.perda === 'number'
+      ? ` · ${e.perda.toFixed(1)}% perdidos` : ' · perda por medir';
+    const desde = calouSeAgora ? ` · sem som há ${Math.round(e.haQuantoRec / 1000)} s` : '';
+    const d = elemento('span', (mudoDesdeSempre || calouSeAgora) ? 'diag__mudo' : null,
+      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}`);
     linha.append(d);
     alvo.append(linha);
   }
@@ -3402,6 +3419,25 @@ function painelDeVoz(chave, opcoes = {}) {
     const aviso = elemento('span', 'tile__sem-audio', 'sem áudio');
     aviso.title = partido;
     t.append(aviso);
+  } else {
+    // E O CASO MAIS PROVÁVEL, que não é o descodificador falhar (#165).
+    //
+    // É o codificador DELA ter morrido, o microfone dela ter desaparecido, ou os datagramas
+    // dela deixarem de chegar. Nesse caso ela continuava no painel, sem anel, exactamente
+    // igual a quem está calado de propósito. E são dois problemas com respostas opostas:
+    // a um espera-se, ao outro avisa-se a pessoa.
+    //
+    // Sessenta segundos e não trinta: com um portão no emissor, um minuto de silêncio real
+    // é possível, e a marca a aparecer em quem só ouve seria pior do que não existir.
+    const q = ultimoEstadoDaVoz.find(x => x.peer === chave);
+    if (q && q.recebidos > 0 && typeof q.haQuantoRec === 'number' && q.haQuantoRec > 60000) {
+      const min = Math.round(q.haQuantoRec / 60000);
+      const mudo = elemento('span', 'tile__sem-audio',
+        min <= 1 ? 'sem som há 1 min' : `sem som há ${min} min`);
+      mudo.title = 'Chegou som desta pessoa antes, e agora não chega. Ela pode estar a falar '
+        + 'sem saber que não sai nada.';
+      t.append(mudo);
+    }
   }
   t.append(elemento('span', 'tile__nome', nomeDoPeer(chave)));
   t.append(accoesDoPainel(chave, { transmite, aVer, temVideo }));
@@ -4089,19 +4125,60 @@ setInterval(verJogo, 5000);
  *  por um relay — que é a diferença entre o router ter sido furado ou não, e a coisa mais
  *  útil que se pode mostrar a quem está a queixar-se de que "está lento".
  */
+/* O último estado da voz, guardado para quem mais o quiser (o painel de rede, as marcas
+   por pessoa). É preenchido pelo `qualidadeDaLigacao`, que já corre de segundo a segundo. */
+let ultimoEstadoDaVoz = [];
+
+/** O que o rodapé diz sobre a chamada — ancorado no TRÁFEGO, não no RTT.
+ *
+ *  # A promessa que isto deixa de fazer (#32, #171)
+ *
+ *  Isto decidia a frase inteira a partir de duas coisas: se a ligação era por relay, e o
+ *  RTT. Nenhuma delas sabe se saiu ou entrou um pacote de som. O rodapé escrevia «Voz
+ *  conectada · 180 ms» com o codificador morto, com o microfone desaparecido, ou com o
+ *  `send_datagram` a falhar sempre — a promessa que o código não cumpre, no sítio mais
+ *  visível da app.
+ *
+ *  E `pior === 0` não queria dizer «zero milissegundos»: queria dizer «ninguém mediu». O
+ *  estado «não sei» pintava-se de verde. Agora o RTT vem `null` quando não foi medido, e
+ *  «ainda a medir» é um estado próprio, nem verde nem fraco.
+ *
+ *  A ordem das perguntas é a ordem da gravidade: primeiro «o meu som sai?», depois «o dele
+ *  chega?», e só no fim a qualidade do que está a passar.
+ */
 async function qualidadeDaLigacao() {
   const gente = [...voz.presentes.entries()].filter(([, c]) => c === voz.canal).map(([p]) => p);
-  if (!gente.length) return { ok: true, texto: 'Voz conectada' };
+  if (!gente.length) return { ok: true, texto: 'Sozinho na sala' };
 
   const estado = await invoke('qualidade', { peers: gente }).catch(() => null);
   if (!estado || !estado.length) return { ok: false, texto: 'A ligar…' };
+  ultimoEstadoDaVoz = estado;
+
+  // 1. O TRANSPORTE RECUSA A MINHA VOZ? É a avaria mais grave e a mais calada: o
+  //    `send_datagram` falha, ninguém conta, e a app diz que está tudo bem.
+  const recusa = estado.find(e => e.vozFalhados > 20 && e.envS === 0);
+  if (recusa) return { ok: false, texto: 'A tua voz não está a sair desta máquina' };
+
+  // 2. SAI DAQUI E NÃO VOLTA NADA? Distinto de «ninguém fala»: só conta se EU estiver a
+  //    mandar. Se ninguém manda, não há nada a concluir.
+  const aMandar = estado.some(e => e.envS > 0);
+  const aReceber = estado.some(e => e.recS > 0);
+  if (aMandar && !aReceber) {
+    return { ok: false, texto: 'Estás a falar e não chega nada de volta' };
+  }
 
   const relay = estado.some(e => e.relay);
-  const pior = Math.max(0, ...estado.map(e => e.ms || 0));
-  if (!pior) return { ok: true, texto: relay ? 'Voz conectada · por relay' : 'Voz conectada' };
+  const medidos = estado.map(e => e.ms).filter(m => typeof m === 'number' && m > 0);
+  const sufixo = relay ? ' · por relay' : '';
+
+  // 3. AINDA SEM MEDIDA: nem verde nem fraco. Zero é ausência, não excelência.
+  if (!medidos.length) {
+    return { ok: null, texto: `Voz conectada · ainda a medir${sufixo}` };
+  }
+  const pior = Math.max(...medidos);
   return {
     ok: pior < 250 && !relay,
-    texto: `Voz conectada · ${Math.round(pior)} ms${relay ? ' · por relay' : ''}`,
+    texto: `Voz conectada · ${Math.round(pior)} ms${sufixo}`,
   };
 }
 
@@ -4116,8 +4193,11 @@ async function desenharRodape() {
 
     const q = await qualidadeDaLigacao();
     $('#ligacao-estado').textContent = q.texto;
-    $('#ligacao-estado').classList.toggle('is-fraco', !q.ok);
-    $('#ligacao-sinal').classList.toggle('is-fraco', !q.ok);
+    // `ok === null` é o estado «ainda a medir»: nem verde nem fraco. Pintá-lo de verde era
+    // exactamente o que o #171 descreve — dizer «bom» sobre uma coisa que não se sabe.
+    $('#ligacao-estado').classList.toggle('is-fraco', q.ok === false);
+    $('#ligacao-sinal').classList.toggle('is-fraco', q.ok === false);
+    $('#ligacao-sinal').classList.toggle('is-neutro', q.ok === null);
 
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
     $('#btn-partilhar').classList.toggle('is-cortado', !!partilhaFalhou);
@@ -5048,7 +5128,22 @@ function pararDeAssistir() {
       const gente = [...voz.presentes.keys()];
       const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
       const resumo = estado.map(e =>
+        // Os RITMOS e não só os totais (#33): é isto que distingue «a chamada está viva»
+        // de «a chamada esteve viva». E os recusados pelo transporte (#34), que até agora
+        // não eram contados em lado nenhum — um par que recuse todos os datagramas dava
+        // exactamente o mesmo que um par calado.
         `${e.peer.slice(0, 6)} ${e.relay ? 'relay' : 'direta'} ↑${e.enviados} ↓${e.recebidos}`
+        + ` (${e.envS}/s ↑, ${e.recS}/s ↓)`
+        + ` rtt=${typeof e.ms === 'number' && e.ms > 0
+          ? (e.ms < 0.5 ? '<1ms' : Math.round(e.ms) + 'ms') : 'por-medir'}`
+        // «datagramas-nao-saidos» e nao «recusados»: o guiao do teste de par procura a
+        // palavra «recus» no registo para contar recusas do porteiro, e este texto fazia-o
+        // acusar seis recusas que nunca existiram. Um medidor que dispara sobre si proprio
+        // deixa de saber dizer quando ha mesmo alguma coisa.
+        + ` datagramas-nao-saidos=${e.vozFalhados}`
+        + ` perda=${typeof e.perda === 'number' ? e.perda.toFixed(1) + '%' : 'por medir'}`
+        + ` ele-diz-ter-mandado=${e.disseTerEnviado}`
+        + ` ultimo-rec=${typeof e.haQuantoRec === 'number' ? e.haQuantoRec + 'ms' : 'nunca'}`
       ).join(' | ');
       const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
       // O que interessa na câmara é o mesmo que interessa no ecrã: não "chegaram bytes",

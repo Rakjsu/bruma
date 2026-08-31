@@ -1427,3 +1427,7 @@ body.ghost .app { transition: filter .8s var(--ease); }
   background: color-mix(in srgb, var(--fundo-2, #2b2d31) 70%, transparent);
   border-radius: 10px;
 }
+
+/* O sinal «ainda a medir» (#171): nem verde nem fraco. Zero milissegundos e «ninguém mediu»
+   davam a mesma cor, e uma delas é uma promessa que não se pode fazer. */
+.is-neutro { opacity: .55; filter: grayscale(1); }

@@ -1441,24 +1441,46 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
             let (c, _) = ligacoes.get(p)?;
             let caminhos = c.paths();
             let escolhido = caminhos.iter().find(|x| x.is_selected());
+            // ZERO NÃO É «ZERO MILISSEGUNDOS», É «NINGUÉM MEDIU» (#171).
+            //
+            // O rodapé fazia `pior = max(0, ...ms)` e, se desse zero, escrevia «Voz
+            // conectada» a verde. Mas zero é o valor que sai quando não há caminho escolhido
+            // ou o RTT ainda não existe — ou seja, o estado «não sei» pintava-se de «óptimo».
+            // Agora o RTT é `null` quando não foi medido, e quem lê tem de decidir o que
+            // fazer com isso em vez de o confundir com um bom resultado.
             let (relay, ms) = match escolhido {
                 Some(x) => (
                     x.is_relay(),
-                    c.rtt(x.id())
-                        .map(|d| d.as_secs_f64() * 1000.0)
-                        .unwrap_or(0.0),
+                    c.rtt(x.id()).map(|d| d.as_secs_f64() * 1000.0),
                 ),
-                None => (false, 0.0),
+                None => (false, None),
             };
+            let agora = std::time::Instant::now();
             let n = rede
                 .contagem
                 .lock()
                 .ok()
-                .and_then(|c| c.get(p).copied())
+                .map(|mut c| {
+                    let e = c.entry(p.clone()).or_default();
+                    e.recalcular_ritmo(agora);
+                    (*e, e.ha_quanto_rec(agora))
+                })
                 .unwrap_or_default();
+            let (n, ha_quanto) = n;
             Some(serde_json::json!({
                 "peer": p, "relay": relay, "ms": ms,
                 "enviados": n.voz_env, "recebidos": n.voz_rec,
+                // O que o painel precisa para falar do AGORA e não do acumulado (#32, #33):
+                // pacotes por segundo em cada sentido, há quanto tempo chegou o último, e
+                // quantos o transporte recusou (#34).
+                "envS": n.env_s, "recS": n.rec_s,
+                "haQuantoRec": ha_quanto,
+                "vozFalhados": n.voz_falhados,
+                // A PERDA (#124): `null` enquanto o outro lado não tiver dito quantos
+                // mandou. Ausência de medida não é zero por cento — é a mesma distinção do
+                // RTT, e a mesma tentação de a pintar de bom resultado.
+                "perda": n.perda_por_cento(),
+                "disseTerEnviado": n.disse_ter_enviado,
                 "ecraEnviado": n.ecra_env, "ecraRecebido": n.ecra_rec,
             }))
         })

@@ -144,6 +144,32 @@ pub enum Msg {
     /// Com ela, o que não se conhece é ignorado e a conversa continua. Não salva as versões
     /// já instaladas — salva todas as que vierem a seguir, e é por isso que entra sozinha e
     /// antes de tudo o resto.
+    /// «Mandei-te N pedaços de voz» — o que torna a perda MEDÍVEL (#124).
+    ///
+    /// # Porque é que isto vai pelo controlo e não dentro do datagrama
+    ///
+    /// O backlog pede um número de sequência à frente de cada datagrama de voz. Dá o mesmo
+    /// número e mais algum (ordem, duplicados) — e parte o áudio de quem ainda não
+    /// actualizou: um par na versão anterior lê os bytes do cabeçalho como se fossem Opus e
+    /// faz BARULHO. Silêncio é mau; barulho na coluna de alguém é pior, e não há sítio no
+    /// datagrama onde se possa pôr uma marca que o Opus não possa legitimamente ter.
+    ///
+    /// Isto dá a percentagem de perda — que era o objectivo — sem tocar no fio: quem manda
+    /// diz, de dois em dois segundos, quantos pedaços já mandou naquela sala. Quem recebe
+    /// compara com os que contou. A diferença é a perda, e passa a haver um número onde havia
+    /// um palpite.
+    ///
+    /// E é seguro desde já: o `#[serde(other)] Desconhecida` existe desde a v0.18.0, portanto
+    /// qualquer versão publicada a ignora sem cair. Não precisa de travessia nenhuma.
+    ///
+    /// O que ISTO não dá é a ordem: um pedaço que chegue fora de ordem continua a ser tocado
+    /// fora de ordem. Essa metade precisa mesmo do cabeçalho, e do procedimento de duas
+    /// versões que o `ESCREVER_PRESO_AO_AUTOR` já documenta para a cifra.
+    Vozes {
+        servidor: String,
+        canal: String,
+        enviados: u64,
+    },
     /// «Não aceito conversas de quem não conheço» — dito, em vez de silêncio (#131).
     ///
     /// # A avaria que isto fecha
@@ -172,6 +198,13 @@ pub enum Msg {
 pub enum Saida {
     Entrada(String, blog::Entry),
     Presenca(String, Option<String>),
+    /// «Mandei-te N pedaços de voz» — dirigido a UM peer (#124).
+    Vozes {
+        para: String,
+        servidor: String,
+        canal: String,
+        enviados: u64,
+    },
     /// «Não te aceito» — dirigido a UM peer (#131).
     Recusa {
         para: String,
@@ -216,6 +249,84 @@ pub struct Contagem {
     pub voz_rec: u64,
     pub ecra_env: u64,
     pub ecra_rec: u64,
+    /// Quantos datagramas de voz o `send_datagram` RECUSOU (#34).
+    ///
+    /// Só se contava o que saía bem. O ramo do erro não existia — não contava, não registava,
+    /// não avisava. Uma perda ocasional por buffer cheio é legítima (uma partilha de ecrã a 60
+    /// fps ao lado enche-o), mas uma recusa PERMANENTE — um par cujo transporte não aceita
+    /// datagramas de todo — dava exactamente a mesma coisa: silêncio, com a app a dizer «Voz
+    /// conectada».
+    ///
+    /// Com este número ao lado do `voz_env`, os dois casos deixam de se confundir: um é uns
+    /// poucos em milhares, o outro é todos.
+    pub voz_falhados: u64,
+    /// Quando saiu e quando entrou o ÚLTIMO datagrama de voz, e o que os contadores diziam há
+    /// um segundo (#33).
+    ///
+    /// # A avaria que isto torna visível
+    ///
+    /// Os contadores só crescem, desde que a ligação abriu. O painel só marcava «mudo» quando
+    /// `recebidos == 0 && enviados > 0` — ou seja, só apanhava a avaria que existiu desde o
+    /// primeiro segundo. Se a voz da outra pessoa morresse ao minuto dez, o painel mostrava
+    /// «↑30000 ↓29000» e parecia saudável para sempre.
+    ///
+    /// Um total não sabe dizer «agora». Um instante sabe.
+    pub ultimo_env: Option<std::time::Instant>,
+    pub ultimo_rec: Option<std::time::Instant>,
+    /// A fotografia de há um segundo, para se poder dizer o RITMO e não só o acumulado.
+    marca: Option<(std::time::Instant, u64, u64)>,
+    /// Pacotes por segundo, calculados na última vez que alguém perguntou.
+    pub env_s: u64,
+    pub rec_s: u64,
+    /// Quantos pedaços de voz este par DIZ ter-me mandado (#124).
+    ///
+    /// Vem do `Msg::Vozes` dele. A diferença para o `voz_rec` é a perda — e é o único sítio
+    /// de onde ela pode vir: o receptor, sozinho, não tem como distinguir «ele calou-se» de
+    /// «perdi trinta pacotes».
+    pub disse_ter_enviado: u64,
+}
+
+impl Contagem {
+    /// Actualiza o ritmo, se já passou tempo suficiente desde a última vez.
+    ///
+    /// Corre quando a interface pergunta (uma vez por segundo), e não a cada datagrama: a cada
+    /// datagrama seriam cinquenta divisões por segundo por par, num mutex que já é o mais
+    /// disputado da app. Aqui é uma por pergunta.
+    pub fn recalcular_ritmo(&mut self, agora: std::time::Instant) {
+        match self.marca {
+            Some((quando, env, rec)) => {
+                let dt = agora.duration_since(quando).as_secs_f64();
+                if dt >= 1.0 {
+                    self.env_s = ((self.voz_env - env) as f64 / dt).round() as u64;
+                    self.rec_s = ((self.voz_rec - rec) as f64 / dt).round() as u64;
+                    self.marca = Some((agora, self.voz_env, self.voz_rec));
+                }
+            }
+            None => self.marca = Some((agora, self.voz_env, self.voz_rec)),
+        }
+    }
+
+    /// A perda, em percentagem, se houver com que a calcular (#124).
+    ///
+    /// `None` quando o outro lado ainda não disse nada — e isso NÃO é zero por cento. É a
+    /// mesma distinção do RTT: a ausência de medida não se pinta de bom resultado.
+    ///
+    /// O valor é aparado a zero em baixo porque as duas contagens não são tiradas no mesmo
+    /// instante: o anúncio dele viaja, e nesse tempo podem chegar mais pedaços. Uma perda
+    /// «negativa» é o relógio, não a rede.
+    pub fn perda_por_cento(&self) -> Option<f64> {
+        if self.disse_ter_enviado == 0 {
+            return None;
+        }
+        let perdidos = self.disse_ter_enviado.saturating_sub(self.voz_rec);
+        Some((perdidos as f64 * 100.0 / self.disse_ter_enviado as f64).clamp(0.0, 100.0))
+    }
+
+    /// Há quantos milissegundos chegou o último datagrama de voz deste par, se algum chegou.
+    pub fn ha_quanto_rec(&self, agora: std::time::Instant) -> Option<u64> {
+        self.ultimo_rec
+            .map(|t| agora.duration_since(t).as_millis() as u64)
+    }
 }
 
 pub struct Rede {
@@ -495,11 +606,20 @@ impl Rede {
             return;
         };
         let bytes = bytes::Bytes::copy_from_slice(dados);
+        let agora = std::time::Instant::now();
         for p in para {
             if let Some((c, _)) = ligacoes.get(p) {
-                if c.send_datagram(bytes.clone()).is_ok() {
-                    if let Ok(mut n) = self.contagem.lock() {
-                        n.entry(p.clone()).or_default().voz_env += 1;
+                // O ramo do ERRO passa a existir (#34). Uma recusa ocasional é normal sob
+                // carga; todas as recusas seguidas são um par que não recebe voz nenhuma, e
+                // até aqui as duas davam o mesmo: silêncio.
+                let saiu = c.send_datagram(bytes.clone()).is_ok();
+                if let Ok(mut n) = self.contagem.lock() {
+                    let e = n.entry(p.clone()).or_default();
+                    if saiu {
+                        e.voz_env += 1;
+                        e.ultimo_env = Some(agora);
+                    } else {
+                        e.voz_falhados += 1;
                     }
                 }
             }
@@ -1001,6 +1121,48 @@ async fn sessao(
         }
     }
 
+    // O ANÚNCIO DE QUANTOS PEDAÇOS DE VOZ MANDEI (#124).
+    //
+    // De dois em dois segundos, e só enquanto houver voz a sair para este par. É o que dá ao
+    // outro lado a metade que lhe falta para calcular a perda: ele conta os que chegaram, eu
+    // digo quantos saíram, e a diferença é o que se perdeu no caminho. Sem isto, o receptor
+    // não tem como distinguir «ele calou-se» de «perdi trinta pacotes».
+    //
+    // Dois segundos é o intervalo em que um número destes ainda é útil e não enche nada: são
+    // uns 100 bytes a cada dois segundos, contra os ~24 kbps da própria voz.
+    {
+        let rede_vozes = rede.clone();
+        let quem = peer.clone();
+        guarda.tarefas.push(tokio::spawn(async move {
+            let mut ultimo = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let onde = rede_vozes.presenca.lock().ok().and_then(|p| p.clone());
+                let Some((servidor, Some(canal))) = onde else {
+                    continue;
+                };
+                let enviados = rede_vozes
+                    .contagem
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.get(&quem).map(|n| n.voz_env))
+                    .unwrap_or(0);
+                // Nada mudou desde o último anúncio: não se diz outra vez. Numa sala em
+                // silêncio isto cala-se sozinho, em vez de repetir o mesmo número.
+                if enviados == ultimo {
+                    continue;
+                }
+                ultimo = enviados;
+                let _ = rede_vozes.tx.send(Saida::Vozes {
+                    para: quem.clone(),
+                    servidor,
+                    canal,
+                    enviados,
+                });
+            }
+        }));
+    }
+
     // O PRAZO SÓ SE APLICA A QUEM AINDA NÃO É DE CASA — e essa isenção não é cortesia.
     //
     // A primeira versão disto armava o prazo para toda a gente, e matava sessões legítimas.
@@ -1117,7 +1279,11 @@ async fn sessao(
                 continue;
             }
             if let Ok(mut n) = contagem.contagem.lock() {
-                n.entry(voz_peer.clone()).or_default().voz_rec += 1;
+                let e = n.entry(voz_peer.clone()).or_default();
+                e.voz_rec += 1;
+                // O INSTANTE, e não só a soma (#33). É ele que distingue «ele está calado»
+                // de «ele acha que está a falar» — dois problemas com respostas opostas.
+                e.ultimo_rec = Some(std::time::Instant::now());
             }
             crate::comandos::voz_recebida(&voz_peer, &d);
         }
@@ -1359,6 +1525,27 @@ async fn sessao(
                         &mut orcamento,
                     );
                 }
+                Ok(Quadro::Controlo(Msg::Vozes {
+                    servidor,
+                    canal,
+                    enviados,
+                })) => {
+                    // SÓ DE QUEM ESTÁ NA SALA (#124). Um anúncio inflacionado de um estranho
+                    // faria a perda parecer enorme — e a perda é um número que se olha para
+                    // decidir se a chamada está má. Passa pelo mesmo `participa` que a
+                    // presença e o vídeo.
+                    if participa(&leitura_app, &servidor, &peer_leitura) {
+                        let _ = &canal;
+                        if let Ok(mut n) = rede_leitura.contagem.lock() {
+                            let e = n.entry(peer_leitura.clone()).or_default();
+                            // Só sobe. Um anúncio que venha atrás de outro — reordenação no
+                            // controlo, ou uma sessão nova a recomeçar a contagem — não pode
+                            // fazer a perda saltar para negativo e ser aparada a zero,
+                            // escondendo a perda real que havia antes.
+                            e.disse_ter_enviado = e.disse_ter_enviado.max(enviados);
+                        }
+                    }
+                }
                 Ok(Quadro::Controlo(Msg::Recusa { servidor })) => {
                     // A RECUSA SÓ CONTA SE VIER DE QUEM PODIA RECUSAR (#131).
                     //
@@ -1494,6 +1681,17 @@ async fn sessao(
                             }
                         }
                         Saida::SyncPara { .. } => None,
+                        Saida::Vozes {
+                            para,
+                            servidor,
+                            canal,
+                            enviados,
+                        } if para == peer => Some(Quadro::Controlo(Msg::Vozes {
+                            servidor,
+                            canal,
+                            enviados,
+                        })),
+                        Saida::Vozes { .. } => None,
                         Saida::Recusa { para, servidor } if para == peer => {
                             Some(Quadro::Controlo(Msg::Recusa { servidor }))
                         }
@@ -2118,6 +2316,7 @@ fn nome_da_msg(m: &Msg) -> &'static str {
         Msg::Presenca { .. } => "Presenca",
         Msg::Sinal { .. } => "Sinal",
         Msg::Recusa { .. } => "Recusa",
+        Msg::Vozes { .. } => "Vozes",
         Msg::Desconhecida => "Desconhecida",
     }
 }
@@ -2899,6 +3098,117 @@ mod testes {
         assert!(
             !ha_estranhos_a_mais(&app, &multidao, &amigo),
             "quem partilha sala comigo entra sempre, e é a esses que o vigia disca"
+        );
+    }
+
+    /// O RITMO É O PRESENTE; O TOTAL É O PASSADO (#33).
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// Os contadores só crescem desde que a ligação abriu. O painel marcava «mudo» só quando
+    /// `recebidos == 0 && enviados > 0` — ou seja, apanhava a avaria que existiu desde o
+    /// primeiro segundo e mais nenhuma. Se a voz da outra pessoa morresse ao minuto dez, o
+    /// painel mostrava «↑30000 ↓29000» e parecia saudável para sempre.
+    ///
+    /// Um total não sabe dizer «agora». O que este teste prende é que o ritmo sabe: depois de
+    /// o outro lado se calar, o `rec_s` cai a zero enquanto o `voz_rec` continua grande.
+    #[test]
+    fn o_ritmo_cai_a_zero_quando_a_voz_para_mesmo_com_o_total_grande() {
+        let t0 = std::time::Instant::now();
+        // Dez minutos de conversa já feitos: os totais estão altos.
+        let mut c = Contagem {
+            voz_env: 30_000,
+            voz_rec: 29_000,
+            ..Default::default()
+        };
+        c.recalcular_ritmo(t0); // primeira vez: só tira a fotografia
+
+        // Um segundo depois, com cinquenta pacotes em cada sentido.
+        c.voz_env += 50;
+        c.voz_rec += 50;
+        c.recalcular_ritmo(t0 + std::time::Duration::from_secs(1));
+        assert_eq!((c.env_s, c.rec_s), (50, 50), "a conversa a decorrer");
+
+        // E agora ele cala-se: eu continuo a mandar, dele não vem nada.
+        c.voz_env += 50;
+        c.recalcular_ritmo(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(c.env_s, 50, "eu continuo a falar");
+        assert_eq!(
+            c.rec_s, 0,
+            "e dele já não vem nada — que é o que o total esconderia"
+        );
+        assert!(
+            c.voz_rec > 29_000,
+            "o total continua grande, e continua a parecer saudável"
+        );
+    }
+
+    /// «Há quanto tempo» só existe depois de ter chegado alguma coisa.
+    ///
+    /// Zero segundos e «nunca chegou nada» são estados diferentes, e confundi-los é a mesma
+    /// família de erro do RTT a zero (#171): um deles é uma medida, o outro é a ausência dela.
+    #[test]
+    fn ha_quanto_rec_distingue_nunca_de_agora_mesmo() {
+        let t0 = std::time::Instant::now();
+        let mut c = Contagem::default();
+        assert_eq!(
+            c.ha_quanto_rec(t0),
+            None,
+            "nunca chegou nada: não há resposta"
+        );
+
+        c.ultimo_rec = Some(t0);
+        assert_eq!(c.ha_quanto_rec(t0), Some(0), "acabou de chegar");
+        assert_eq!(
+            c.ha_quanto_rec(t0 + std::time::Duration::from_secs(90)),
+            Some(90_000),
+            "e noventa segundos depois, noventa mil milissegundos"
+        );
+    }
+
+    /// A PERDA SÓ EXISTE COM AS DUAS METADES (#124).
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O receptor conta os pedaços que chegaram e mais nada. Com esse número sozinho não há
+    /// como distinguir «ele calou-se» de «perdi trinta pacotes» — e num percurso EUA-Brasil
+    /// por relay a segunda hipótese é rotina. A app dizia «Voz conectada» nas duas.
+    ///
+    /// A metade que faltava é o emissor dizer quantos mandou. Aí a subtracção é a perda, e
+    /// passa a haver um número onde havia um palpite.
+    ///
+    /// E há três casos que NÃO podem virar «0%», que é o erro fácil: ninguém disse nada
+    /// ainda, chegaram mais do que os anunciados (o anúncio viaja, e entretanto chegam
+    /// mais), e nada se perdeu de facto. O primeiro é ausência de medida e tem de o dizer.
+    #[test]
+    fn a_perda_precisa_das_duas_metades_e_ausencia_nao_e_zero() {
+        // Chegaram 500 e ele ainda não disse nada: não há perda para calcular, e isso NÃO é
+        // zero por cento.
+        let mut c = Contagem {
+            voz_rec: 500,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.perda_por_cento(),
+            None,
+            "sem o anúncio dele não há medida — e ausência de medida não se pinta de bom"
+        );
+
+        // Ele diz ter mandado 1000; chegaram 500. Metade perdeu-se.
+        c.disse_ter_enviado = 1000;
+        assert_eq!(c.perda_por_cento(), Some(50.0));
+
+        // Chegou tudo.
+        c.voz_rec = 1000;
+        assert_eq!(c.perda_por_cento(), Some(0.0));
+
+        // E o caso do relógio: o anúncio dele viaja, e entretanto chegaram mais. Uma perda
+        // «negativa» é o desencontro dos instantes, não a rede — apara-se a zero.
+        c.voz_rec = 1200;
+        assert_eq!(
+            c.perda_por_cento(),
+            Some(0.0),
+            "mais do que os anunciados é o relógio, não uma perda negativa"
         );
     }
 
