@@ -250,6 +250,12 @@ function desenharConversas() {
     // pessoa é um gesto muito maior, e até aqui era o único que havia.
     l.oncontextmenu = ev => {
       ev.preventDefault();
+      // E PARA A PROPAGAÇÃO. Sem isto o menu era construído e destruído no mesmo instante:
+      // o ouvinte global de `contextmenu` corre a seguir (fase de bolha), a linha da conversa
+      // tem a classe `.member` e o `closest('.member')` dele acerta, e o `abrirMenu` começa
+      // por limpar o menu inteiro. Nem um piscar se via — só o menu errado, sem o «Apagar
+      // esta conversa». A funcionalidade estava morta do lado de quem a usa.
+      ev.stopPropagation();
       abrirMenu(ev.clientX, ev.clientY, [
         { rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(c.com) },
         '-',
@@ -417,6 +423,8 @@ async function desenharMensagens() {
   }
 
   await escreverMensagens(stream, msgs, s.id, canal.id);
+  // Os avisos do sistema (#196, #131) voltam a seguir ao redesenho que os teria apagado.
+  pintarAvisos();
 }
 
 /** Escreve a lista de mensagens no stream, com a linha de «novas mensagens» no sítio.
@@ -554,6 +562,7 @@ async function desenharMensagensPrivadas() {
   $('#entrada').placeholder = `Mensagem para ${c.nome}`;
   const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
   await escreverMensagens(stream, msgs, c.id, c.canal);
+  pintarAvisos();
 }
 
 /** A lista de pessoas que EU decidi conhecer.
@@ -3867,14 +3876,38 @@ function desenharNaChamada() {
  *  máquina diz respeito.
  */
 function avisoNaConversa(id, texto) {
+  // O REDESENHO CHEGA PRIMEIRO, E É POR ISSO QUE ISTO ESPERA.
+  //
+  // O `aplicar` do lado do Rust emite `servidor-mudou` e logo a seguir o aviso. O primeiro
+  // dispara um `desenharTudo`, que limpa o `#stream` e o reconstrói — e limpava o aviso
+  // milissegundos depois de ele ser escrito. Ninguém o via, e eu tinha-o dado por feito.
+  //
+  // Guarda-se numa fila por sala e pinta-se DEPOIS do redesenho, com um `setTimeout(0)` que
+  // o põe atrás do trabalho já agendado. A fila é o que faz o aviso sobreviver a um
+  // redesenho que ainda não aconteceu, em vez de depender de quem chega primeiro.
+  const fila = avisosPendentes.get(id) || [];
+  fila.push(texto);
+  avisosPendentes.set(id, fila);
+  setTimeout(pintarAvisos, 0);
+}
+
+/** Os avisos por sala/conversa, à espera de caber no ecrã. */
+const avisosPendentes = new Map();
+
+function pintarAvisos() {
   const zona = $('#stream');
   if (!zona) return;
-  // Só se mostra se for a sala/conversa que está aberta — um aviso sobre outra sala no meio
-  // desta conversa seria ruído no sítio errado.
+  // Só se mostram os da sala/conversa ABERTA — um aviso sobre outra sala no meio desta
+  // conversa seria ruído no sítio errado. Os outros ficam na fila até lá se ir.
   const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
-  if (aberto !== id) return;
-  const linha = elemento('div', 'aviso-sistema', texto);
-  zona.append(linha);
+  const fila = avisosPendentes.get(aberto);
+  if (!fila || !fila.length) return;
+  for (const texto of fila) {
+    // Não se repete o mesmo aviso: um redesenho a meio podia trazer a fila outra vez.
+    if ([...zona.querySelectorAll('.aviso-sistema')].some(n => n.textContent === texto)) continue;
+    zona.append(elemento('div', 'aviso-sistema', texto));
+  }
+  avisosPendentes.set(aberto, []);
   zona.scrollTop = zona.scrollHeight;
 }
 

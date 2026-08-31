@@ -340,14 +340,25 @@ const ESCREVER_PRESO_AO_AUTOR: bool = false;
 ///
 /// | a entrada | com AAD | sem AAD | resultado |
 /// |---|---|---|---|
-/// | nova, autor certo | abre | — | aceite |
-/// | nova, `ciphertext` copiado sob outro autor | falha | falha | **recusada** |
-/// | antiga (anterior a esta versão) | falha | abre | aceite |
+/// | selada com o autor certo | abre | — | aceite |
+/// | selada, mas copiada sob outro autor | falha | falha | **recusada** |
+/// | selada sem autor (antiga, ou desta versão) | falha | abre | aceite |
 ///
-/// O único conjunto que continua copiável é o das entradas escritas ANTES desta versão — um
-/// conjunto fechado, que não cresce, e que aqui são poucas dezenas. O `else` some no dia em
-/// que essas deixarem de importar; até lá, tirá-lo custava o histórico todo e não fechava
-/// nada que já não esteja fechado.
+/// # E o que isto NÃO protege hoje — que é preciso dizer com todas as letras
+///
+/// Enquanto o [`ESCREVER_PRESO_AO_AUTOR`] estiver a `false`, **esta versão não sela nada com
+/// o autor**. Logo nenhuma entrada que ela produza cai na primeira linha da tabela: todas
+/// caem na terceira, e uma cópia delas sob outro nome continua a abrir pelo `else` e continua
+/// a tornar quem a mandou um membro provado.
+///
+/// Ou seja: o ataque do `ciphertext` copiado **ainda não está fechado em produção**. O que
+/// está feito é a metade que não parte nada — o lado da leitura, que reconhece e protege o
+/// que vier selado. A outra metade é uma linha, e o dia dela está escrito no
+/// `ESCREVER_PRESO_AO_AUTOR`: quando as duas casas estiverem na mesma versão.
+///
+/// Escrever isto aqui em vez de deixar a tabela sozinha não é pedantismo. Uma tabela que
+/// descreve a defesa completa, ao lado de código que só entrega metade, é a forma mais fácil
+/// de alguém — eu, daqui a três meses — ler «recusada» e dar o problema por resolvido.
 fn decifrar_carga(chave: &[u8; 32], e: &blog::Entry) -> Option<Vec<u8>> {
     let nonce = hex24(&e.nonce).ok()?;
     let ct = HEXLOWER.decode(e.ciphertext.as_bytes()).ok()?;
@@ -1040,10 +1051,13 @@ impl App {
             }
             s.remove(id);
         }
-        self.lido
-            .lock()
-            .map_err(|_| anyhow!("estado partido"))?
-            .remove(id);
+        // O `lido` é indexado por «id/canal» e não por id: um `remove(id)` não apagava nada,
+        // e uma conversa apagada que voltasse a nascer herdava as marcas de leitura da antiga.
+        {
+            let mut l = self.lido.lock().map_err(|_| anyhow!("estado partido"))?;
+            let prefixo = format!("{id}/");
+            l.retain(|k, _| k != id && !k.starts_with(&prefixo));
+        }
         // O índice PRIMEIRO: se a gravação falhar, a conversa volta no arranque seguinte com
         // o log ao lado, que é melhor do que um índice sem chave e um ficheiro que já não
         // abre. Ver a ordem em `gravar_semente`.

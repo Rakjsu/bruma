@@ -980,7 +980,11 @@ async fn sessao(
     // Quem é de casa nunca é recusado. Quem não é, e chega quando já há cinco desconhecidos
     // pendurados, leva com a porta na cara — e a porta diz porquê no registo, senão isto
     // seria mais um desaparecimento sem explicação.
-    {
+    //
+    // E só nas ligações que ENTRAM. Uma que eu inicio foi decisão minha — o vigia só disca a
+    // quem está nos `peers` de alguma sala minha, ou a um amigo — e recusá-la seria o tecto a
+    // cortar-me a mim próprio por eu ter tido azar na ordem das ligações.
+    if !iniciei {
         let ligados: Vec<String> = rede
             .ligacoes
             .lock()
@@ -996,6 +1000,37 @@ async fn sessao(
             return Ok(());
         }
     }
+
+    // O PRAZO SÓ SE APLICA A QUEM AINDA NÃO É DE CASA — e essa isenção não é cortesia.
+    //
+    // A primeira versão disto armava o prazo para toda a gente, e matava sessões legítimas.
+    // A bandeira `ola_chegou` só é levantada pelo LEITOR, e o leitor só nasce depois de o
+    // sync inicial inteiro ter saído: um `await` por cada lote de 256 KiB, por cada sala
+    // partilhada. Este mesmo ficheiro dá 20 s a CADA um desses quadros, e a razão escrita ao
+    // lado do `prazo_de_escrita` é «um sync legítimo entre o Brasil e os EUA pode ser grande
+    // e lento». Dois lotes lentos e o prazo de 30 s estoura — com o `Ola` do outro lado a ter
+    // chegado no primeiro segundo, à espera de ser lido.
+    //
+    // O resultado seria um par derrubado a meio do sync, a religar-se, a recomeçar do
+    // princípio e a ser cortado outra vez. Para sempre. E não apareceu na medição porque a
+    // cópia dos dados reais tem 115 entradas, onde esse passo é instantâneo.
+    //
+    // A correcção é a isenção, e ela CHEGA — não por sorte, mas por uma propriedade que já
+    // existia: para um desconhecido não há sync nenhum a escrever. O `pacotes` só junta salas
+    // onde o par já é conhecido, e a `Presenca` só sai a quem `participa`. Ou seja, o caminho
+    // entre armar o prazo e nascer o leitor é, para um desconhecido, o `Ola` e mais nada.
+    // Trinta segundos continuam a ser de sobra para isso.
+    //
+    // Quem tem um sync grande à frente é sempre gente de casa — e essa não é vigiada. É a
+    // mesma isenção que o tecto aqui em cima já tinha, e cuja ausência aqui era a assimetria
+    // que devia ter-me saltado à vista.
+    //
+    // (Considerei mover o leitor para antes do sync, que tornaria a bandeira independente
+    // disto tudo. Não o fiz: é uma reordenação de uma função que já foi reordenada uma vez
+    // nesta mesma fase, e o proveito seria zero enquanto a isenção estiver de pé. Fica dito
+    // para o dia em que alguém queira vigiar também os de casa — nesse dia, o leitor tem de
+    // subir primeiro.)
+    let vigiar_o_prazo = !e_de_casa(&app, &peer);
 
     // O PRAZO PARA PROVAR QUE É GENTE (#195) — armado ANTES da espera pelo stream.
     //
@@ -1014,7 +1049,7 @@ async fn sessao(
         let quem = peer.clone();
         guarda.tarefas.push(tokio::spawn(async move {
             tokio::time::sleep(PRAZO_DO_OLA).await;
-            if !ola_chegou.load(std::sync::atomic::Ordering::Relaxed) {
+            if vigiar_o_prazo && !ola_chegou.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[porteiro] {} ligou-se e não se apresentou em {PRAZO_DO_OLA:?}: fecho",
                     &quem[..8.min(quem.len())]
@@ -1811,11 +1846,23 @@ fn aplicar(
     // grande é o comportamento normal e não pode ter tecto. Quem ainda não provou entra na
     // mesma — é assim que alguém se prova, escrevendo algo que decifra — mas com uma conta
     // aberta, e a conta é do lixo que já mandou.
+    //
+    // O tecto conta o lixo JÁ GASTO **mais** o que este lote pode gastar no pior caso, que é
+    // ele inteiro. Sem a segunda metade, o primeiro lote de cada sessão era ilimitado — e uma
+    // religação repunha a conta a zero, portanto bastava religar para voltar a ter direito a
+    // um lote sem tecto. O que este porteiro existe para impedir é precisamente a app a
+    // congelar a decifrar um quadro cheio de lixo, e o primeiro quadro é o que congela.
+    //
+    // Quem já provou pertencer à sala continua sem limite nenhum: sincronizar um histórico
+    // grande é o comportamento normal e não pode ter tecto.
     let chave = (peer.to_string(), servidor.to_string());
-    if !pode_sincronizar(app, servidor, peer)
-        && orcamento.get(&chave).copied().unwrap_or(0) > LIXO_TOLERADO
-    {
-        return;
+    if !pode_sincronizar(app, servidor, peer) {
+        let gasto = orcamento.get(&chave).copied().unwrap_or(0);
+        if gasto + entradas.len() > LIXO_TOLERADO {
+            // Conta-se a tentativa, senão bastava repetir para nunca esgotar.
+            *orcamento.entry(chave).or_insert(0) += entradas.len();
+            return;
+        }
     }
     // «Não temos este servidor» tem duas leituras, e só uma delas é «não é para nós».
     //
@@ -2800,6 +2847,58 @@ mod testes {
         assert!(
             !ha_estranhos_a_mais(&cheia, &estranhos, &estranhos[0]),
             "quarenta pares de casa não contam para o tecto dos desconhecidos"
+        );
+    }
+
+    /// O ORÇAMENTO TRAVA O PRIMEIRO LOTE — não o segundo (#85).
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// A primeira versão do porteiro comparava só o que JÁ tinha sido gasto. Isso deixava o
+    /// primeiro lote de cada sessão passar inteiro, fosse ele qual fosse — e uma religação
+    /// repunha a conta a zero, portanto bastava religar para voltar a ter direito a um lote
+    /// sem tecto nenhum. O que este porteiro existe para impedir é a app a congelar a
+    /// decifrar um quadro cheio de lixo, e o quadro que congela é precisamente o primeiro.
+    ///
+    /// Agora conta-se o que já se gastou MAIS o pior caso deste lote, que é ele inteiro.
+    #[test]
+    fn o_orcamento_trava_o_primeiro_lote_e_nao_o_segundo() {
+        // A decisão, extraída tal como está no `aplicar`: quem não provou tem tecto, e o
+        // tecto olha para o lote que vem a caminho.
+        let cabe = |gasto: usize, lote: usize| gasto + lote <= LIXO_TOLERADO;
+
+        assert!(
+            !cabe(0, LIXO_TOLERADO + 1),
+            "um primeiro lote acima do tecto tem de ser travado ANTES de se decifrar nada"
+        );
+        assert!(
+            cabe(0, LIXO_TOLERADO),
+            "e um lote do tamanho do tecto ainda passa"
+        );
+        assert!(
+            !cabe(LIXO_TOLERADO, 1),
+            "esgotado o orçamento, nem mais uma entrada"
+        );
+    }
+
+    /// O TECTO DE DESCONHECIDOS NÃO SE APLICA A QUEM EU DISCO.
+    ///
+    /// Uma ligação que eu inicio foi decisão minha: o vigia só disca a quem está nos `peers`
+    /// de alguma sala minha, ou a um amigo. Aplicar-lhe o tecto seria o porteiro a cortar-me a
+    /// mim próprio por azar na ordem das ligações — e o sintoma seria «às vezes não me ligo a
+    /// ele», que é a pior espécie de avaria intermitente.
+    ///
+    /// O teste é sobre a REGRA, não sobre a `sessao`: afirma que um par que eu disco e que já
+    /// é de casa nunca é recusado, esteja a casa como estiver. O `if !iniciei` que envolve a
+    /// chamada está ao lado, com a razão escrita.
+    #[test]
+    fn quem_eu_disco_nunca_e_recusado_pelo_tecto() {
+        let amigo = "aa".repeat(32);
+        let app = app_com_sala(&[&amigo]);
+        let multidao: Vec<String> = (0..30u8).map(|i| format!("{:02x}", i).repeat(32)).collect();
+        assert!(
+            !ha_estranhos_a_mais(&app, &multidao, &amigo),
+            "quem partilha sala comigo entra sempre, e é a esses que o vigia disca"
         );
     }
 
