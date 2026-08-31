@@ -248,6 +248,86 @@ pub struct Servidor {
 /// acende a bolha. Está dito no painel.
 const DESVIO_TOLERADO_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Um `App` e um `Servidor` de teste, sem tocar no disco.
+///
+/// Os testes que já existem neste ficheiro usam o `App::arrancar()` com o `BRUMA_DADOS`
+/// apontado a uma pasta temporária — e por isso precisam do `trava_dados()`, porque a variável
+/// é global ao processo e o `cargo test` corre em paralelo. Isso é necessário para testar o
+/// ARRANQUE; é peso morto para testar uma decisão que só lê o mapa de servidores.
+///
+/// Estes constroem o estado directamente: sem env vars, sem pasta, sem serialização — logo sem
+/// mutex de teste e sem ordem entre testes. O log aponta para um caminho que nunca é escrito
+/// (nenhum destes testes anexa nada), e é o `Log::load` de um ficheiro inexistente que dá um
+/// log vazio, que é exactamente o que se quer.
+#[cfg(test)]
+impl App {
+    pub(crate) fn para_teste() -> std::sync::Arc<Self> {
+        let semente = [7u8; 32];
+        std::sync::Arc::new(App {
+            ident: crypto::Identity::from_seed(&semente),
+            semente,
+            nome: Mutex::new("eu".into()),
+            servidores: Mutex::new(BTreeMap::new()),
+            prekeys: Mutex::new(BTreeMap::new()),
+            amigos: Mutex::new(Vec::new()),
+            bloqueados: Mutex::new(Vec::new()),
+            quem_escreve: Mutex::new(QuemEscreve::default()),
+            lido: Mutex::new(BTreeMap::new()),
+            escrita_do_indice: Mutex::new(()),
+            nao_abriram: Mutex::new(Vec::new()),
+            resto_do_indice: Mutex::new(BTreeMap::new()),
+            congelada: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+#[cfg(test)]
+impl Servidor {
+    pub(crate) fn para_teste(id: &str) -> Self {
+        let caminho =
+            std::env::temp_dir().join(format!("bruma-porteiro-{}-{id}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&caminho);
+        Servidor::novo(
+            id.to_string(),
+            [0u8; 32],
+            blog::Log::load(&caminho).expect("um log vazio"),
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+}
+
+/// Decifra a carga de uma entrada, aceitando as duas formas — e a leitura dupla é SEGURA.
+///
+/// # Porque é que a alternativa não abre uma porta (#197)
+///
+/// A tentação, ao ver um `else`, é dizer: «então o atacante usa a forma antiga e passa na
+/// mesma». Não passa, e a razão está no AEAD: a etiqueta de autenticação COBRE o `aad`. Um
+/// `ciphertext` selado com o autor lá dentro **não abre sem ele** — tentar abri-lo à moda
+/// antiga falha tal como tentar abri-lo com o autor errado.
+///
+/// Portanto os três casos são:
+///
+/// | a entrada | com AAD | sem AAD | resultado |
+/// |---|---|---|---|
+/// | nova, autor certo | abre | — | aceite |
+/// | nova, `ciphertext` copiado sob outro autor | falha | falha | **recusada** |
+/// | antiga (anterior a esta versão) | falha | abre | aceite |
+///
+/// O único conjunto que continua copiável é o das entradas escritas ANTES desta versão — um
+/// conjunto fechado, que não cresce, e que aqui são poucas dezenas. O `else` some no dia em
+/// que essas deixarem de importar; até lá, tirá-lo custava o histórico todo e não fechava
+/// nada que já não esteja fechado.
+fn decifrar_carga(chave: &[u8; 32], e: &blog::Entry) -> Option<Vec<u8>> {
+    let nonce = hex24(&e.nonce).ok()?;
+    let ct = HEXLOWER.decode(e.ciphertext.as_bytes()).ok()?;
+    let autor = hex32(&e.author).ok()?;
+    crypto::open_com(chave, &nonce, &ct, &autor)
+        .or_else(|_| crypto::open(chave, &nonce, &ct))
+        .ok()
+}
+
 impl Servidor {
     /// O único caminho para construir um `Servidor`.
     ///
@@ -283,14 +363,10 @@ impl Servidor {
         let mut saida = Vec::new();
         let mut ids = Vec::new();
         for e in self.log.ordered() {
-            let (Ok(nonce), Ok(ct), Ok(id)) = (
-                hex24(&e.nonce),
-                HEXLOWER.decode(e.ciphertext.as_bytes()),
-                e.hash_hex(),
-            ) else {
+            let Ok(id) = e.hash_hex() else {
                 continue;
             };
-            let Ok(claro) = crypto::open(&self.chave, &nonce, &ct) else {
+            let Some(claro) = decifrar_carga(&self.chave, &e) else {
                 continue;
             };
             // LEITURA EM DOIS PASSOS (#8, #20).
@@ -464,7 +540,12 @@ impl Servidor {
     /// Cifra uma carga e junta-a ao log. Devolve a entrada para ser difundida aos peers.
     pub fn escrever(&mut self, signing: &SigningKey, carga: &Carga) -> Result<blog::Entry> {
         let claro = serde_json::to_vec(carga)?;
-        let (nonce, ct) = crypto::seal(&self.chave, &claro)?;
+        // Preso a QUEM escreve (#197): o mesmo ciphertext deixa de abrir sob outro nome.
+        let (nonce, ct) = crypto::seal_com(
+            &self.chave,
+            &claro,
+            signing.verifying_key().as_bytes().as_slice(),
+        )?;
         let e = self.log.append_local(signing, nonce, ct, agora_ms())?;
         self.provados.insert(e.author.clone());
         Ok(e)
@@ -483,7 +564,18 @@ impl Servidor {
     /// QUANDO A ROTAÇÃO DE CHAVE EXISTIR, isto tem de passar a «decifra com alguma chave que
     /// eu tenha, actual ou reformada». Hoje não há rotação — e é por isso que se pode ser
     /// tão estrito. Fica escrito para não se descobrir tarde.
-    pub fn merge_verificado(&mut self, entradas: Vec<blog::Entry>) -> Result<usize> {
+    /// E a dizer quantas ficaram de fora (#85).
+    ///
+    /// Uma entrada que não decifra com a chave desta sala é, por definição, de quem NÃO tem a
+    /// chave. Uma legítima decifra sempre — quem pertence tem-na. Portanto a contagem de
+    /// recusas é o sinal que distingue «alguém a sincronizar» de «alguém a atirar lixo», e é
+    /// esse número que o porteiro da entrada gasta.
+    ///
+    /// Substituiu o `merge_verificado`, que devolvia só as novas: um caminho que não conta o
+    /// lixo é um caminho por onde o porteiro não vê nada, e dois caminhos para o mesmo merge
+    /// seriam a receita para alguém escolher o cego sem dar por isso.
+    pub fn merge_contado(&mut self, entradas: Vec<blog::Entry>) -> Result<(usize, usize)> {
+        let total = entradas.len();
         let boas: Vec<blog::Entry> = entradas
             .into_iter()
             .filter(|e| {
@@ -508,18 +600,14 @@ impl Servidor {
                 if e.verify().is_err() {
                     return false;
                 }
-                let (Ok(nonce), Ok(ct)) =
-                    (hex24(&e.nonce), HEXLOWER.decode(e.ciphertext.as_bytes()))
-                else {
-                    return false;
-                };
-                crypto::open(&self.chave, &nonce, &ct).is_ok()
+                decifrar_carga(&self.chave, e).is_some()
             })
             .collect();
         for e in &boas {
             self.provados.insert(e.author.clone());
         }
-        self.log.merge(boas)
+        let recusadas = total - boas.len();
+        Ok((self.log.merge(boas)?, recusadas))
     }
 
     /// Refaz a cache de quem provou. Só ao abrir a app, e uma vez por servidor.
@@ -723,8 +811,35 @@ impl App {
         crypto::verify_prekey(&dono, &xb, &sb)?;
 
         let mut m = self.prekeys.lock().unwrap();
-        if m.get(peer).map(|v| v.as_str()) == Some(x_pub) {
-            return Ok(()); // já a tínhamos, e é a mesma
+        match m.get(peer).map(|v| v.as_str()) {
+            Some(ja) if ja == x_pub => return Ok(()), // já a tínhamos, e é a mesma
+            // UMA IDENTIDADE TEM UMA E UMA SÓ CHAVE DE CONVERSA (#147).
+            //
+            // A x25519 é derivada DETERMINISTICAMENTE da mesma semente que a Ed25519 (ver o
+            // `crypto.rs`): para uma dada chave pública de identidade existe exactamente uma
+            // prekey válida. Portanto duas prekeys diferentes assinadas pela mesma identidade
+            // não são uma actualização — são um facto que precisa de explicação.
+            //
+            // Isto substituía-a em silêncio. A assinatura confere (é ele que a assina), a
+            // conversa passa a usar a chave nova, e tudo continua a funcionar — que é
+            // exactamente a forma de uma troca de chaves não se notar. As duas leituras
+            // possíveis são «a identidade dele foi comprometida» e «ele corre uma versão que
+            // deriva a chave de outra maneira», e as duas merecem ser ditas em vez de
+            // resolvidas por omissão.
+            //
+            // Guarda-se a ANTIGA e recusa-se a nova: a conversa que já existe continua a
+            // decifrar, e a decisão de aceitar a chave nova fica para quem consegue ligar
+            // para a pessoa e perguntar.
+            Some(_) => {
+                drop(m);
+                bail!(
+                    "a chave de conversa de {} mudou — ou a identidade dele foi comprometida, \
+                     ou ele está numa versão incompatível. Fico com a antiga; fala com ele por \
+                     outro caminho antes de aceitar a nova.",
+                    &peer[..8.min(peer.len())]
+                );
+            }
+            None => {}
         }
         m.insert(peer.to_string(), x_pub.to_string());
         drop(m);
@@ -859,6 +974,50 @@ impl App {
     ///
     /// Por baixo é um servidor como os outros — o mesmo log assinado, a mesma cifra, o mesmo
     /// caminho de sincronização. A única diferença guardada é o `com`.
+    /// Apaga uma conversa: do índice, do disco, e da lista de quem se disca (#87).
+    ///
+    /// # Porque é que isto tinha de existir
+    ///
+    /// Um pedido indesejado não tinha fim. A conversa aparecia na lista, o log ficava no
+    /// disco, e o par ficava a ser discado — e a única coisa que se podia fazer era bloquear
+    /// a pessoa, que é um gesto muito maior do que «não quero esta conversa».
+    ///
+    /// É irreversível de propósito e sem rede pelo meio: apaga-se aqui, e mais nada. Não se
+    /// avisa o outro lado — dizer-lhe «apaguei a tua conversa» seria contar-lhe uma coisa que
+    /// só me diz respeito a mim, e confirmava-lhe que a chave está viva.
+    ///
+    /// O ficheiro é renomeado para `.apagado` em vez de removido: um clique não deve ser
+    /// capaz de destruir o único sítio onde uma conversa existe. Quem quiser mesmo perdê-la
+    /// apaga o ficheiro à mão, e aí sabe o que está a fazer.
+    pub fn apagar_conversa(&self, id: &str) -> Result<()> {
+        {
+            let mut s = self
+                .servidores
+                .lock()
+                .map_err(|_| anyhow!("estado partido"))?;
+            let Some(srv) = s.get(id) else {
+                bail!("essa conversa não existe aqui");
+            };
+            if srv.com.is_none() {
+                bail!("isso é um servidor, não uma conversa");
+            }
+            s.remove(id);
+        }
+        self.lido
+            .lock()
+            .map_err(|_| anyhow!("estado partido"))?
+            .remove(id);
+        // O índice PRIMEIRO: se a gravação falhar, a conversa volta no arranque seguinte com
+        // o log ao lado, que é melhor do que um índice sem chave e um ficheiro que já não
+        // abre. Ver a ordem em `gravar_semente`.
+        self.gravar_indice()?;
+        let caminho = caminho_do_log(id);
+        if caminho.exists() {
+            let _ = std::fs::rename(&caminho, caminho.with_extension("apagado"));
+        }
+        Ok(())
+    }
+
     pub fn abrir_conversa(&self, peer: &str) -> Result<String> {
         let minha = self.minha_chave();
         if peer == minha {
@@ -1320,6 +1479,273 @@ pub fn caminho_do_log(id: &str) -> PathBuf {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// UM CIPHERTEXT COPIADO JÁ NÃO TORNA NINGUÉM MEMBRO (#197).
+    ///
+    /// # A avaria que isto fecha, e que foi medida antes de ser corrigida
+    ///
+    /// A cifra não usava dados associados: os mesmos bytes de `ciphertext` decifravam na
+    /// mesma sala esteja em que entrada estivessem. A assinatura cobre
+    /// `author‖ts‖prev‖nonce‖ct`, mas quem assina é quem quiser — ela prova quem MONTOU a
+    /// entrada, não quem escreveu o conteúdo.
+    ///
+    /// Portanto: alguém que obtivesse o log cifrado de uma sala — do disco, de uma cópia de
+    /// segurança, de um `Sync` antigo — mas NÃO tivesse a chave, copiava um `ciphertext` de
+    /// lá, assinava-o com a sua identidade e mandava-o. Do nosso lado decifrava (nós temos a
+    /// chave) e o autor entrava em `autores_provados` — a lista que dá direitos de sala.
+    /// **Copiar bytes que não se conseguem ler dava direitos de membro.**
+    ///
+    /// Este teste existiu primeiro na forma contrária: afirmava que o ataque FUNCIONAVA, para
+    /// a decisão sobre o formato ser tomada em cima de um facto e não de um receio. Inverteu-o
+    /// a correcção, e é isso que o torna a prova — a mesma montagem, o resultado ao contrário.
+    #[test]
+    fn um_ciphertext_copiado_nao_torna_ninguem_membro() {
+        let chave = [11u8; 32];
+        let membro = crypto::Identity::from_seed(&[1u8; 32]);
+        let forasteiro = crypto::Identity::from_seed(&[2u8; 32]);
+
+        let tmp = |n: &str| {
+            let c =
+                std::env::temp_dir().join(format!("bruma-aad-{n}-{}.jsonl", std::process::id()));
+            let _ = std::fs::remove_file(&c);
+            c
+        };
+        let sala_nova = |caminho: &std::path::Path| {
+            Servidor::novo(
+                "sala".into(),
+                chave,
+                blog::Log::load(caminho).unwrap(),
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+
+        let c1 = tmp("a");
+        let mut sala = sala_nova(&c1);
+        let original = sala
+            .escrever(
+                &membro.signing,
+                &crate::modelo::Carga::Mensagem {
+                    canal: "geral".into(),
+                    texto: "olá a todos".into(),
+                },
+            )
+            .unwrap();
+
+        // O forasteiro copia o `nonce` e o `ciphertext` — que é tudo o que ele vê no log — e
+        // monta uma entrada SUA com eles. Não tem a chave da sala, e não precisa dela.
+        let c2 = tmp("b");
+        let mut log_dele = blog::Log::load(&c2).unwrap();
+        let nonce = hex24(&original.nonce).unwrap();
+        let ct = HEXLOWER.decode(original.ciphertext.as_bytes()).unwrap();
+        let copiada = log_dele
+            .append_local(&forasteiro.signing, nonce, ct, 12345)
+            .unwrap();
+
+        let c3 = tmp("c");
+        let mut nossa = sala_nova(&c3);
+        let (entraram, recusadas) = nossa.merge_contado(vec![copiada]).unwrap();
+
+        let dele = HEXLOWER.encode(forasteiro.signing.verifying_key().as_bytes());
+        assert_eq!(
+            (entraram, recusadas),
+            (0, 1),
+            "a entrada copiada é recusada, e conta como lixo"
+        );
+        assert!(
+            !nossa.autores_provados().contains(&dele),
+            "copiar um ciphertext não pode dar direitos de membro"
+        );
+
+        // E A OUTRA METADE, que é a que impede a correcção de ser uma avaria: a entrada
+        // LEGÍTIMA continua a entrar, e a ler-se.
+        let c4 = tmp("d");
+        let mut outra = sala_nova(&c4);
+        let (entraram, recusadas) = outra.merge_contado(vec![original]).unwrap();
+        assert_eq!((entraram, recusadas), (1, 0), "a original entra sem custo");
+        assert_eq!(
+            outra.mensagens("geral").len(),
+            1,
+            "e lê-se: a carga decifra com o autor certo"
+        );
+
+        for c in [c1, c2, c3, c4] {
+            let _ = std::fs::remove_file(&c);
+        }
+    }
+
+    /// O HISTÓRICO ANTERIOR A ESTA VERSÃO CONTINUA A ABRIR (#197).
+    ///
+    /// A correcção só vale se não custar o passado. Uma entrada cifrada à moda antiga — sem
+    /// dados associados — tem de continuar a decifrar, senão a actualização apagava do ecrã
+    /// tudo o que já lá estava, em silêncio, que é a pior forma de falhar que este projecto
+    /// conhece.
+    ///
+    /// E a leitura dupla não abre porta nenhuma: o AEAD faz a etiqueta cobrir o `aad`, portanto
+    /// um `ciphertext` selado COM o autor **não abre sem ele**. Um atacante não pode escolher a
+    /// via antiga para uma entrada nova — ela falha nos dois sentidos. O que continua copiável
+    /// é só o que foi escrito antes desta versão: um conjunto fechado, que não cresce.
+    #[test]
+    fn o_historico_de_antes_do_aad_continua_a_abrir() {
+        let chave = [12u8; 32];
+        let autor = crypto::Identity::from_seed(&[3u8; 32]);
+        let caminho =
+            std::env::temp_dir().join(format!("bruma-aad-velho-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&caminho);
+
+        // Cifrada como a v0.18.3 e anteriores cifravam: sem AAD nenhum.
+        let claro = serde_json::to_vec(&crate::modelo::Carga::Mensagem {
+            canal: "geral".into(),
+            texto: "isto é de antes".into(),
+        })
+        .unwrap();
+        let (nonce, ct) = crypto::seal(&chave, &claro).unwrap();
+
+        let mut log = blog::Log::load(&caminho).unwrap();
+        let antiga = log.append_local(&autor.signing, nonce, ct, 1000).unwrap();
+
+        let outro =
+            std::env::temp_dir().join(format!("bruma-aad-velho2-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&outro);
+        let mut srv = Servidor::novo(
+            "sala".into(),
+            chave,
+            blog::Log::load(&outro).unwrap(),
+            Vec::new(),
+            None,
+            None,
+        );
+        let (entraram, recusadas) = srv.merge_contado(vec![antiga]).unwrap();
+        assert_eq!(
+            (entraram, recusadas),
+            (1, 0),
+            "uma entrada de antes do AAD entra na mesma"
+        );
+        let msgs = srv.mensagens("geral");
+        assert_eq!(msgs.len(), 1, "e lê-se");
+        assert!(
+            msgs[0].texto.contains("de antes"),
+            "com o texto certo: {:?}",
+            msgs[0].texto
+        );
+
+        let _ = std::fs::remove_file(&caminho);
+        let _ = std::fs::remove_file(&outro);
+    }
+
+    /// O QUE SE CONTA É O LIXO, E NÃO O VOLUME (#85).
+    ///
+    /// # Porque é que a distinção é a defesa toda
+    ///
+    /// À entrada não havia porteiro nenhum: um `Sync` de um estranho com o id de uma sala
+    /// minha ia direito ao merge, e cada entrada custava uma verificação de assinatura e uma
+    /// tentativa de decifragem — com o mutex dos servidores segurado, portanto com a app
+    /// congelada.
+    ///
+    /// A tentação é pôr um tecto no NÚMERO de entradas. Seria uma avaria: um par legítimo com
+    /// um ano de conversa manda milhares, e cortá-lo dá exactamente o sintoma que este
+    /// projecto passou versões a caçar — sincronização que pára sem dizer porquê.
+    ///
+    /// O que separa os dois casos não é o volume: é a chave. Quem pertence à sala tem-na, e
+    /// TUDO o que manda decifra. Quem não pertence não tem, e NADA do que manda decifra. Este
+    /// teste é essa afirmação: mil entradas boas custam zero do orçamento, e as más custam
+    /// todas.
+    #[test]
+    fn o_orcamento_conta_o_lixo_e_nao_o_volume() {
+        let chave = [9u8; 32];
+        let eu = crypto::Identity::from_seed(&[1u8; 32]);
+        let intruso = crypto::Identity::from_seed(&[2u8; 32]);
+
+        let caminho = std::env::temp_dir().join(format!("bruma-orc-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&caminho);
+        let mut srv = Servidor::novo(
+            "sala".into(),
+            chave,
+            blog::Log::load(&caminho).unwrap(),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        // MIL entradas legítimas: cifradas com a chave da sala, assinadas por quem pertence.
+        let mut boas = Vec::new();
+        {
+            let outro_caminho =
+                std::env::temp_dir().join(format!("bruma-orc-b-{}.jsonl", std::process::id()));
+            let _ = std::fs::remove_file(&outro_caminho);
+            let mut fonte = Servidor::novo(
+                "sala".into(),
+                chave,
+                blog::Log::load(&outro_caminho).unwrap(),
+                Vec::new(),
+                None,
+                None,
+            );
+            for i in 0..1000 {
+                boas.push(
+                    fonte
+                        .escrever(
+                            &eu.signing,
+                            &crate::modelo::Carga::Mensagem {
+                                canal: "geral".into(),
+                                texto: format!("mensagem {i}"),
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+            let _ = std::fs::remove_file(&outro_caminho);
+        }
+        let (novas, recusadas) = srv.merge_contado(boas).unwrap();
+        assert_eq!(novas, 1000, "todas as legítimas entram");
+        assert_eq!(
+            recusadas, 0,
+            "e nenhuma gasta orçamento: quem pertence tem a chave"
+        );
+
+        // E agora o lixo: assinado (qualquer pessoa assina o que quiser) mas cifrado com
+        // OUTRA chave. É o que um estranho consegue fabricar.
+        let mut lixo = Vec::new();
+        {
+            let sujo =
+                std::env::temp_dir().join(format!("bruma-orc-l-{}.jsonl", std::process::id()));
+            let _ = std::fs::remove_file(&sujo);
+            let mut fonte = Servidor::novo(
+                "outra".into(),
+                [3u8; 32], // chave que a minha sala não tem
+                blog::Log::load(&sujo).unwrap(),
+                Vec::new(),
+                None,
+                None,
+            );
+            for i in 0..40 {
+                lixo.push(
+                    fonte
+                        .escrever(
+                            &intruso.signing,
+                            &crate::modelo::Carga::Mensagem {
+                                canal: "x".into(),
+                                texto: format!("lixo {i}"),
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+            let _ = std::fs::remove_file(&sujo);
+        }
+        let (novas, recusadas) = srv.merge_contado(lixo).unwrap();
+        assert_eq!(novas, 0, "nada do intruso entra");
+        assert_eq!(recusadas, 40, "e tudo o que ele mandou gasta orçamento");
+
+        // E o intruso não passou a constar como autor da sala.
+        assert!(
+            !srv.autores_provados()
+                .contains(&HEXLOWER.encode(intruso.signing.verifying_key().as_bytes())),
+            "quem não decifra não se torna membro"
+        );
+        let _ = std::fs::remove_file(&caminho);
+    }
     use std::sync::Arc;
 
     /// `BRUMA_DADOS` é uma variável de ambiente GLOBAL ao processo, e vários testes definem-na
@@ -1882,9 +2308,9 @@ mod testes {
                 .unwrap()
         };
         assert_eq!(
-            srv.merge_verificado(vec![forjada]).unwrap(),
-            1,
-            "tinha de entrar"
+            srv.merge_contado(vec![forjada]).unwrap(),
+            (1, 0),
+            "tinha de entrar, e sem gastar orçamento: decifra"
         );
 
         let marca = srv.ultima_mensagem("geral", &minha);
@@ -1968,7 +2394,9 @@ mod testes {
         forjada.author = terceiro.clone();
         forjada.sig = "00".repeat(64);
 
-        let entraram = srv.merge_verificado(vec![boa, forjada]).unwrap();
+        // E a entrada forjada gasta orçamento (#85): é lixo, e é isso que o porteiro conta.
+        let (entraram, recusadas) = srv.merge_contado(vec![boa, forjada]).unwrap();
+        assert_eq!(recusadas, 1, "a forjada tem de contar como lixo");
 
         let provados = srv.autores_provados();
         let chave_do_membro = HEXLOWER.encode(membro.signing.verifying_key().as_bytes());

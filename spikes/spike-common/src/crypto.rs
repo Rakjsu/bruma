@@ -222,24 +222,113 @@ pub fn chave_do_indice(seed: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
+    seal_com(key, plaintext, b"")
+}
+
+pub fn open(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8]) -> Result<Vec<u8>> {
+    open_com(key, nonce, ct, b"")
+}
+
+/// Cifra PRENDENDO o resultado a uns dados que não vão cifrados — o `aad`.
+///
+/// # A avaria que isto fecha (#197)
+///
+/// Sem dados associados, os mesmos bytes de `ciphertext` decifram na mesma sala esteja em que
+/// entrada estiverem. A assinatura cobre `author‖ts‖prev‖nonce‖ciphertext`, mas quem assina é
+/// quem quiser: a assinatura prova quem MONTOU a entrada, não quem escreveu o conteúdo.
+///
+/// O ataque, que foi medido antes de isto existir: alguém que obtenha o log cifrado de uma
+/// sala — do disco, de uma cópia de segurança, de um `Sync` antigo — mas NÃO tenha a chave,
+/// copia um `ciphertext` de lá, assina-o com a sua identidade, e manda-o. Do outro lado
+/// decifra (eles têm a chave), e o autor entra em `autores_provados`, que é a lista que dá
+/// direitos de sala. Copiar bytes que não se consegue ler dava direitos de membro.
+///
+/// Com o `aad` a ser a chave pública de quem escreve, a mesma cópia deixa de abrir sob outro
+/// nome: o AEAD faz a etiqueta cobrir o `aad`, e uma etiqueta que não bate é uma decifragem
+/// que falha.
+///
+/// # Porquê o autor e não `author‖prev‖ts_ms`
+///
+/// O `prev` e o `ts_ms` só são escolhidos no `append_local`, DEPOIS de a carga estar cifrada
+/// — usá-los obrigava a reordenar o caminho de escrita. E acrescentam pouco: mover uma
+/// entrada dentro do histórico do próprio autor exige a chave dele, e aí ele reescreve-a à
+/// vontade. O que estava aberto de par em par era a troca de AUTOR, e é essa que fecha.
+pub fn seal_com(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0u8; 24];
     getrandom::getrandom(&mut nonce).map_err(|e| anyhow!("rng: {e}"))?;
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("falha a cifrar"))?;
     Ok((nonce, ct))
 }
 
-pub fn open(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8]) -> Result<Vec<u8>> {
+pub fn open_com(key: &[u8; 32], nonce: &[u8; 24], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     XChaCha20Poly1305::new(key.into())
-        .decrypt(XNonce::from_slice(nonce), ct)
+        .decrypt(
+            XNonce::from_slice(nonce),
+            chacha20poly1305::aead::Payload { msg: ct, aad },
+        )
         .map_err(|_| anyhow!("falha a decifrar"))
 }
 
 #[cfg(test)]
 mod testes_palavras {
     use super::*;
+
+    /// A FORMA SEM AAD É BYTE A BYTE A DE ANTES — e isso não se assume, prende-se.
+    ///
+    /// O `seal`/`open` passaram a ser casos particulares do `seal_com`/`open_com` com um `aad`
+    /// vazio (#197). A compatibilidade com tudo o que já está escrito em disco depende de uma
+    /// afirmação sobre a biblioteca: que `encrypt(nonce, msg)` é o mesmo que
+    /// `encrypt(nonce, Payload { msg, aad: b"" })`.
+    ///
+    /// É verdade hoje — é assim que o `aead` define o atalho — e é exactamente o género de
+    /// coisa que muda numa actualização de dependência sem ninguém reparar. Se mudasse, o
+    /// sintoma seria o histórico inteiro a desaparecer do ecrã em silêncio na primeira
+    /// actualização. Por isso a afirmação é feita aqui, contra a API crua, e não deduzida.
+    #[test]
+    fn o_sem_aad_e_o_mesmo_que_o_de_sempre() {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+        let chave = [7u8; 32];
+        let nonce = [3u8; 24];
+        let claro = b"uma mensagem de antes do AAD";
+
+        // A chamada CRUA, tal como o codigo antigo a fazia.
+        let antigo = XChaCha20Poly1305::new(&chave.into())
+            .encrypt(XNonce::from_slice(&nonce), claro.as_slice())
+            .expect("cifrar a moda antiga");
+
+        // E o nosso `open` de hoje tem de a abrir.
+        let lido = open(&chave, &nonce, &antigo).expect("o histórico de antes tem de abrir");
+        assert_eq!(lido, claro, "e com o mesmo conteúdo");
+
+        // E com um `aad` NÃO abre — que é o que torna a leitura dupla segura: um ciphertext
+        // selado com autor não se consegue abrir sem ele, portanto ninguém escolhe a via
+        // antiga para uma entrada nova.
+        let com_autor = seal_com(&chave, claro, b"o-autor").unwrap();
+        assert!(
+            open(&chave, &com_autor.0, &com_autor.1).is_err(),
+            "um ciphertext preso ao autor não pode abrir sem ele"
+        );
+        assert!(
+            open_com(&chave, &com_autor.0, &com_autor.1, b"outro-autor").is_err(),
+            "nem com o autor errado"
+        );
+        assert_eq!(
+            open_com(&chave, &com_autor.0, &com_autor.1, b"o-autor").unwrap(),
+            claro,
+            "e abre com o certo"
+        );
+    }
 
     /// Uma prekey de ordem pequena tornava a chave da conversa calculavel por QUALQUER UM.
     ///

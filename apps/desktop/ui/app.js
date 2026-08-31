@@ -246,6 +246,26 @@ function desenharConversas() {
       l.append(bolha(c.nao_lidos));
     }
     l.onclick = () => escolherConversa(c.id);
+    // APAGAR UMA CONVERSA (#87). É a única forma de um pedido indesejado ter fim: bloquear a
+    // pessoa é um gesto muito maior, e até aqui era o único que havia.
+    l.oncontextmenu = ev => {
+      ev.preventDefault();
+      abrirMenu(ev.clientX, ev.clientY, [
+        { rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(c.com) },
+        '-',
+        {
+          rotulo: 'Apagar esta conversa',
+          perigo: true,
+          accao: async () => {
+            await invoke('apagar_conversa', { id: c.id }).catch(e => {
+              console.warn('não consegui apagar a conversa:', e);
+            });
+            if (conversaAtual === c.id) conversaAtual = null;
+            await desenharTudo();
+          },
+        },
+      ]);
+    };
     lista.append(l);
   }
 }
@@ -333,7 +353,9 @@ function desenharMembros() {
     bloco.append(elemento(
       'i',
       aviso ? 'versao-diferente' : null,
-      aviso || (m.fundador ? 'fundou este servidor' : chaveCurta(m.chave)),
+      // O «fundou este servidor» saiu (#144): era forjável por qualquer membro da sala, e
+      // não há substituto honesto. A chave curta é verdade e chega.
+      aviso || chaveCurta(m.chave),
     ));
     linha.append(av, bloco);
     lista.append(linha);
@@ -1631,7 +1653,10 @@ function comecarAEnviarVoz(microfone) {
       if (!gente.length) return;
       const bytes = new Uint8Array(pedaco.byteLength);
       pedaco.copyTo(bytes);
-      invoke('enviar_voz', { para: gente, dados: [...bytes] }).catch(() => {});
+      // O `servidor` vai agora junto: o Rust filtra a lista pelo `participa` da sala,
+      // porque a verdade sobre quem me ouve não pode viver só aqui (#138).
+      invoke('enviar_voz', { servidor: voz.servidor, para: gente, dados: [...bytes] })
+        .catch(() => {});
     },
     error: e => {
       console.warn('o codificador de voz parou:', e);
@@ -3834,6 +3859,56 @@ function desenharNaChamada() {
 /** Erro de escrita no disco — uma faixa PERSISTENTE, porque um disco cheio não se resolve
  *  sozinho. Fica até a app fechar. É a diferença entre uma falha silenciosa total (o que
  *  havia) e o utilizador saber que o que escrever a partir de agora pode perder-se. */
+/** Um aviso efémero na sala ou conversa a que diz respeito.
+ *
+ *  Não é uma mensagem: não vai para o log, não é assinado, e desaparece ao recarregar. É o
+ *  mesmo tipo de coisa que a presença já é — um facto sobre AGORA, não história. Escrever
+ *  estes avisos no log seria pôr no histórico de toda a gente uma coisa que só a esta
+ *  máquina diz respeito.
+ */
+function avisoNaConversa(id, texto) {
+  const zona = $('#stream');
+  if (!zona) return;
+  // Só se mostra se for a sala/conversa que está aberta — um aviso sobre outra sala no meio
+  // desta conversa seria ruído no sítio errado.
+  const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
+  if (aberto !== id) return;
+  const linha = elemento('div', 'aviso-sistema', texto);
+  zona.append(linha);
+  zona.scrollTop = zona.scrollHeight;
+}
+
+/* A RECUSA DITA (#131).
+   Até aqui, quem era recusado pela política do outro lado não sabia: a conversa aparecia,
+   as mensagens ficavam no log local, o envio saía sem erro, e a pessoa escrevia durante
+   dias para uma sala que só existia na máquina dela. Agora diz-se, no sítio onde ela está
+   a escrever. */
+listen('conversa-recusada', ev => {
+  const id = String(ev.payload || '');
+  const c = (vista.conversas || []).find(x => x.id === id);
+  const quem = c ? c.nome : 'Esta pessoa';
+  avisoNaConversa(id, `${quem} só aceita conversas de quem já a conhece — o que escreveres `
+    + 'aqui não lhe chega.');
+});
+
+/* ALGUÉM ENTROU NA SALA (#196).
+   Passar a ser membro dá o direito de me pôr som nas colunas e de receber o meu ecrã. Era
+   completamente mudo. Vai agrupado de propósito: numa sala que sincroniza histórico grande,
+   muitos autores aparecem de uma vez. */
+listen('membros-novos', ev => {
+  const [servidor, chaves] = ev.payload || [];
+  if (!servidor || !chaves || !chaves.length) return;
+  const s = (vista.servidores || []).find(x => x.id === servidor);
+  const nomeDe = k => {
+    const m = s && (s.membros || []).find(x => x.chave === k);
+    return m ? m.nome : chaveCurta(k);
+  };
+  const texto = chaves.length === 1
+    ? `${nomeDe(chaves[0])} apareceu nesta sala.`
+    : `${chaves.length} pessoas apareceram nesta sala.`;
+  avisoNaConversa(servidor, texto);
+});
+
 listen('erro-dados', ev => {
   const texto = String(ev.payload || 'Não consigo escrever na pasta de dados.');
   let faixa = document.getElementById('faixa-disco');

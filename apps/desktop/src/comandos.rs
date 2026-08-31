@@ -590,6 +590,14 @@ pub fn criar_canal(
     Ok(())
 }
 
+/// Apaga uma conversa e tudo o que ela arrasta (#87).
+#[tauri::command]
+pub fn apagar_conversa(id: String, app: State<Arc<App>>, janela: AppHandle) -> R<()> {
+    app.apagar_conversa(&id).map_err(erro)?;
+    let _ = janela.emit("servidor-mudou", &id);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn apagar_canal(
     servidor: String,
@@ -1362,13 +1370,37 @@ pub fn receber_voz(canal: Channel<InvokeResponseBody>, voz: State<Arc<Voz>>) {
     *voz.entrada.lock().unwrap() = Some(canal);
 }
 
-/// Um pedaço de som para cada pessoa da sala.
+/// Um pedaço de som para cada pessoa da sala — filtrado por quem PERTENCE à sala (#138).
 ///
-/// A interface é que diz a quem, porque é ela que sabe quem está na chamada. O Rust não
-/// guarda essa lista para não haver duas versões da mesma verdade.
+/// A interface continua a dizer a quem, porque é ela que sabe quem está na chamada. Mas
+/// deixou de ser a única a decidir: a lista passa pelo `participa`, que é a mesma prova que
+/// a presença e a sincronização já usavam.
+///
+/// # A avaria que isto fecha
+///
+/// A verdade sobre quem recebe o meu microfone vivia SÓ no JavaScript — numa `Map` chamada
+/// `voz.presentes`, alimentada por mensagens de presença que chegam da rede. Um par com
+/// software modificado que forjasse presença entrava nessa lista, e daí em diante o Rust
+/// escrevia-lhe datagramas sem perguntar nada a ninguém. O porteiro existia para a
+/// sincronização, para o vídeo e para a presença; a voz — a única coisa que sai desta
+/// máquina cinquenta vezes por segundo — passava ao lado dele.
+///
+/// O filtro é do lado de cá porque é deste lado que estão as provas: o `participa` lê os
+/// `peers` da sala, e um `peer` só lá chega tendo escrito uma entrada que DECIFRA com a
+/// chave dela.
 #[tauri::command]
-pub fn enviar_voz(para: Vec<String>, dados: Vec<u8>, rede: State<Arc<Rede>>) {
-    rede.enviar_voz(&para, &dados);
+pub fn enviar_voz(
+    servidor: String,
+    para: Vec<String>,
+    dados: Vec<u8>,
+    rede: State<Arc<Rede>>,
+    nucleo: State<Arc<crate::estado::App>>,
+) {
+    let permitidos = crate::rede::so_quem_participa(&nucleo, &servidor, &para);
+    if permitidos.is_empty() {
+        return;
+    }
+    rede.enviar_voz(&permitidos, &dados);
 }
 
 /// Chamado pela camada de rede a cada datagrama de voz que chega.

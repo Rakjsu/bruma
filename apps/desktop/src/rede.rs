@@ -39,6 +39,47 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// impasse — medir progresso, não tempo decorrido.
 const LOTE_SYNC: usize = 256 * 1024;
 
+/// Quanto tempo um par tem para dizer `Ola` antes de a ligação ser fechada (#195).
+///
+/// O ciclo de `accept` aceitava qualquer ligação com o ALPN certo e lançava uma tarefa por
+/// cada uma. Uma ligação que nunca fala fica de pé para sempre: come uma entrada no mapa, uma
+/// tarefa, e uma linha no contador de «ligados» da interface — sem nunca ter dito quem é.
+///
+/// Trinta segundos e não três: entre o Brasil e os EUA, com o aperto de mão do QUIC e um
+/// arranque de app pelo meio, um par legítimo pode demorar. O que isto corta é quem NUNCA
+/// fala, não quem fala devagar.
+const PRAZO_DO_OLA: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Quantos pares que ainda não provaram nada podem estar ligados ao mesmo tempo (#195).
+///
+/// Um par «de casa» — que partilha uma sala comigo, ou que eu convidei — nunca conta para
+/// este tecto: por muito cheia que a casa esteja, ela entra sempre. O tecto é só para quem
+/// tem a minha chave (que viaja em qualquer convite reencaminhado) e ainda não provou nada.
+///
+/// Cinco chega de sobra para uma app de duas pessoas, e é generoso o bastante para o caso
+/// legítimo que interessa: várias pessoas a entrar pelo mesmo convite ao mesmo tempo.
+const TECTO_DE_ESTRANHOS: usize = 5;
+
+/// Quantas entradas ILEGÍVEIS se aceitam de um par que ainda não provou pertencer à sala (#85).
+///
+/// # A avaria que isto fecha
+///
+/// À saída havia porteiro; à entrada não havia nenhum. O `Msg::Sync` e o `Msg::Nova` iam
+/// direitos ao `aplicar`, e um estranho ligado podia mandar quadros cheios de entradas falsas
+/// com o id de uma sala minha — e o id de uma sala viaja em claro em qualquer convite
+/// reencaminhado. Cada entrada custa uma verificação de assinatura e uma tentativa de
+/// decifragem, **tudo com o mutex dos servidores segurado**: a app inteira congela enquanto
+/// isso corre, e repete-se a cada ligação.
+///
+/// O que se conta são as RECUSADAS, e não o total — e essa é a diferença entre uma defesa e
+/// uma avaria. Um par legítimo com histórico grande manda milhares de entradas e todas
+/// decifram: não gasta nada deste orçamento, por muito que mande. Um estranho gasta-o à
+/// primeira, porque não tem a chave e nenhuma das dele decifra.
+///
+/// Cinquenta é folgado de propósito: um par legítimo pode trazer entradas de uma sala cuja
+/// chave rodou, ou restos de um formato antigo, e isso não deve fechar-lhe a porta.
+const LIXO_TOLERADO: usize = 50;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -103,6 +144,25 @@ pub enum Msg {
     /// Com ela, o que não se conhece é ignorado e a conversa continua. Não salva as versões
     /// já instaladas — salva todas as que vierem a seguir, e é por isso que entra sozinha e
     /// antes de tudo o resto.
+    /// «Não aceito conversas de quem não conheço» — dito, em vez de silêncio (#131).
+    ///
+    /// # A avaria que isto fecha
+    ///
+    /// Quando alguém me abria uma conversa e a minha política dizia que não, escrevia-se uma
+    /// linha no registo DE QUEM RECUSA e não se respondia nada. Do outro lado, tudo tinha
+    /// corrido bem: a conversa aparecia na interface, as mensagens ficavam no log local, e o
+    /// envio saía sem erro. A pessoa escrevia durante dias para uma sala que só existia na
+    /// máquina dela.
+    ///
+    /// É seguro acrescentar isto porque o `#[serde(other)] Desconhecida` já existe desde a
+    /// v0.18.0: um par nessa versão ou mais recente ignora-a sem derrubar a sessão. Um par em
+    /// v0.17 ou anterior derrubaria — e isso é aceitável porque este quadro só chega a quem
+    /// tentou abrir-me uma conversa e foi recusado, que é precisamente o caminho que hoje
+    /// acaba em nada.
+    ///
+    /// E não conta nada de novo a ninguém: que a minha chave está viva, quem se liga já sabe
+    /// pela ligação ter pegado.
+    Recusa { servidor: String },
     #[serde(other)]
     Desconhecida,
 }
@@ -112,6 +172,11 @@ pub enum Msg {
 pub enum Saida {
     Entrada(String, blog::Entry),
     Presenca(String, Option<String>),
+    /// «Não te aceito» — dirigido a UM peer (#131).
+    Recusa {
+        para: String,
+        servidor: String,
+    },
     /// Dirigido a UM peer. As outras sessoes ignoram.
     /// «Toma o meu log deste servidor», a UM par.
     ///
@@ -195,6 +260,9 @@ pub struct Rede {
 
 impl Rede {
     pub async fn arrancar(app: Arc<App>, janela: AppHandle) -> Result<Arc<Self>> {
+        // O fio dos porteiros para a interface (#139). Um envenenamento do mapa de
+        // servidores põe todos eles a recusar; sem isto, recusariam em silêncio.
+        let _ = JANELA.set(janela.clone());
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&app.semente))
             .alpns(vec![ALPN.to_vec()])
@@ -565,7 +633,24 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
             };
-            let mut v: Vec<String> = s.values().flat_map(|x| x.peers.clone()).collect();
+            // «ELE FALOU-ME» NÃO É «EU QUERO ENCONTRÁ-LO» (#87).
+            //
+            // Isto juntava os `peers` de TODOS os servidores — e uma conversa é guardada como
+            // um servidor. Quando um estranho me escrevia, o `aplicar` criava a conversa com
+            // ele nos `peers`, e a partir daí o vigia discava-lhe de dois em dois segundos,
+            // para sempre, mesmo que eu nunca tivesse respondido. Um pedido indesejado
+            // transformava-se em tráfego permanente para quem o mandou — e a dizer-lhe, com o
+            // próprio tráfego, que eu continuo online.
+            //
+            // As SALAS continuam todas: lá, estar nos `peers` é prova de ter a chave. Numa
+            // CONVERSA a barra é outra — só se disca se EU já lá tiver escrito, que é o único
+            // gesto que distingue «aceitei falar contigo» de «recebi uma mensagem tua».
+            let minha = app.minha_chave();
+            let mut v: Vec<String> = s
+                .values()
+                .filter(|x| x.com.is_none() || x.autores_provados().contains(&minha))
+                .flat_map(|x| x.peers.clone())
+                .collect();
             // E quem me convidou. Ele ainda não provou nada — e por isso não passa o
             // porteiro — mas é o único fio que tenho para o servidor onde acabei de entrar.
             v.extend(s.values().filter_map(|x| x.convidou.clone()));
@@ -876,6 +961,70 @@ async fn sessao(
         }
     }
 
+    // Antes de decidir o que sai e o que entra: ver se este par já escreveu numa sala
+    // minha. Se escreveu, é de casa, mesmo que nunca tenhamos sincronizado um com o outro.
+    //
+    // Corre ANTES do stream, e essa ordem foi aprendida a medir: estava depois, e o
+    // `accept_bi` de quem aceita fica à espera para SEMPRE de um par que nunca abra stream
+    // nenhum. Tudo o que estivesse a seguir era inalcançável — incluindo os dois porteiros
+    // logo abaixo, que eu tinha escrito precisamente para esse caso. Uma sonda que se liga e
+    // se cala apanhou oito ligações de pé ao fim de 45 s, sem uma linha no registo.
+    aprender_dos_logs(&app, &peer);
+
+    // O TECTO DE ESTRANHOS (#195).
+    //
+    // Depois do `aprender_dos_logs`, que é o que pode tornar este par de casa, e depois de a
+    // sessão já estar no mapa — portanto o próprio par conta a si mesmo, e é por isso que a
+    // comparação é `>` e não `>=`.
+    //
+    // Quem é de casa nunca é recusado. Quem não é, e chega quando já há cinco desconhecidos
+    // pendurados, leva com a porta na cara — e a porta diz porquê no registo, senão isto
+    // seria mais um desaparecimento sem explicação.
+    {
+        let ligados: Vec<String> = rede
+            .ligacoes
+            .lock()
+            .map(|l| l.keys().cloned().collect())
+            .unwrap_or_default();
+        if ha_estranhos_a_mais(&app, &ligados, &peer) {
+            eprintln!(
+                "[porteiro] {} liga-se sem partilhar sala nenhuma e já há {TECTO_DE_ESTRANHOS} \
+                 assim: recuso",
+                &peer[..8.min(peer.len())]
+            );
+            conn.close(0u32.into(), b"demasiados desconhecidos");
+            return Ok(());
+        }
+    }
+
+    // O PRAZO PARA PROVAR QUE É GENTE (#195) — armado ANTES da espera pelo stream.
+    //
+    // Estava depois, e não servia de nada: quem nunca abre um stream nunca chega lá. Aqui
+    // cobre as duas esperas que um par pode fazer eternas — o stream e o `Ola` — porque
+    // fechar a ligação faz o `accept_bi` falhar e a sessão sair pelo caminho normal, com o
+    // `SessaoViva` a limpar tudo.
+    //
+    // Trinta segundos e não três: entre o Brasil e os EUA, com o aperto de mão do QUIC e um
+    // arranque de app pelo meio, um par legítimo pode demorar. O que isto corta é quem NUNCA
+    // fala, não quem fala devagar.
+    let ola_chegou = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let ola_chegou = ola_chegou.clone();
+        let conn_prazo = conn.clone();
+        let quem = peer.clone();
+        guarda.tarefas.push(tokio::spawn(async move {
+            tokio::time::sleep(PRAZO_DO_OLA).await;
+            if !ola_chegou.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[porteiro] {} ligou-se e não se apresentou em {PRAZO_DO_OLA:?}: fecho",
+                    &quem[..8.min(quem.len())]
+                );
+                conn_prazo.close(0u32.into(), b"sem ola");
+            }
+        }));
+    }
+    let ola_para_o_leitor = ola_chegou.clone();
+
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
     let (mut envia, mut recebe) = if iniciei {
         conn.open_bi()
@@ -886,10 +1035,6 @@ async fn sessao(
             .await
             .map_err(|e| anyhow!("sem stream: {e}"))?
     };
-
-    // Antes de decidir o que sai e o que entra: ver se este par já escreveu numa sala
-    // minha. Se escreveu, é de casa, mesmo que nunca tenhamos sincronizado um com o outro.
-    aprender_dos_logs(&app, &peer);
 
     // OUTRA VEZ, DEPOIS DE INSCRITO.
     //
@@ -945,7 +1090,24 @@ async fn sessao(
 
     guarda.tarefas.push(ouvinte);
 
-    let meu_nome = app.nome.lock().unwrap().clone();
+    // O NOME NÃO VAI A QUEM AINDA NÃO É DE CASA (#136, #194).
+    //
+    // Isto mandava o nome escolhido a QUALQUER pessoa que se ligasse. E ligar-se só precisa do
+    // `EndpointId`, que viaja em claro dentro de cada convite — e um convite reencaminha-se.
+    // Bastava alguém ter recebido um convite meu de outra pessoa para ficar a saber que estou
+    // online e como me chamo.
+    //
+    // E não se perde nada, porque o nome NUNCA veio daqui para quem interessa: ele viaja
+    // dentro do log cifrado, na `Carga::Apresentar`, que o `definir_nome` escreve em todas as
+    // salas. Quem partilha uma sala comigo aprende-o por lá — verificado pela chave da sala,
+    // que é uma prova, em vez de uma afirmação de quem se liga.
+    //
+    // O `aprender_dos_logs` já correu acima, portanto neste ponto já se sabe quem é de casa.
+    let meu_nome = if e_de_casa(&app, &peer) {
+        app.nome.lock().map(|n| n.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
     escrever(
         &mut envia,
         &Msg::Ola {
@@ -1025,6 +1187,8 @@ async fn sessao(
         // e uma prekey diferente força um `gravar_indice` — o ciclo completo de cifrar e
         // escrever no disco. Nada obriga o outro lado a mandar um só: mil `Ola`, cada um com
         // uma chave x25519 que ele assina, eram mil reescritas do índice à cadência dele.
+        // A conta do lixo, por sala, desta sessão (#85).
+        let mut orcamento: Orcamento = Default::default();
         let mut ola_visto = false;
         // Um quadro ignorado regista-se uma vez por sessão, não mil.
         let mut quadro_ignorado = false;
@@ -1060,7 +1224,15 @@ async fn sessao(
                     prekey_sig,
                     versao,
                 })) => {
-                    let _ = leitura_janela.emit("peer-nome", (&peer_leitura, &nome));
+                    // O `emit("peer-nome")` que aqui estava foi removido, e não substituído
+                    // por outro (#136). Ninguém o ouvia — e ligá-lo à interface era pior do
+                    // que apagá-lo: seria um nome AUTO-DECLARADO por quem se liga, sem prova
+                    // nenhuma, a aparecer no ecrã ao lado de nomes que vêm do log cifrado e
+                    // esses estão provados pela chave da sala. Duas coisas com o mesmo aspecto
+                    // e garantias opostas é como se enganam pessoas.
+                    //
+                    // O nome continua a chegar, pelo sítio certo: a `Carga::Apresentar`.
+                    let _ = &nome;
                     // A VERSÃO DO OUTRO LADO (#4).
                     //
                     // Um par sem este campo corre uma versão anterior à que o introduziu — e
@@ -1085,6 +1257,8 @@ async fn sessao(
                         );
                     } else {
                         ola_visto = true;
+                        // E diz-se ao vigia do prazo que já não precisa de fechar nada.
+                        ola_para_o_leitor.store(true, std::sync::atomic::Ordering::Relaxed);
                         // A chave de conversa dele, guardada para se poder abrir a conversa
                         // mais tarde sem ele estar online. Verificada antes de guardada — sem
                         // isso, qualquer um anunciava a prekey de outro e lia-lhe as conversas.
@@ -1136,6 +1310,7 @@ async fn sessao(
                         entradas,
                         &peer_leitura,
                         &rede_leitura,
+                        &mut orcamento,
                     );
                 }
                 Ok(Quadro::Controlo(Msg::Nova { servidor, entrada })) => {
@@ -1146,7 +1321,32 @@ async fn sessao(
                         vec![entrada],
                         &peer_leitura,
                         &rede_leitura,
+                        &mut orcamento,
                     );
+                }
+                Ok(Quadro::Controlo(Msg::Recusa { servidor })) => {
+                    // A RECUSA SÓ CONTA SE VIER DE QUEM PODIA RECUSAR (#131).
+                    //
+                    // Um terceiro que soubesse o id da conversa — e ele sai de duas chaves
+                    // públicas, portanto qualquer pessoa o calcula — mandaria isto para me
+                    // fazer crer que a outra pessoa me recusou. Exige-se que quem manda seja
+                    // o OUTRO LADO da conversa: é o `com` que o diz, e ele foi escrito por
+                    // mim quando abri.
+                    let e_dele = leitura_app
+                        .servidores
+                        .lock()
+                        .map(|s| {
+                            s.get(&servidor)
+                                .is_some_and(|srv| srv.com.as_deref() == Some(&peer_leitura))
+                        })
+                        .unwrap_or(false);
+                    if e_dele {
+                        eprintln!(
+                            "[porteiro] {} recusou a conversa",
+                            &peer_leitura[..8.min(peer_leitura.len())]
+                        );
+                        let _ = leitura_janela.emit("conversa-recusada", &servidor);
+                    }
                 }
                 Ok(Quadro::Controlo(Msg::Presenca { servidor, canal })) => {
                     // A presença é o que faz o meu microfone e a minha câmara passarem a
@@ -1259,12 +1459,27 @@ async fn sessao(
                             }
                         }
                         Saida::SyncPara { .. } => None,
+                        Saida::Recusa { para, servidor } if para == peer => {
+                            Some(Quadro::Controlo(Msg::Recusa { servidor }))
+                        }
+                        Saida::Recusa { .. } => None,
                         // Sinalizacao e video sao dirigidos: as outras sessoes deixam passar.
                         Saida::Sinal { para, servidor, canal, dados } if para == peer => {
                             Some(Quadro::Controlo(Msg::Sinal { servidor, canal, dados }))
                         }
                         Saida::Sinal { .. } => None,
-                        Saida::Video { tipo, para, servidor, canal, dados } if para == peer => {
+                        // O VÍDEO PASSA PELO MESMO PORTEIRO QUE A PRESENÇA (#138).
+                        //
+                        // Duas linhas acima, a `Saida::Presenca` tem um `participa(...)` com
+                        // um comentário a explicar porquê. O vídeo — o ecrã e a câmara, que é
+                        // muito mais do que a presença dá — não tinha nada: bastava
+                        // `para == peer`, e o `para` sai da lista que o JavaScript mantém.
+                        //
+                        // Quem forjasse presença entrava nessa lista e passava a receber o
+                        // meu ecrã. O guarda estava construído e esta porta ficou de fora.
+                        Saida::Video { tipo, para, servidor, canal, dados }
+                            if para == peer && participa(&app, &servidor, &peer) =>
+                        {
                             if let Ok(mut n) = rede.contagem.lock() {
                                 n.entry(peer.clone()).or_default().ecra_env += 1;
                             }
@@ -1331,6 +1546,74 @@ fn peer_proprio(app: &Arc<App>) -> String {
     app.minha_chave()
 }
 
+/// Onde a interface está, para um estado inconsistente poder ser DITO.
+///
+/// Os porteiros não têm `AppHandle` — são funções puras chamadas de todo o lado. Isto é o
+/// único fio para lhes dar voz, e é posto uma vez no arranque da rede.
+static JANELA: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// «Recusado» e «não consegui perguntar» NÃO SÃO A MESMA COISA (#139).
+///
+/// # A avaria que isto torna visível
+///
+/// Os três porteiros acabavam todos em `.unwrap_or(false)`. Se um `unwrap()` em qualquer
+/// outro sítio entrar em pânico enquanto segura o `app.servidores` — e há vários — o mutex
+/// fica ENVENENADO, e daí em diante todos os porteiros dizem que não. A toda a gente. Para
+/// sempre. Sem uma linha em lado nenhum.
+///
+/// O sintoma para quem está a usar: a voz cala-se, a sincronização pára, ninguém aparece na
+/// sala — e tudo isto parece um problema de rede, que é o sítio errado para procurar. Uma app
+/// sem servidor não tem a quem perguntar o que se passa.
+///
+/// Um envenenamento é um ESTADO DA APP, não uma resposta. Continua a devolver-se o valor
+/// seguro (recusar), mas diz-se: uma vez no registo, e uma faixa na interface a dizer que
+/// fechar e voltar a abrir resolve — porque resolve mesmo, o log está no disco.
+///
+/// # Porque é que não se termina o processo
+///
+/// Foi ponderado, e é defensável: um envenenamento é irrecuperável e continuar a fingir é
+/// pior. Não se faz porque a queda seria a MEIO de uma chamada, e um par que cai sem dizer
+/// nada é exactamente o que este projecto passou versões a corrigir. A faixa aparece, a
+/// pessoa escolhe o momento, e o estado no disco não corre risco nenhum entretanto.
+fn com_servidores<T>(
+    app: &Arc<App>,
+    o_que: &str,
+    seguro: T,
+    f: impl FnOnce(&std::collections::BTreeMap<String, crate::estado::Servidor>) -> T,
+) -> T {
+    match app.servidores.lock() {
+        Ok(s) => f(&s),
+        Err(_) => {
+            dizer_que_o_estado_esta_partido(o_que);
+            seguro
+        }
+    }
+}
+
+/// Diz-se UMA vez — e nas duas direcções, registo e interface.
+///
+/// Uma vez porque um porteiro envenenado é consultado a cada datagrama de voz: repetir
+/// encheria o registo em segundos e tornaria ilegível justamente o ficheiro onde a
+/// explicação está.
+fn dizer_que_o_estado_esta_partido(o_que: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static JA: AtomicBool = AtomicBool::new(false);
+    if JA.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[estado] o mapa de servidores ficou envenenado (a perguntar por «{o_que}»): a partir \
+         de agora os porteiros recusam tudo. Fecha e volta a abrir o Bruma."
+    );
+    if let Some(j) = JANELA.get() {
+        let _ = j.emit(
+            "erro-dados",
+            "O Bruma ficou num estado inconsistente: a voz, o vídeo e a sincronização vão \
+             recusar tudo até fechares e voltares a abrir. Os teus dados no disco estão bem.",
+        );
+    }
+}
+
 fn conhecido(app: &Arc<App>, peer: &str) -> bool {
     // A AMIZADE NÃO ENTRA AQUI, e foi uma decisão tomada depois de a escrever.
     //
@@ -1344,24 +1627,55 @@ fn conhecido(app: &Arc<App>, peer: &str) -> bool {
     // E não se perde nada declarado: a amizade continua a dar ligação (é o vigia que disca)
     // e conversa privada (que vai pelo `participa`, não por aqui). Voz fora de um servidor
     // ainda não existe — quando existir, será com o consentimento de quem atende.
-    app.servidores
-        .lock()
-        .map(|s| {
-            s.values()
-                // Uma CONVERSA não conta. Ela é guardada como um servidor — é isso que a
-                // torna barata — mas não é uma sala partilhada: qualquer pessoa que tenha a
-                // minha chave pública abre uma comigo, e a minha chave é pública por
-                // desenho.
-                //
-                // Se contasse, a funcionalidade desfazia o porteiro construído para a
-                // proteger: bastava abrir-me uma conversa para ganhar o direito de me pôr
-                // som nas colunas e abrir descodificadores na minha máquina.
-                //
-                // O critério é partilhar uma SALA, e isso prova-se com a chave dela.
-                .filter(|srv| srv.com.is_none())
-                .any(|srv| srv.peers.iter().any(|p| p == peer))
+    com_servidores(app, "conhecido", false, |s| {
+        s.values()
+            // Uma CONVERSA não conta. Ela é guardada como um servidor — é isso que a
+            // torna barata — mas não é uma sala partilhada: qualquer pessoa que tenha a
+            // minha chave pública abre uma comigo, e a minha chave é pública por
+            // desenho.
+            //
+            // Se contasse, a funcionalidade desfazia o porteiro construído para a
+            // proteger: bastava abrir-me uma conversa para ganhar o direito de me pôr
+            // som nas colunas e abrir descodificadores na minha máquina.
+            //
+            // O critério é partilhar uma SALA, e isso prova-se com a chave dela.
+            .filter(|srv| srv.com.is_none())
+            .any(|srv| srv.peers.iter().any(|p| p == peer))
+    })
+}
+
+/// Já há desconhecidos a mais para aceitar mais este? (#195)
+///
+/// À parte da `sessao` pela razão de sempre neste ficheiro: é uma DECISÃO, e uma decisão
+/// testa-se sozinha. A `sessao` precisa de uma ligação QUIC viva; isto precisa de uma lista de
+/// nomes.
+///
+/// Duas regras, e a ordem entre elas é o ponto todo:
+///
+/// 1. **Quem é de casa entra sempre.** Por muito cheia que a casa esteja, um par que partilha
+///    uma sala comigo — ou que eu convidei — nunca é recusado. Um tecto que corta gente de
+///    casa é uma avaria, não uma defesa.
+/// 2. Para os outros, conta-se quantos DESCONHECIDOS já estão ligados. O `ligados` inclui esta
+///    sessão, que já se registou no mapa — por isso o próprio par a contar-se a si mesmo é o
+///    que faz a comparação ser `>` e não `>=`.
+fn ha_estranhos_a_mais(app: &Arc<App>, ligados: &[String], quem_chega: &str) -> bool {
+    if e_de_casa(app, quem_chega) {
+        return false;
+    }
+    ligados.iter().filter(|p| !e_de_casa(app, p)).count() > TECTO_DE_ESTRANHOS
+}
+
+/// Fui EU que o convidei para alguma sala? — o outro fio de confiança, além de partilhar sala.
+///
+/// Quem entra por convite ainda não escreveu nada, portanto não é `conhecido` de ninguém. Do
+/// lado de quem entrou, o anfitrião fica em `convidou`; é esse o único par que se conhece antes
+/// de haver prova. Serve para decidir a quem se diz o nome (#136) e quem não conta para o tecto
+/// de estranhos (#195).
+fn e_de_casa(app: &Arc<App>, peer: &str) -> bool {
+    conhecido(app, peer)
+        || com_servidores(app, "convidou", false, |s| {
+            s.values().any(|srv| srv.convidou.as_deref() == Some(peer))
         })
-        .unwrap_or(false)
 }
 
 /// Aprende, do próprio log, que este par é de casa.
@@ -1435,25 +1749,52 @@ fn ataque_permitido() -> bool {
 }
 
 fn pode_sincronizar(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
-    app.servidores
-        .lock()
-        .map(|s| {
-            s.get(servidor).is_some_and(|srv| {
-                srv.peers.iter().any(|p| p == peer) || srv.convidou.as_deref() == Some(peer)
-            })
+    com_servidores(app, "pode sincronizar", false, |s| {
+        s.get(servidor).is_some_and(|srv| {
+            srv.peers.iter().any(|p| p == peer) || srv.convidou.as_deref() == Some(peer)
         })
-        .unwrap_or(false)
+    })
+}
+
+/// A lista de destinatários, depois do porteiro — e a queixa quando alguém cai fora.
+///
+/// Usada pela voz (#138). Devolve só quem participa mesmo naquela sala, e diz UMA vez quando
+/// tira alguém: se a interface e o Rust discordam sobre quem está numa chamada, isso é uma
+/// coisa que se quer saber, e não um silêncio a cada pedaço de som.
+pub fn so_quem_participa(app: &Arc<App>, servidor: &str, para: &[String]) -> Vec<String> {
+    let permitidos: Vec<String> = para
+        .iter()
+        .filter(|p| participa(app, servidor, p))
+        .cloned()
+        .collect();
+    if permitidos.len() != para.len() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static JA: AtomicBool = AtomicBool::new(false);
+        if !JA.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[porteiro] a interface queria mandar voz a {} pares e só {} pertencem à sala \
+                 {}: os outros não recebem",
+                para.len(),
+                permitidos.len(),
+                &servidor[..8.min(servidor.len())]
+            );
+        }
+    }
+    permitidos
 }
 
 fn participa(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
-    app.servidores
-        .lock()
-        .map(|s| {
-            s.get(servidor)
-                .is_some_and(|srv| srv.peers.iter().any(|p| p == peer))
-        })
-        .unwrap_or(false)
+    com_servidores(app, "participa", false, |s| {
+        s.get(servidor)
+            .is_some_and(|srv| srv.peers.iter().any(|p| p == peer))
+    })
 }
+
+/// Quanto lixo cada par já nos fez engolir, nesta sessão e por sala (#85).
+///
+/// Vive na sessão e não no `App` de propósito: um par que se porte mal e depois se ligue outra
+/// vez merece uma segunda oportunidade — o que não pode é gastar-nos a máquina numa só.
+type Orcamento = std::collections::HashMap<(String, String), usize>;
 
 fn aplicar(
     app: &Arc<App>,
@@ -1462,7 +1803,20 @@ fn aplicar(
     entradas: Vec<blog::Entry>,
     peer: &str,
     rede: &Arc<Rede>,
+    orcamento: &mut Orcamento,
 ) {
+    // O PORTEIRO DA ENTRADA (#85).
+    //
+    // Quem já provou pertencer a esta sala passa sem limite nenhum: sincronizar um histórico
+    // grande é o comportamento normal e não pode ter tecto. Quem ainda não provou entra na
+    // mesma — é assim que alguém se prova, escrevendo algo que decifra — mas com uma conta
+    // aberta, e a conta é do lixo que já mandou.
+    let chave = (peer.to_string(), servidor.to_string());
+    if !pode_sincronizar(app, servidor, peer)
+        && orcamento.get(&chave).copied().unwrap_or(0) > LIXO_TOLERADO
+    {
+        return;
+    }
     // «Não temos este servidor» tem duas leituras, e só uma delas é «não é para nós».
     //
     // A outra é: ele acabou de abrir a nossa conversa e escreveu-me. Aí eu ainda não tenho
@@ -1489,6 +1843,12 @@ fn aplicar(
                 "[porteiro] {} quis abrir uma conversa e a tua definição não deixa",
                 &peer[..8.min(peer.len())]
             );
+            // E DIZ-SE-LHE (#131). Sem isto ele escrevia dias para uma sala que só existe
+            // na máquina dele.
+            let _ = rede.tx.send(Saida::Recusa {
+                para: peer.to_string(),
+                servidor: servidor.to_string(),
+            });
             return;
         }
         if let Err(e) = app.abrir_conversa(peer) {
@@ -1504,6 +1864,10 @@ fn aplicar(
         );
     }
 
+    // Quem passou a ser membro desta sala AGORA (#196). Sai do bloco com o mutex para ser
+    // dito depois de ele ser largado: emitir um evento com um `lock` na mão é como se
+    // constroem os bloqueios que ninguém consegue reproduzir.
+    let mut entraram: Vec<String> = Vec::new();
     let (novas, aprendi) = {
         let mut s = app.servidores.lock().unwrap();
         let Some(srv) = s.get_mut(servidor) else {
@@ -1531,8 +1895,23 @@ fn aplicar(
         // antes de inserir). Engoli-lo com `unwrap_or(0)` era a pior falha que este projecto
         // reconhece: as mensagens apareciam no ecrã e desapareciam ao fechar. Regista-se e
         // avisa-se a interface.
-        let novas = match srv.merge_verificado(entradas) {
-            Ok(n) => n,
+        let novas = match srv.merge_contado(entradas) {
+            Ok((n, recusadas)) => {
+                if recusadas > 0 {
+                    let gasto = orcamento.entry(chave.clone()).or_insert(0);
+                    *gasto += recusadas;
+                    if *gasto > LIXO_TOLERADO {
+                        eprintln!(
+                            "[porteiro] {} mandou {} entradas que não decifram na sala {}: \
+                             fecho-lhe a conta desta sala nesta sessão",
+                            &peer[..8.min(peer.len())],
+                            gasto,
+                            &servidor[..8.min(servidor.len())]
+                        );
+                    }
+                }
+                n
+            }
             Err(e) => {
                 eprintln!("[dados] não consegui gravar as mensagens que chegaram: {e}");
                 let _ = janela.emit(
@@ -1562,12 +1941,13 @@ fn aplicar(
                 .filter(|a| a.as_str() != peer_proprio(app) && !srv.peers.iter().any(|p| p == *a))
                 .cloned()
                 .collect();
-            for autor in novos {
+            for autor in &novos {
                 if autor == peer {
                     aprendi = true;
                 }
-                srv.peers.push(autor);
+                srv.peers.push(autor.clone());
             }
+            entraram = novos;
         }
         (novas, aprendi)
     };
@@ -1591,6 +1971,21 @@ fn aplicar(
     }
     if novas > 0 {
         let _ = janela.emit("servidor-mudou", servidor);
+    }
+
+    // ALGUÉM PASSOU A SER MEMBRO, E ISSO DIZ-SE (#196).
+    //
+    // Quando uma entrada nova decifra, todos os autores dela passam a estar nos `peers` — e é
+    // a regra certa, porque a chave da sala é a prova. Mas o acontecimento era completamente
+    // mudo: nem evento, nem linha no histórico, nem nada. Alguém ganhava o direito de me pôr
+    // som nas colunas e de receber o meu ecrã, e ninguém ficava a saber.
+    //
+    // Vai como AVISO e não como mensagem: não é história assinada, é do mesmo tipo efémero
+    // que a presença já é. E vai em lote — numa sala que sincroniza histórico grande, muitos
+    // autores aparecem de uma vez, e uma linha por cada seria uma enxurrada em vez de uma
+    // informação.
+    if !entraram.is_empty() {
+        let _ = janela.emit("membros-novos", (servidor, &entraram));
     }
     // Ele deu-se a conhecer neste servidor: agora é participante, e recebe o que eu tenho.
     // É esta resposta — e não um sync voluntariado a toda a gente — que traz o histórico a
@@ -1675,6 +2070,7 @@ fn nome_da_msg(m: &Msg) -> &'static str {
         Msg::Nova { .. } => "Nova",
         Msg::Presenca { .. } => "Presenca",
         Msg::Sinal { .. } => "Sinal",
+        Msg::Recusa { .. } => "Recusa",
         Msg::Desconhecida => "Desconhecida",
     }
 }
@@ -2279,6 +2675,131 @@ mod testes {
             a.discou("p2", t0),
             2,
             "o p2 nunca falhou, não pode herdar o recuo do p1"
+        );
+    }
+
+    /// Um `App` de teste com uma sala e um membro — o mínimo para exercitar os porteiros.
+    ///
+    /// Os porteiros lêem só o mapa de servidores; não precisam de rede, nem de disco, nem de
+    /// identidade. É por isso que se testam aqui, e é por isso que valem: a decisão é uma
+    /// função do estado, e uma função do estado prova-se.
+    fn app_com_sala(membros: &[&str]) -> Arc<App> {
+        let app = crate::estado::App::para_teste();
+        {
+            let mut s = app.servidores.lock().unwrap();
+            let mut srv = crate::estado::Servidor::para_teste("sala");
+            srv.peers = membros.iter().map(|m| m.to_string()).collect();
+            s.insert("sala".to_string(), srv);
+        }
+        app
+    }
+
+    /// A VOZ SÓ SAI PARA QUEM PERTENCE À SALA (#138).
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// A lista de quem me ouve vivia só no JavaScript, alimentada por mensagens de presença
+    /// que chegam da rede. Um par com software modificado que forjasse presença entrava nessa
+    /// lista, e o Rust escrevia-lhe datagramas sem perguntar nada — cinquenta vezes por
+    /// segundo, com o meu microfone lá dentro.
+    ///
+    /// A presença, o vídeo e a sincronização já passavam pelo `participa`. A voz não. Este
+    /// teste é a afirmação de que passa.
+    #[test]
+    fn a_voz_so_sai_para_quem_pertence_a_sala() {
+        let de_casa = "aa".repeat(32);
+        let forjado = "ff".repeat(32);
+        let app = app_com_sala(&[&de_casa]);
+
+        let pedido = vec![de_casa.clone(), forjado.clone()];
+        let permitidos = so_quem_participa(&app, "sala", &pedido);
+        assert_eq!(permitidos, vec![de_casa.clone()], "só o membro recebe voz");
+
+        // E numa sala que nem sequer existe, não sai nada para ninguém.
+        assert!(
+            so_quem_participa(&app, "sala-que-nao-tenho", &pedido).is_empty(),
+            "uma sala que não é minha não autoriza ninguém"
+        );
+    }
+
+    /// «DE CASA» é partilhar uma sala ou ter sido convidado por mim (#195, #136).
+    ///
+    /// É este o critério que decide a quem se diz o nome e quem não conta para o tecto de
+    /// desconhecidos. Uma CONVERSA não conta — qualquer pessoa com a minha chave pública abre
+    /// uma comigo, e a chave é pública por desenho: se contasse, bastava escrever-me para
+    /// deixar de ser estranho.
+    #[test]
+    fn de_casa_e_partilhar_sala_ou_ter_sido_convidado() {
+        let membro = "aa".repeat(32);
+        let estranho = "ff".repeat(32);
+        let app = app_com_sala(&[&membro]);
+        assert!(e_de_casa(&app, &membro));
+        assert!(!e_de_casa(&app, &estranho));
+
+        // Uma conversa com o estranho NÃO o torna de casa.
+        {
+            let mut s = app.servidores.lock().unwrap();
+            let mut conversa = crate::estado::Servidor::para_teste("conversa");
+            conversa.peers = vec![estranho.clone()];
+            conversa.com = Some(estranho.clone());
+            s.insert("conversa".to_string(), conversa);
+        }
+        assert!(
+            !e_de_casa(&app, &estranho),
+            "abrir-me uma conversa não pode dar direitos de sala"
+        );
+
+        // Mas ter sido convidado por mim, sim: é o único fio antes de haver prova.
+        {
+            let mut s = app.servidores.lock().unwrap();
+            s.get_mut("sala").unwrap().convidou = Some(estranho.clone());
+        }
+        assert!(e_de_casa(&app, &estranho), "quem eu convidei é de casa");
+    }
+
+    /// O TECTO DE DESCONHECIDOS NUNCA CORTA GENTE DE CASA (#195).
+    ///
+    /// # A avaria que isto mede
+    ///
+    /// O ciclo de `accept` aceitava qualquer ligação com o ALPN certo e lançava uma tarefa por
+    /// cada uma, sem limite. Quem tem a minha chave — que viaja em claro em qualquer convite
+    /// reencaminhado — podia abrir quantas quisesse.
+    ///
+    /// Mas um tecto mal feito é pior do que nenhum: cortar um par legítimo é uma avaria que
+    /// parece rede e não se diagnostica. Por isso a primeira coisa que este teste afirma não é
+    /// que o tecto corta — é que ele NÃO corta quem é de casa, esteja a casa como estiver.
+    #[test]
+    fn o_tecto_de_estranhos_nunca_corta_gente_de_casa() {
+        let membro = "aa".repeat(32);
+        let app = app_com_sala(&[&membro]);
+        let estranhos: Vec<String> = (0..40u8).map(|i| format!("{:02x}", i).repeat(32)).collect();
+
+        // A casa a abarrotar de desconhecidos, e o membro chega: entra.
+        assert!(
+            !ha_estranhos_a_mais(&app, &estranhos, &membro),
+            "quem partilha sala comigo entra sempre"
+        );
+
+        // Abaixo do tecto, um desconhecido também entra.
+        let poucos = estranhos[..TECTO_DE_ESTRANHOS].to_vec();
+        assert!(
+            !ha_estranhos_a_mais(&app, &poucos, &estranhos[9]),
+            "com {TECTO_DE_ESTRANHOS} ligados ainda cabe mais um"
+        );
+
+        // Acima, não. (O `ligados` já inclui quem chega: é a sessão que acabou de se
+        // registar no mapa.)
+        let demais = estranhos[..TECTO_DE_ESTRANHOS + 1].to_vec();
+        assert!(
+            ha_estranhos_a_mais(&app, &demais, &estranhos[0]),
+            "acima do tecto, um desconhecido é recusado"
+        );
+
+        // E os de casa não gastam lugar: quarenta membros ligados não fecham a porta.
+        let cheia = app_com_sala(&estranhos.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        assert!(
+            !ha_estranhos_a_mais(&cheia, &estranhos, &estranhos[0]),
+            "quarenta pares de casa não contam para o tecto dos desconhecidos"
         );
     }
 

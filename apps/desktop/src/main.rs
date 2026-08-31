@@ -99,6 +99,7 @@ macro_rules! handler_com {
             comandos::criar_servidor,
             comandos::criar_canal,
             comandos::apagar_canal,
+            comandos::apagar_conversa,
             comandos::criar_convite,
             comandos::entrar_com_convite,
             comandos::abrir_conversa,

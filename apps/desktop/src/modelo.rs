@@ -49,10 +49,29 @@ pub struct Membro {
     /// Chave pública em hex. É o ID da pessoa; não há nome de utilizador reservado.
     pub chave: String,
     pub nome: String,
-    /// Se é o fundador do servidor. O fundador é simplesmente quem escreveu a primeira
-    /// operação — não há registo de "dono" para se falsificar.
-    pub fundador: bool,
 }
+
+// O CRACHÁ DE FUNDADOR FOI REMOVIDO, E A RAZÃO FICA ESCRITA (#144).
+//
+// Ele dizia: «o fundador é simplesmente quem escreveu a primeira operação — não há registo de
+// "dono" para se falsificar». A segunda metade era falsa.
+//
+// «A primeira operação» era o índice 0 da ordem de chegada, que sai do `ordered()`, que
+// ordena por `instantes()` — e uma entrada com `prev = ZERO_HASH` recebe `max(ts_ms, 1)`.
+// Nada verifica o `prev`: nem o `log.merge` (só a assinatura) nem o `merge_contado` (só a
+// decifragem). Qualquer membro da sala escrevia uma entrada com `prev` a zeros e `ts_ms` a
+// zero, e passava a aparecer, a toda a gente, como quem fundou a sala.
+//
+// E não há um substituto honesto. A hipótese óbvia — «o autor da raiz canónica, a entrada com
+// `prev` a zeros de menor hash» — não serve, porque raízes legítimas são NORMAIS: quem entra
+// por convite escreve a sua apresentação antes de receber o histórico, e nessa altura o log
+// dele está vazio, portanto o `head()` é o hash-zero. Recusar segundas raízes partia a entrada
+// de quem se junta; escolher entre elas premiava um hash.
+//
+// Num log onde qualquer pessoa com a chave da sala escreve o que quiser, com o carimbo de
+// tempo que quiser e o `prev` que quiser, **não existe um primeiro que se possa provar**. A
+// lista de membros continua a dizer quem escreveu — isso é verificável, porque cada entrada
+// está assinada. Quem fundou não é.
 
 /// O que vai dentro da carga cifrada de cada entrada do log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,8 +204,7 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
 
     let membros = ordem_de_chegada
         .iter()
-        .enumerate()
-        .map(|(i, chave)| Membro {
+        .map(|chave| Membro {
             chave: chave.clone(),
             nome: nomes
                 .get(chave)
@@ -194,7 +212,6 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
                 .cloned()
                 // Sem apresentação, mostra-se um pedaço da chave. Não se inventa um nome.
                 .unwrap_or_else(|| format!("{}…", &chave[..chave.len().min(6)])),
-            fundador: i == 0,
         })
         .collect();
 
@@ -388,8 +405,15 @@ mod tests {
         );
     }
 
+    /// A lista de membros é a ordem em que cada um ESCREVEU pela primeira vez — e mais nada.
+    ///
+    /// Este teste substituiu o `o_fundador_e_quem_escreveu_primeiro`, que afirmava que o
+    /// primeiro da lista era o fundador. A ordem continua a ser esta e continua a ser útil;
+    /// o que deixou de existir é a CONCLUSÃO que se tirava dela, porque não se aguentava: um
+    /// membro qualquer escrevia uma entrada com `prev` a zeros e carimbo zero e passava para
+    /// a frente da fila. Ver a nota no `Membro` (#144).
     #[test]
-    fn o_fundador_e_quem_escreveu_primeiro() {
+    fn os_membros_vem_pela_ordem_em_que_escreveram() {
         let e = vec![
             ap(
                 "aaa",
@@ -399,11 +423,21 @@ mod tests {
                 },
             ),
             ap("bbb", 2, Carga::Apresentar { nome: "rui".into() }),
+            // E escrever outra vez não muda o lugar de ninguém.
+            ap(
+                "aaa",
+                3,
+                Carga::Mensagem {
+                    canal: "geral".into(),
+                    texto: "olá".into(),
+                },
+            ),
         ];
         let s = reconstruir(&e);
         assert_eq!(s.nome, "Casa");
-        assert!(s.membros[0].fundador, "o primeiro a escrever e o fundador");
-        assert!(!s.membros[1].fundador);
+        assert_eq!(s.membros.len(), 2, "duas pessoas, três entradas");
+        assert_eq!(s.membros[0].chave, "aaa");
+        assert_eq!(s.membros[1].chave, "bbb");
     }
 
     #[test]

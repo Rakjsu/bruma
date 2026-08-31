@@ -1412,3 +1412,18 @@ body.ghost .app { transition: filter .8s var(--ease); }
 /* Versao diferente da minha: ambar, nao vermelho -- nao e um erro, e uma explicacao. Sem
    isto, uma funcionalidade que nao funciona por diferenca de versao parece uma avaria. */
 .versao-diferente { color: var(--amber) !important; }
+
+/* Um aviso do sistema no meio da conversa: alguém entrou na sala (#196), ou a pessoa do
+   outro lado recusou (#131). Não é uma mensagem — não vem do log, não está assinado, e
+   desaparece ao recarregar —, por isso não tem avatar, nem hora, nem autor. Discreto de
+   propósito: a informação é útil e não é o assunto. */
+.aviso-sistema {
+  margin: 10px auto;
+  padding: 6px 12px;
+  max-width: 82%;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--txt-fraco, #8a8f98);
+  background: color-mix(in srgb, var(--fundo-2, #2b2d31) 70%, transparent);
+  border-radius: 10px;
+}
