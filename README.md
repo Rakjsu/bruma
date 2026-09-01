@@ -6,8 +6,12 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.19.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.20.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos, permissões de mensagens e por-ler com avisos.**
+>
+> A voz mede-se a si própria: a folga de reprodução adapta-se à rede em vez de ser um
+> número escrito à mão, os cortes contam-se, e o painel diz se o teu microfone está a
+> captar alguma coisa em vez de o presumir.
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
