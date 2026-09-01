@@ -1439,6 +1439,18 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
         .iter()
         .filter_map(|p| {
             let (c, _) = ligacoes.get(p)?;
+            // UMA LIGAÇÃO MORTA NÃO DÁ UM RTT ANTIGO (#142). O painel existe para
+            // transformar «não se ouve nada» numa resposta, e uma ligação fechada a
+            // aparecer com o RTT da última vez que esteve viva é a resposta errada.
+            if let Some(razao) = c.close_reason() {
+                return Some(serde_json::json!({
+                    "peer": p, "relay": false, "ms": null, "morta": razao.to_string(),
+                    "enviados": 0, "recebidos": 0, "envS": 0, "recS": 0,
+                    "haQuantoRec": null, "vozFalhados": 0, "perda": null,
+                    "disseTerEnviado": 0, "filaLivre": 0,
+                    "ecraEnviado": 0, "ecraRecebido": 0,
+                }));
+            }
             let caminhos = c.paths();
             let escolhido = caminhos.iter().find(|x| x.is_selected());
             // ZERO NÃO É «ZERO MILISSEGUNDOS», É «NINGUÉM MEDIU» (#171).

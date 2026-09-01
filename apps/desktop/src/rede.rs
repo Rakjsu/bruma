@@ -12,7 +12,7 @@
 use anyhow::{anyhow, bail, Result};
 use data_encoding::HEXLOWER;
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, Watcher};
 use serde::{Deserialize, Serialize};
 use spike_common::log as blog;
 use std::sync::Arc;
@@ -765,6 +765,19 @@ impl Adiamento {
         *s = (*s * 2).min(60);
         agendado
     }
+
+    /// Volta a agendar SEM crescer o recuo (#172).
+    ///
+    /// Para quando a tentativa falhou por culpa nossa — sem relay de casa não há travessia
+    /// de NAT nem endereço publicado, e a falha não diz nada sobre o outro lado. Espera-se
+    /// o mesmo que da última vez e tenta-se outra vez; um par que nunca responde continua
+    /// a subir pelo `discou`, um que nunca foi tentado a sério não é castigado.
+    fn ainda_o_mesmo(&mut self, peer: &str, agora: std::time::Instant) -> u64 {
+        let s = *self.espera.get(peer).unwrap_or(&2);
+        self.proxima
+            .insert(peer.to_string(), agora + std::time::Duration::from_secs(s));
+        s
+    }
 }
 
 /// Mantém as ligações de pé, para sempre.
@@ -789,8 +802,28 @@ impl Adiamento {
 /// a ligação pega. Sem recuo, um peer desligado durante a noite dava milhares de tentativas
 /// e enchia o registo de ruído.
 async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
+    // ESPERAR QUE O LADO DE CÁ ESTEJA PRONTO (#172).
+    //
+    // Esta tarefa arrancava ao mesmo tempo que o `bind()` acabava. Nessa altura ainda não há
+    // relay escolhido nem endereço publicado — a documentação do iroh diz isso com todas as
+    // letras e oferece o `online()` precisamente para se esperar por ele. As primeiras
+    // tentativas falhavam porque NÓS não estávamos prontos, e cada falha duplicava o recuo
+    // daquele par: 2, 4, 8, 16 segundos de castigo por uma culpa que não era dele.
+    //
+    // O tecto de tempo existe para a rede local isolada, onde não há relay nenhum para
+    // esperar e a ligação directa funciona à mesma. Quinze segundos é muito mais do que o
+    // `online()` costuma demorar e muito menos do que alguém espera por uma conversa.
+    let esperou =
+        tokio::time::timeout(std::time::Duration::from_secs(15), rede.endpoint.online()).await;
+    match esperou {
+        Ok(()) => eprintln!("[rede] relay de casa ligado; o vigia começa agora"),
+        Err(_) => eprintln!("[rede] 15 s sem relay de casa; o vigia começa na mesma (rede local?)"),
+    }
+
     let mut adiamento = Adiamento::default();
+    let mut voltas: u64 = 0;
     loop {
+        voltas += 1;
         let conhecidos: Vec<String> = {
             let Ok(s) = app.servidores.lock() else {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -840,14 +873,36 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
             .collect();
         let agora = std::time::Instant::now();
         for peer in conhecidos {
-            let ja_ligado = rede
-                .ligacoes
-                .lock()
-                .map(|l| l.contains_key(&peer))
-                .unwrap_or(false);
+            let ja_ligado = tem_ligacao_viva(&rede.ligacoes, &peer);
             if ja_ligado {
                 // Pegou: o próximo corte volta a tentar depressa, e não daqui a um minuto.
                 adiamento.pegou(&peer);
+                // A SUBSTITUIÇÃO FORÇADA (#50), só em `debug` e só com a bandeira posta.
+                // Sem isto o ramo do `Destino::Substitui` — o único onde o contador de
+                // ligados se estragava — não é exercitado por nada nesta máquina.
+                if let Some(cada) = crate::bandeiras::discar_a_dobrar_a_cada_voltas() {
+                    if voltas.is_multiple_of(cada.max(1)) {
+                        // O `ligar` normal recusa-se: o `reservar` ve que o par ja esta no
+                        // mapa e volta logo. E preciso passar-lhe por cima, que e
+                        // exactamente o que a rede faz sozinha quando os dois lados discam
+                        // no mesmo instante.
+                        eprintln!(
+                            "[teste] a discar A DOBRAR para {} (BRUMA_DISCAR_A_DOBRAR)",
+                            &peer[..8.min(peer.len())]
+                        );
+                        if let Ok(id) = peer.parse::<EndpointId>() {
+                            match rede.endpoint.connect(EndpointAddr::from(id), ALPN).await {
+                                Ok(conn) => {
+                                    let (r, a, j) = (rede.clone(), app.clone(), janela.clone());
+                                    tokio::spawn(async move {
+                                        let _ = sessao(conn, true, r, a, j).await;
+                                    });
+                                }
+                                Err(e) => eprintln!("[teste] a dobrar falhou: {e}"),
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             if adiamento.ainda_cedo(&peer, agora) {
@@ -869,7 +924,31 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
             //
             // Quem limpa o recuo é o `pegou`, lá em cima, que tem prova de sessão viva.
             let resultado = ligar(&rede, &app, &janela, &peer).await;
-            let s = adiamento.discou(&peer, agora);
+            // SE A CULPA É NOSSA, O RECUO NÃO CRESCE (#172).
+            //
+            // Sem relay de casa não há travessia de NAT nem endereço publicado: a tentativa
+            // falha por o lado de cá estar em baixo, não por o outro não atender. Castigar o
+            // par por isso é o que fazia um par perfeitamente contactável ficar com um recuo
+            // de dezasseis segundos a seguir a uma mudança de rede — precisamente o momento
+            // em que se quer religar depressa.
+            //
+            // Um par que nunca respondeu continua a subir. Um que não foi sequer tentado a
+            // sério, não.
+            let temos_relay = rede
+                .endpoint
+                .home_relay_status()
+                .get()
+                .into_iter()
+                .any(|r| r.is_connected());
+            let s = if temos_relay {
+                adiamento.discou(&peer, agora)
+            } else {
+                eprintln!(
+                    "[rede] {} não atendeu, mas nós é que não temos relay: o recuo fica",
+                    &peer[..8.min(peer.len())]
+                );
+                adiamento.ainda_o_mesmo(&peer, agora)
+            };
             match &resultado {
                 Ok(()) => eprintln!(
                     "[rede] discado para {}; se pegar, o recuo limpa-se na volta seguinte",
@@ -887,19 +966,74 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
 
 /// Reserva o par para uma tentativa de ligação. `false` quer dizer «já há, ou já vai a
 /// caminho» — e nesse caso não se liga outra vez.
+/// Este par tem uma ligação VIVA — e não apenas uma entrada no mapa (#142).
+///
+/// # A avaria que isto fecha
+///
+/// Três decisões dependiam de a chave estar no mapa: o vigia decidia não discar, o
+/// `reservar` recusava uma tentativa, e o desempate preferia a que já lá estava. Mas o que
+/// tira uma entrada do mapa é só o `Drop` do `SessaoViva` — e há maneiras de a tarefa da
+/// sessão nunca lá chegar. Bastava uma para o par ficar inalcançável **para sempre**: o
+/// mapa dizia «ligado», o vigia acreditava, e ninguém voltava a tentar.
+///
+/// Perguntar ao QUIC é barato e não mente: uma ligação fechada tem razão de fecho. E a
+/// entrada morta é removida no mesmo gesto, porque deixá-la lá era o problema.
+///
+/// Se a leitura for optimista num instante de reconexão interna do iroh, apaga-se uma
+/// ligação boa — e o pior caso é o vigia discar outra vez dois segundos depois.
+fn tem_ligacao_viva(
+    ligacoes: &std::sync::Mutex<std::collections::HashMap<String, (Connection, u64)>>,
+    peer: &str,
+) -> bool {
+    let Ok(mut l) = ligacoes.lock() else {
+        return false;
+    };
+    match l.get(peer) {
+        None => false,
+        Some((c, _)) if c.close_reason().is_none() => true,
+        Some(_) => {
+            l.remove(peer);
+            eprintln!(
+                "[rede] a entrada de {} no mapa estava morta; removida",
+                &peer[..8.min(peer.len())]
+            );
+            false
+        }
+    }
+}
+
 fn reservar(
     ligacoes: &std::sync::Mutex<std::collections::HashMap<String, (Connection, u64)>>,
     a_ligar: &std::sync::Mutex<std::collections::HashSet<String>>,
     peer: &str,
 ) -> bool {
-    let ja = ligacoes
-        .lock()
-        .map(|l| l.contains_key(peer))
-        .unwrap_or(false);
+    let ja = tem_ligacao_viva(ligacoes, peer);
     let Ok(mut fila) = a_ligar.lock() else {
         return false;
     };
     !ja && fila.insert(peer.to_string())
+}
+
+/// Quanto tempo tem de passar entre dois pedidos de log ao mesmo par (#53).
+///
+/// Um par cronicamente atrasado — um portátil a nadar, uma ligação por relay saturada —
+/// pediria um log inteiro a cada soluço do canal, e cada pedido desses agrava o atraso que
+/// o causou. Dez segundos são muito menos do que uma pessoa demora a dar pela falta de uma
+/// mensagem, e muito mais do que a rajada de `Lagged` que um único engasgo produz.
+const RESYNC_MINIMO: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// As salas que eu partilho com este par.
+///
+/// É a mesma pergunta que o sync dirigido faz — «este peer é conhecido nesta sala?» — e a
+/// resposta é a lista de logs que faz sentido voltar a oferecer-lhe.
+fn salas_com(app: &Arc<App>, peer: &str) -> Vec<String> {
+    let Ok(s) = app.servidores.lock() else {
+        return Vec::new();
+    };
+    s.values()
+        .filter(|srv| srv.peers.iter().any(|p| p == peer))
+        .map(|srv| srv.id.clone())
+        .collect()
 }
 
 /// Qual das duas ligações sobrevive quando os dois lados se ligam ao mesmo tempo.
@@ -986,6 +1120,31 @@ struct SessaoViva {
     anunciado: bool,
 }
 
+/// Diz à interface QUEM está ligado — a lista inteira, e não «mais um» ou «menos um» (#50).
+///
+/// # A avaria que isto fecha
+///
+/// A barra contava eventos: `peer-ligado` somava, `peer-desligado` subtraía. Só que quando os
+/// dois lados discam ao mesmo tempo — o que acontece em quase todas as religações, porque os
+/// dois vigias correm de dois em dois segundos — o desempate faz `Destino::Substitui`: a
+/// entrada do mapa passa a ser da sessão NOVA, e o `Drop` da antiga vê que a série já não é a
+/// dela e **cala-se**. A sessão nova emite `peer-ligado`. Uma soma sem a subtração
+/// correspondente, uma vez por religação: «3 ligados» numa sala de duas pessoas.
+///
+/// Um saldo de eventos só precisa de perder um para ficar errado para sempre. A lista não
+/// tem esse problema: cada anúncio é a verdade inteira, e o anúncio seguinte corrige o
+/// anterior sem ninguém ter de perceber o que se passou entre os dois.
+fn anunciar_ligados(rede: &Rede, janela: &AppHandle) {
+    // O lock fecha-se ANTES do emit. O `Drop` de uma sessão pode correr com o mapa tomado
+    // por quem a está a substituir, e emitir lá dentro seria segurar o mapa durante um
+    // salto para a webview.
+    let lista: Vec<String> = match rede.ligacoes.lock() {
+        Ok(l) => l.keys().cloned().collect(),
+        Err(_) => return,
+    };
+    let _ = janela.emit("peers-ligados", &lista);
+}
+
 impl Drop for SessaoViva {
     fn drop(&mut self) {
         for t in &self.tarefas {
@@ -1009,6 +1168,12 @@ impl Drop for SessaoViva {
             .unwrap_or(false);
         if era_a_nossa && self.anunciado {
             let _ = self.janela.emit("peer-desligado", &self.peer);
+        }
+        // A lista sai SEMPRE que o mapa muda, e só quando ele mudou mesmo. Numa substituição
+        // `era_a_nossa` é falso — o mapa já é da sessão nova, que já anunciou — e não há nada
+        // a dizer: é precisamente esse o caso em que o saldo de eventos se estragava.
+        if era_a_nossa {
+            anunciar_ligados(&self.rede, &self.janela);
         }
     }
 }
@@ -1101,6 +1266,8 @@ async fn sessao(
         Destino::Substitui(v) => v.close(0u32.into(), b"substituida"),
         Destino::Fica => {}
     }
+    // Entrou no mapa (de novo ou por substituição): a lista mudou.
+    anunciar_ligados(&rede, &janela);
 
     // O guarda nasce aqui, colado ao registo, e não mais abaixo: abrir o stream já é uma
     // das saídas que deixava a ligação morta no mapa para sempre.
@@ -1263,6 +1430,21 @@ async fn sessao(
             }
         }));
     }
+    // A QUEDA DE UMA SESSÃO DE PÉ (#56). Nesta máquina a rede não soluça, e sem isto a
+    // religação — o caso normal entre os EUA e o Brasil — nunca é exercitada por nada.
+    if let Some(ms) = crate::bandeiras::sessao_morre_ao_fim_de() {
+        let conn_morte = conn.clone();
+        let quem = peer.clone();
+        guarda.tarefas.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            eprintln!(
+                "[teste] a derrubar a sessão de {} ao fim de {ms} ms (BRUMA_SESSAO_MORRE_MS)",
+                &quem[..8.min(quem.len())]
+            );
+            conn_morte.close(0u32.into(), b"queda de proposito");
+        }));
+    }
+
     let ola_para_o_leitor = ola_chegou.clone();
 
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
@@ -1658,6 +1840,11 @@ async fn sessao(
         }
     });
 
+    // O travão do #53 vive aqui, ao lado do laço que o usa: é por sessão, e uma sessão
+    // nova tem direito a pedir o log outra vez sem esperar pelo relógio da anterior.
+    let mut ultimo_resync: Option<std::time::Instant> = None;
+    let nasceu = std::time::Instant::now();
+    let janela_lenta = std::time::Duration::from_secs(crate::bandeiras::escrita_lenta_ate_s());
     loop {
         tokio::select! {
             // Só o leitor de controlo decide o fim. O de datagramas acabar não é motivo
@@ -1769,24 +1956,69 @@ async fn sessao(
                         Saida::Video { .. } => None,
                     };
                     if let Some(q) = quadro {
+                        // A ESCRITA LENTA DE PROPÓSITO (#53), só em `debug` e só com a
+                        // bandeira posta: é o que faz o canal de difusão transbordar e
+                        // dizer `Lagged`, que nesta máquina nunca acontece sozinho.
+                        //
+                        // E é TRANSITÓRIA, com uma janela fixa. Um atraso permanente também
+                        // afogaria a recuperação — o `SyncPara` que o `Lagged` enfileira sai
+                        // por este mesmo laço — e o teste diria «não recuperou» sobre uma
+                        // recuperação que nunca teve por onde sair. Uma rede que engasga e
+                        // volta ao normal é o caso real; uma que nunca mais escreve é outro
+                        // problema, e tem outro nome.
+                        if let Some(ms) = crate::bandeiras::atraso_da_escrita_ms() {
+                            if nasceu.elapsed() < janela_lenta {
+                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            }
+                        }
                         if escrever_quadro_partido(&mut envia, q).await.is_err() {
                             break;
                         }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // O comentário que aqui estava dizia "o próximo sync recupera", e isso
-                    // era verdade quando por aqui só passavam mensagens de controlo. Já não
-                    // é: passam também frames de ecrã e de câmara, e ESSES não se
-                    // recuperam — não há sync que os vá buscar, porque um frame que se
-                    // perdeu já não interessa a ninguém.
+                    // POR AQUI NÃO PASSA SÓ IMAGEM: PASSA TEXTO (#53).
+                    //
+                    // O comentário que aqui estava dizia que os frames de ecrã e de câmara
+                    // não se recuperam — e é verdade, um frame perdido já não interessa a
+                    // ninguém. Mas por este mesmo canal passa a `Saida::Entrada`, que é uma
+                    // MENSAGEM NOVA. Essa perdia-se exactamente igual, em silêncio, e não
+                    // havia nada que a fosse buscar: o `Sync` completo só acontece no
+                    // arranque da sessão. Numa app cujo requisito é «as mensagens sobrevivem
+                    // a estar offline», perder uma por o canal se ter atrasado é o pior
+                    // género de defeito — silencioso e sem rasto.
                     //
                     // Cair também não serve: derrubar a ligação porque um espectador se
-                    // atrasou é trocar um soluço na imagem por uma chamada perdida. O que
-                    // se faz é o que se pode fazer — seguir, e DIZER, para quem estiver a
-                    // ler os registos saber que a imagem partida daquele momento tem uma
-                    // explicação e não é um mistério.
+                    // atrasou é trocar um soluço na imagem por uma chamada perdida.
+                    //
+                    // O que se faz é separar o que se recupera do que não se recupera. O
+                    // `merge` é idempotente e endereçado por conteúdo, portanto pedir o log
+                    // outra vez não custa nada a quem já o tem.
                     eprintln!("[rede] {peer} atrasou-se e perdeu {n} pedaços");
+                    // O TRAVÃO. Um par cronicamente atrasado pediria sincronizações de logs
+                    // grandes a cada soluço, o que agrava o próprio atraso que as causou.
+                    let agora = std::time::Instant::now();
+                    let pode = ultimo_resync
+                        .map(|t: std::time::Instant| agora.duration_since(t) >= RESYNC_MINIMO)
+                        .unwrap_or(true);
+                    if pode {
+                        ultimo_resync = Some(agora);
+                        let salas = salas_com(&app, &peer);
+                        if !salas.is_empty() {
+                            eprintln!(
+                                "[rede] a pedir o log de {} sala(s) a {} — o texto perdido \
+                                 no atraso volta por aqui",
+                                salas.len(),
+                                &peer[..8.min(peer.len())]
+                            );
+                        }
+                        for servidor in salas {
+                            let _ = rede.tx.send(Saida::SyncPara {
+                                para: peer.clone(),
+                                servidor,
+                            });
+                        }
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },

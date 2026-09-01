@@ -48,6 +48,18 @@ const ANDAIMES: &[&str] = &[
     // de a tirar de um `grep`, que e exactamente o erro que esta ferramenta existe para
     // apanhar. Ver `ferramentas/so-o-que-vai-na-release` no README de commits.
     "BRUMA_SESSAO_MORRE",
+    // A queda de uma sessao DE PE, e a substituicao de sessao forcada. As duas existem
+    // porque a religacao -- o caso normal entre os EUA e o Brasil -- nao acontece nesta
+    // maquina: sem elas, o contador de ligados, a marca «a religar» e o reenvio do
+    // cabecalho ficavam por verificar. Andaimes de medicao, e o scan do binario garante
+    // que nao vao na release.
+    "BRUMA_SESSAO_MORRE_MS",
+    "BRUMA_DISCAR_A_DOBRAR",
+    // O atraso na escrita, que faz o canal de difusao transbordar. Sem ele o ramo do
+    // `Lagged` -- onde as mensagens de TEXTO se perdiam em silencio -- nao e exercitado
+    // por nada nesta maquina.
+    "BRUMA_ESCRITA_LENTA_MS",
+    "BRUMA_ESCRITA_LENTA_ATE_S",
     "BRUMA_SYNC_LENTO",
     "BRUMA_SO_VIGIA",
     "BRUMA_SEM_TRAVAO",

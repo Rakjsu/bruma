@@ -2134,8 +2134,12 @@ function comecarAEnviarVoz(microfone) {
       ultimoPedacoSaiu = performance.now();
       // Só se envia a quem está mesmo na sala. Falar para uma lista vazia não custa nada
       // e não se manda nada para lado nenhum.
+      // A quem CAIU não se manda (#51). O Rust já deitava isto fora em silêncio — a chave
+      // não está no mapa de ligações —, mas fazer um `invoke` cinquenta vezes por segundo
+      // para atravessar a ponte e ser deitado fora do outro lado é trabalho a mais por uma
+      // pessoa que não está lá.
       const gente = [...voz.presentes.entries()]
-        .filter(([, c]) => c === voz.canal).map(([p]) => p);
+        .filter(([p, c]) => c === voz.canal && !paresPerdidos.has(p)).map(([p]) => p);
       if (!gente.length) return;
       const bytes = new Uint8Array(pedaco.byteLength);
       pedaco.copyTo(bytes);
@@ -3209,8 +3213,68 @@ function avisoDeVersao(chave) {
   return `tem a ${dele}, tu tens a ${minhaVersao}`;
 }
 
-listen('peer-ligado', () => { ligados += 1; desenharTopo(); });
-listen('peer-desligado', () => { ligados = Math.max(0, ligados - 1); desenharTopo(); });
+/** Quem estava ligado e deixou de estar, sem o ter dito (#51).
+ *
+ *  Não são as pessoas que saíram — essas mandam `Presenca` e desaparecem em condições. São
+ *  as que CAÍRAM: a rede foi abaixo, o portátil fechou, o Brasil trocou de IP. A religação é
+ *  automática e demora segundos, por isso o cartão fica com uma marca em vez de desaparecer:
+ *  apagar e reaparecer lê-se pior do que «a religar».
+ */
+const paresPerdidos = new Set();
+
+/* O QUE A RELIGACAO DEIXOU PARA TRAS, para o `--par` poder olhar.
+ *
+ * `ligadosMax` e o numero que denuncia o defeito do contador (#50): ele SOMAVA eventos, e
+ * numa substituicao de ligacao chegava a soma sem a subtraccao. Numa sala de duas pessoas o
+ * maximo tem de ser 1; qualquer coisa acima disso e o saldo a mentir. */
+let ligadosMax = 0;
+let jaSePerdeu = false;
+let jaVoltou = false;
+
+/* A LISTA MANDA (#50, #51).
+ *
+ * O contador somava `peer-ligado` e subtraía `peer-desligado`, e numa substituição de
+ * ligação — o que acontece em quase todas as religações — só chegava a soma. Agora o Rust
+ * manda a lista inteira sempre que o mapa muda, e o que se desenha é o tamanho dela.
+ *
+ * E é também aqui que se descobre quem caiu. O `voz.presentes` só era limpo pelo ouvinte da
+ * `presenca` — e numa queda de rede não há `Presenca` nenhuma: a pessoa ficava presente para
+ * sempre no painel, com o microfone a codificar para uma chave que já não existia e o ecrã
+ * a ser enviado para ninguém. O `peer-desligado` só mexia no contador.
+ */
+listen('peers-ligados', ev => {
+  const vivos = new Set(Array.isArray(ev.payload) ? ev.payload : []);
+  ligados = vivos.size;
+  if (ligados > ligadosMax) ligadosMax = ligados;
+
+  let mexeu = false;
+  for (const chave of [...voz.presentes.keys()]) {
+    if (vivos.has(chave) || paresPerdidos.has(chave)) continue;
+    paresPerdidos.add(chave);
+    jaSePerdeu = true;
+    // Fecha-se o que consome: descodificadores, fluxos e câmaras de alguém que já não está
+    // do outro lado seguram memória de vídeo e não vão receber mais nada.
+    esquecerOQueEleMandava(chave);
+    mexeu = true;
+  }
+  for (const chave of vivos) {
+    if (paresPerdidos.delete(chave)) { mexeu = true; jaVoltou = true; }
+  }
+  // E os perdidos que entretanto saíram da sala a sério deixam de existir aqui.
+  for (const chave of [...paresPerdidos]) {
+    if (!voz.presentes.has(chave)) paresPerdidos.delete(chave);
+  }
+
+  desenharTopo();
+  if (mexeu) {
+    // Quem voltou é ESPECTADOR NOVO outra vez (#52): o `definir_espectadores` só manda o
+    // cabeçalho a quem não estava na lista, e sem isto quem religasse ficava com o ecrã
+    // preto — a receber fragmentos que o `MediaSource` dele não sabe abrir.
+    actualizarEspectadores();
+    desenharVoz();
+    desenharRodape();
+  }
+});
 
 /* ---------- explicações: o porquê vive na app ---------- */
 
@@ -3587,6 +3651,13 @@ async function desenharDiagnostico() {
   for (const e of estado) {
     const linha = elemento('div', 'diag__linha');
     linha.append(elemento('span', 'diag__quem', nomeDoPeer(e.peer)));
+    // UMA LIGACAO MORTA DIZ-SE (#142), em vez de dar o RTT da ultima vez que esteve viva.
+    if (e.morta) {
+      linha.append(elemento('span', 'diag__mudo',
+        `ligação morta (${e.morta}) — o Bruma volta a discar sozinho`));
+      alvo.append(linha);
+      continue;
+    }
     const caminho = e.relay ? 'por relay' : 'direta';
     // `null` é «ninguém mediu», e é diferente de zero (#171).
     // «<1 ms» e não «0 ms»: um RTT medido que arredonda a zero escrevia exactamente o mesmo
@@ -4284,7 +4355,12 @@ function actualizarEspectadores() {
   if (!voz.ecra) return;
   // Neste momento quem assiste é quem tem a transmissão aberta; a interface ainda não
   // distingue "aberto mas minimizado", e é aí que vive a próxima poupança de upload.
-  const lista = [...voz.aSerVistoPor].filter(p => voz.presentes.get(p) === voz.canal);
+  // OS PERDIDOS SAEM DA LISTA, e é isso que faz o cabeçalho voltar quando eles voltarem
+  // (#52). O `definir_espectadores` só manda o princípio da transmissão a quem é NOVO na
+  // lista; sem os tirar aqui, quem religasse continuava lá dentro, não contava como novo, e
+  // ficava a receber fragmentos que o `MediaSource` dele — fechado na queda — não sabe abrir.
+  const lista = [...voz.aSerVistoPor]
+    .filter(p => voz.presentes.get(p) === voz.canal && !paresPerdidos.has(p));
   invoke('definir_espectadores', { chaves: lista }).catch(() => {});
 }
 
@@ -4388,6 +4464,15 @@ function painelDeVoz(chave, opcoes = {}) {
     // ruído: a foto sozinha já diz que não há vídeo.
     if (!estaNaSala(chave)) sem.append(elemento('span', null, 'a ligar…'));
     t.append(sem);
+  }
+
+  if (paresPerdidos.has(chave)) {
+    // A LIGAÇÃO CAIU (#51). Não se apaga a pessoa: a religação é automática e demora
+    // segundos, e vê-la desaparecer e reaparecer diz menos do que vê-la a religar.
+    const aviso = elemento('span', 'tile__sem-audio', 'a religar…');
+    aviso.title = 'A ligação a esta pessoa caiu. O Bruma volta a tentar de dois em dois '
+      + 'segundos, sozinho.';
+    t.append(aviso);
   }
 
   const partido = vozPartida.get(chave);
@@ -4650,6 +4735,13 @@ function fotinha(chave, noPalco) {
       tampa.append(b);
       m.append(tampa);
     }
+  }
+  if (paresPerdidos.has(chave)) {
+    const aviso = elemento('span', 'mini__vivo', 'A RELIGAR');
+    aviso.style.background = 'var(--amber)';
+    aviso.style.color = '#16181c';
+    aviso.title = 'A ligação a esta pessoa caiu; o Bruma volta a tentar sozinho.';
+    m.append(aviso);
   }
   const partida = vozPartida.get(chave);
   if (partida) {
@@ -4996,6 +5088,25 @@ listen('partilha-falhou', ev => {
 /** A última razão por que a partilha morreu, para o botão a poder mostrar. */
 let partilhaFalhou = null;
 
+/** Fecha tudo o que uma pessoa nos estava a mandar.
+ *
+ *  Chamado de dois sítios que antes tinham código diferente para o mesmo trabalho: quando
+ *  alguém sai da sala em condições (`presenca`), e quando alguém CAI sem o dizer
+ *  (`peers-ligados`, #51). Era o segundo que não existia — quem caía deixava o
+ *  descodificador de vídeo dele aberto para sempre a segurar memória.
+ */
+function esquecerOQueEleMandava(peer) {
+  fecharFluxoRecebido(peer);
+  // A câmara também. Quem cai da rede não chega a anunciar que a desligou, e sem isto o
+  // descodificador dele ficava aberto para sempre a segurar memória de vídeo — numa sala
+  // onde as pessoas entram e saem, isso só cresce.
+  fecharCamaraRecebida(peer);
+  voz.comCamara.delete(peer);
+  voz.entendeCamara.delete(peer);
+  voz.entendeSom.delete(peer);
+  voz.jaFalou.delete(peer);
+}
+
 listen('presenca', ev => {
   const { peer, canal } = ev.payload;
   if (canal) voz.presentes.set(peer, canal); else voz.presentes.delete(peer);
@@ -5004,15 +5115,7 @@ listen('presenca', ev => {
   if (voz.canal && canal === voz.canal) anunciarEstado();
   if (!canal || canal !== voz.canal) {
     if (voz.aSerVistoPor.delete(peer)) actualizarEspectadores();
-    fecharFluxoRecebido(peer);
-    // E a câmara também. Quem cai da rede não chega a anunciar que a desligou, e sem isto
-    // o descodificador dele ficava aberto para sempre a segurar memória de vídeo — numa
-    // sala onde as pessoas entram e saem, isso só cresce.
-    fecharCamaraRecebida(peer);
-    voz.comCamara.delete(peer);
-    voz.entendeCamara.delete(peer);
-    voz.entendeSom.delete(peer);
-    voz.jaFalou.delete(peer);
+    esquecerOQueEleMandava(peer);
   }
   if (!canal || canal !== voz.canal) calarPeer(peer);
   desenharVoz();
@@ -6031,6 +6134,27 @@ function pararDeAssistir() {
           .catch(e => diz(`par ANFITRIAO nao conseguiu escrever durante o sync: ${e}`));
       });
 
+      // E CINCO DEPOIS DE O CANAL SE TER ATRASADO (#53).
+      //
+      // Com `BRUMA_ESCRITA_LENTA_MS` posto, o laco de escrita fica para tras dos frames de
+      // ecra e de camara, o canal de difusao transborda, e o `tokio::sync::broadcast` deita
+      // fora o que este receptor nao leu. Por ai passa a `Saida::Entrada` -- uma MENSAGEM --
+      // e ela perdia-se em silencio, sem nada que a fosse buscar: o `Sync` completo so
+      // acontece no arranque da sessao.
+      //
+      // Estas cinco sao escritas bem depois disso, uma a uma, para se poder contar quantas
+      // sobreviveram ao caminho.
+      (async () => {
+        await esperar(30000);
+        for (let i = 1; i <= 5; i += 1) {
+          await invoke('enviar', {
+            servidor: servidorId, canal: texto.id, texto: `depois do atraso ${i}`,
+          }).catch(() => {});
+          await esperar(2500);
+        }
+        diz('par ANFITRIAO escreveu 5 mensagens DEPOIS do atraso');
+      })();
+
       const convite = await invoke('criar_convite', { servidor: servidorId });
       diz(`par ANFITRIAO convite=${convite}`);
     } else {
@@ -6059,6 +6183,29 @@ function pararDeAssistir() {
         await desenharTudo();
       }
       diz(`par CONVIDADO recebeu a mensagem escrita DURANTE o sync: ${durante}`);
+
+      // AS CINCO DE DEPOIS DO ATRASO (#53). Sao escritas entre os 30 e os 42 segundos;
+      // espera-se ate aos 70 e conta-se. Sem a correccao, o que o `Lagged` deitou fora nao
+      // volta por nada -- e o requisito do dono e que as mensagens nao se percam.
+      (async () => {
+        // 130 VOLTAS, E O NUMERO NAO E POR PRECAUCAO. A recuperacao so pode acontecer
+        // depois de a escrita voltar ao normal -- e com uma janela de atraso de 90 s,
+        // parar de contar aos 70 dizia "1/5" sobre uma recuperacao que ainda nao tinha
+        // tido oportunidade de correr. Contei-o como uma falha da correccao antes de
+        // perceber que era uma falha do relogio do teste.
+        let quantas = 0;
+        for (let i = 0; i < 130 && quantas < 5; i += 1) {
+          await esperar(1000);
+          const srv3 = vista.servidores.find(x => x.id === servidorId);
+          const t3 = srv3 && srv3.canais.find(c => c.tipo === 'texto');
+          if (t3) {
+            const todas = await invoke('mensagens', { servidor: servidorId, canal: t3.id })
+              .catch(() => []);
+            quantas = todas.filter(m => /^depois do atraso /.test(m.texto || '')).length;
+          }
+        }
+        diz(`par CONVIDADO recebeu ${quantas}/5 mensagens escritas DEPOIS do atraso`);
+      })();
 
       diz(`par CONVIDADO recebeu ${msgs.length}/5 mensagens escritas antes de ele entrar`
         + (msgs.length ? ` (primeira: "${msgs[0].texto}", última: "${msgs[msgs.length - 1].texto}")` : ''));
@@ -6182,7 +6329,7 @@ function pararDeAssistir() {
 
       const gente = [...voz.presentes.keys()];
       const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
-      const resumo = estado.map(e =>
+      const resumo = estado.map(e => e.morta ? `${e.peer.slice(0, 6)} MORTA(${e.morta})` :
         // Os RITMOS e não só os totais (#33): é isto que distingue «a chamada está viva»
         // de «a chamada esteve viva». E os recusados pelo transporte (#34), que até agora
         // não eram contados em lado nenhum — um par que recuse todos os datagramas dava
@@ -6217,6 +6364,10 @@ function pararDeAssistir() {
       // Um aviso sobre a partilha tem de CHEGAR a interface, e nao ficar num eprintln.
       if (partilhaAviso) diz(`par AVISO na interface: "${partilhaAviso.slice(0, 72)}"`);
       diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
+        // A RELIGACAO (#50, #51, #56). Numa sala de duas pessoas o maximo de ligados tem de
+        // ser 1: acima disso e o contador a somar eventos que nao se anulam.
+        + ` | ligados=${ligados} max=${ligadosMax} perdidos=${paresPerdidos.size}`
+        + ` caiu=${jaSePerdeu} voltou=${jaVoltou}`
         + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`
         + ` | câmaras: ${cams || 'nenhuma'} (anunciadas: ${voz.comCamara.size})`);
 
