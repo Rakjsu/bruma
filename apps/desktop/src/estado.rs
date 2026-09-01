@@ -151,6 +151,18 @@ pub enum QuemEscreve {
     Amigos,
 }
 
+/// Os endereços de um par, e quando foram vistos (#118).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EnderecosDoPar {
+    /// `ip:1.2.3.4:5678` ou `relay:https://...`, como o `TransportAddr` os escreve.
+    #[serde(default)]
+    pub onde: Vec<String>,
+    /// Segundos desde a época. Endereços velhos fazem o iroh gastar tempo a tentar caminhos
+    /// mortos antes de cair no relay — por isso há uma idade máxima na leitura.
+    #[serde(default)]
+    pub visto: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Indice {
     #[serde(default)]
@@ -164,6 +176,23 @@ pub struct Indice {
     /// cifrado, e porque quem sabe com quem eu tenho prekeys sabe com quem eu falo.
     #[serde(default)]
     pub prekeys: BTreeMap<String, String>,
+    /// Onde cada par foi encontrado da última vez, e quando (#118).
+    ///
+    /// # Porque é que isto precisa de existir
+    ///
+    /// O `ligar` faz `connect(EndpointAddr::from(id))` — só o identificador, sem endereço
+    /// nenhum. Quem descobre o endereço é o serviço de descoberta do preset do n0, que
+    /// resolve por HTTPS e por DNS contra servidores deles. E o que se guardava em disco de
+    /// cada par era só a chave.
+    ///
+    /// Consequência: sem os servidores do n0 — em baixo, bloqueados, ou simplesmente sem
+    /// DNS — duas pessoas que já falaram mil vezes **não se encontram**. Numa app cuja
+    /// promessa é não depender de servidor nenhum, essa é a dependência escondida.
+    ///
+    /// Guarda-se como texto e não como o tipo do iroh de propósito: este ficheiro tem de
+    /// sobreviver a actualizações da biblioteca.
+    #[serde(default)]
+    pub enderecos: BTreeMap<String, EnderecosDoPar>,
     #[serde(default)]
     pub amigos: Vec<Amigo>,
     /// Chaves de quem eu recuso. **O bloqueio é local**: eu deixo de aceitar o que ele
@@ -269,6 +298,7 @@ impl App {
             nome: Mutex::new("eu".into()),
             servidores: Mutex::new(BTreeMap::new()),
             prekeys: Mutex::new(BTreeMap::new()),
+            enderecos: Mutex::new(BTreeMap::new()),
             amigos: Mutex::new(Vec::new()),
             bloqueados: Mutex::new(Vec::new()),
             quem_escreve: Mutex::new(QuemEscreve::default()),
@@ -670,6 +700,8 @@ pub struct App {
     pub nome: Mutex<String>,
     pub servidores: Mutex<BTreeMap<String, Servidor>>,
     pub prekeys: Mutex<BTreeMap<String, String>>,
+    /// Onde cada par foi encontrado da ultima vez (#118). Ver `Indice::enderecos`.
+    pub enderecos: Mutex<BTreeMap<String, EnderecosDoPar>>,
     pub amigos: Mutex<Vec<Amigo>>,
     pub bloqueados: Mutex<Vec<String>>,
     pub quem_escreve: Mutex<QuemEscreve>,
@@ -783,6 +815,7 @@ impl App {
             nome: Mutex::new(indice.nome),
             servidores: Mutex::new(servidores),
             prekeys: Mutex::new(indice.prekeys),
+            enderecos: Mutex::new(indice.enderecos),
             amigos: Mutex::new(indice.amigos),
             bloqueados: Mutex::new(indice.bloqueados),
             quem_escreve: Mutex::new(indice.quem_escreve),
@@ -1194,6 +1227,7 @@ impl App {
             nome: self.nome.lock().unwrap().clone(),
             servidores: guardados,
             prekeys: self.prekeys.lock().unwrap().clone(),
+            enderecos: self.enderecos.lock().unwrap().clone(),
             amigos: self.amigos.lock().unwrap().clone(),
             bloqueados: self.bloqueados.lock().unwrap().clone(),
             quem_escreve: *self.quem_escreve.lock().unwrap(),

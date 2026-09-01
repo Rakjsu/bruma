@@ -1149,6 +1149,103 @@ fn agora_hms() -> String {
 /// mensagem, e muito mais do que a rajada de `Lagged` que um único engasgo produz.
 const RESYNC_MINIMO: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Quanto tempo um endereço guardado ainda vale a pena tentar (#118).
+///
+/// Uma semana. Endereços velhos não são gratuitos: o iroh tenta-os antes de cair no relay, e
+/// um caminho morto custa o tempo de esperar por ele. Mas um par que não se vê há uma semana
+/// também não perde nada em ser procurado pela descoberta, que é o que já acontecia sempre.
+const IDADE_DOS_ENDERECOS: u64 = 7 * 24 * 3600;
+/// E quantos, no máximo. Tentar quinze caminhos mortos é pior do que não tentar nenhum.
+const MAX_ENDERECOS: usize = 6;
+
+/// Como um endereço de transporte se escreve no índice, e como se volta a ler.
+///
+/// Texto, e não o tipo do iroh: o índice tem de sobreviver a actualizações da biblioteca, e
+/// um `enum` `#[non_exhaustive]` serializado é um convite a que uma versão futura não leia o
+/// ficheiro de uma antiga.
+fn endereco_para_texto(a: &iroh::TransportAddr) -> Option<String> {
+    match a {
+        iroh::TransportAddr::Ip(sa) => Some(format!("ip:{sa}")),
+        iroh::TransportAddr::Relay(u) => Some(format!("relay:{u}")),
+        // Um transporte que esta versão não conhece não se guarda. Guardá-lo como texto
+        // opaco seria escrever no disco uma coisa que não se sabe voltar a ler.
+        _ => None,
+    }
+}
+
+fn texto_para_endereco(t: &str) -> Option<iroh::TransportAddr> {
+    if let Some(r) = t.strip_prefix("ip:") {
+        return r.parse().ok().map(iroh::TransportAddr::Ip);
+    }
+    if let Some(r) = t.strip_prefix("relay:") {
+        return r.parse().ok().map(iroh::TransportAddr::Relay);
+    }
+    None
+}
+
+/// Guarda onde este par foi encontrado, para o voltar a encontrar sem o DNS do n0 (#118).
+async fn guardar_onde_ele_estava(rede: &Rede, app: &Arc<App>, peer: &str) {
+    let Ok(id) = peer.parse::<EndpointId>() else {
+        return;
+    };
+    let Some(info) = rede.endpoint.remote_info(id).await else {
+        return;
+    };
+    let onde: Vec<String> = info
+        .addrs()
+        .filter_map(|a| endereco_para_texto(a.addr()))
+        .take(MAX_ENDERECOS)
+        .collect();
+    if onde.is_empty() {
+        return;
+    }
+    let visto = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let quantos = onde.len();
+    {
+        let Ok(mut i) = app.enderecos.lock() else {
+            return;
+        };
+        i.insert(
+            peer.to_string(),
+            crate::estado::EnderecosDoPar { onde, visto },
+        );
+    }
+    if let Err(e) = app.gravar_indice() {
+        eprintln!("[rede] não consegui guardar os endereços de {peer}: {e}");
+    } else {
+        eprintln!(
+            "[rede] guardei {} endereço(s) de {}: sem o DNS do n0, é por aqui que se volta a encontrá-lo",
+            quantos,
+            &peer[..8.min(peer.len())]
+        );
+    }
+}
+
+/// Onde é que este par estava da última vez — se ainda vale a pena tentar lá (#118).
+fn onde_ele_estava(app: &Arc<App>, peer: &str) -> Vec<iroh::TransportAddr> {
+    let agora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Ok(i) = app.enderecos.lock() else {
+        return Vec::new();
+    };
+    let Some(e) = i.get(peer) else {
+        return Vec::new();
+    };
+    if agora.saturating_sub(e.visto) > IDADE_DOS_ENDERECOS {
+        return Vec::new();
+    }
+    e.onde
+        .iter()
+        .filter_map(|t| texto_para_endereco(t))
+        .take(MAX_ENDERECOS)
+        .collect()
+}
+
 /// O que define «a mesma rede», para efeitos do #55: que relays estão ligados.
 ///
 /// Compara-se um RESUMO e não o valor inteiro: o `RelayStatus` traz o último erro, que muda
@@ -1217,7 +1314,22 @@ pub async fn ligar(rede: &Arc<Rede>, app: &Arc<App>, janela: &AppHandle, peer: &
     if !reservar(&rede.ligacoes, &rede.a_ligar, peer) {
         return Ok(());
     }
-    let conn = match rede.endpoint.connect(EndpointAddr::from(id), ALPN).await {
+    // AS PISTAS DE ONDE ELE ESTAVA (#118).
+    //
+    // `EndpointAddr::from(id)` é só o identificador: quem descobre o endereço é o serviço de
+    // descoberta do preset do n0, por HTTPS e DNS contra servidores deles. Numa app que
+    // promete não depender de servidor nenhum, isso é a dependência escondida — sem eles,
+    // duas pessoas que já falaram mil vezes não se encontram.
+    //
+    // Os endereços guardados entram como PISTAS: o iroh tenta-os e cai na descoberta se
+    // falharem. Não substituem nada; tiram-lhe a exclusividade.
+    let pistas = onde_ele_estava(app, peer);
+    let alvo = if pistas.is_empty() {
+        EndpointAddr::from(id)
+    } else {
+        EndpointAddr::from_parts(id, pistas)
+    };
+    let conn = match rede.endpoint.connect(alvo, ALPN).await {
         Ok(c) => c,
         Err(e) => {
             // A reserva morre com a tentativa, senão o par ficava marcado para sempre e
@@ -1325,6 +1437,43 @@ impl Drop for SessaoViva {
         }
     }
 }
+
+/// Entrega um quadro de vídeo à interface, venha ele por onde vier (#134).
+///
+/// Existe porque passou a haver dois caminhos: o stream de controlo, que é por onde tudo foi
+/// sempre, e os streams unidireccionais, que são para onde isto vai. Ter o porteiro e a
+/// contagem escritos duas vezes seria garantir que um dia divergiam — e a metade esquecida
+/// seria a do porteiro.
+fn entregar_video(
+    rede: &Arc<Rede>,
+    app: &Arc<App>,
+    peer: &str,
+    tipo: &str,
+    servidor: &str,
+    canal: &str,
+    dados: Vec<u8>,
+) {
+    // Imagem de um estranho não abre descodificadores meus. Cada fluxo novo custa um
+    // MediaSource, um <video> e um descodificador de hardware; a interface criava-os para
+    // qualquer chave que mandasse bytes.
+    if !conhecido(app, peer) {
+        return;
+    }
+    if let Ok(mut n) = rede.contagem.lock() {
+        n.entry(peer.to_string()).or_default().ecra_rec += 1;
+    }
+    if tipo == "camara" {
+        crate::comandos::camara_recebida(peer, dados);
+    } else {
+        crate::comandos::ecra_recebido(peer, servidor, canal, dados);
+    }
+}
+
+/// O tecto de um quadro de vídeo que chega por um stream unidireccional (#134).
+///
+/// O mesmo `MAX_FRAME` do stream de controlo: um par que mande mais do que isto está a
+/// tentar encher-me a memória, e o stream morre sem ser lido até ao fim.
+const MAX_UNI: usize = MAX_FRAME;
 
 /// `iniciei` diz se fomos nós a ligar-nos ou se foi o outro lado.
 ///
@@ -1593,6 +1742,71 @@ async fn sessao(
         }));
     }
 
+    // E ONDE ELE ESTÁ AGORA fica guardado (#118): a sessão está de pé, portanto o que o
+    // iroh sabe sobre este par acabou de ser confirmado pela realidade.
+    {
+        let r = rede.clone();
+        let a = app.clone();
+        let quem = peer.clone();
+        guarda.tarefas.push(tokio::spawn(async move {
+            guardar_onde_ele_estava(&r, &a, &quem).await;
+        }));
+    }
+
+    // O SEGUNDO CAMINHO PARA O VÍDEO (#134), passo 1 de dois: LER, sem ainda escrever.
+    //
+    // # O problema
+    //
+    // A sessão abre um `open_bi` e tudo passa por lá: o `Ola`, o histórico completo de cada
+    // sala, cada mensagem nova, os sinais, e cada fragmento de ecrã e de câmara — até 8 MB.
+    // Um stream QUIC é fiável e ORDENADO: enquanto um fragmento de ecrã de centenas de
+    // kilobytes não passar, **nada passa atrás dele**. É a mesma causa do `Lagged` que
+    // deitava fora mensagens de texto (#53), vista do outro lado do fio.
+    //
+    // # Porque é que isto é lido antes de ser escrito
+    //
+    // Se eu mandasse vídeo por aqui já, uma v0.20.0 do outro lado não o leria: ela só sabe
+    // do stream único, e a partilha de ecrã morria em silêncio para quem não tivesse
+    // actualizado. É o mesmo procedimento de duas versões do `ESCREVER_PRESO_AO_AUTOR`:
+    // primeiro sai uma versão que LÊ as duas coisas e escreve a antiga; quando as duas
+    // máquinas estiverem nela — e a app mostra a versão do outro lado desde a v0.18.0 —,
+    // vira-se a escrita.
+    //
+    // Enquanto o `#[cfg]` da escrita não virar, este leitor nunca recebe nada. Isso é o
+    // esperado, e não uma avaria.
+    {
+        let conn_uni = conn.clone();
+        let rede_uni = rede.clone();
+        let app_uni = app.clone();
+        let quem = peer.clone();
+        guarda.tarefas.push(tokio::spawn(async move {
+            loop {
+                let Ok(mut recebe) = conn_uni.accept_uni().await else {
+                    return;
+                };
+                let rede_uni = rede_uni.clone();
+                let app_uni = app_uni.clone();
+                let quem = quem.clone();
+                // Cada fragmento no seu stream, e cada stream na sua tarefa: um fragmento
+                // lento deixa de segurar o seguinte, que é a razão de existir disto.
+                tokio::spawn(async move {
+                    let Ok(bytes) = recebe.read_to_end(MAX_UNI).await else {
+                        return;
+                    };
+                    if let Ok(Quadro::Video {
+                        tipo,
+                        servidor,
+                        canal,
+                        dados,
+                    }) = interpretar(&bytes)
+                    {
+                        entregar_video(&rede_uni, &app_uni, &quem, &tipo, &servidor, &canal, dados);
+                    }
+                });
+            }
+        }));
+    }
+
     let ola_para_o_leitor = ola_chegou.clone();
 
     // Quem liga abre o stream; quem aceita espera por ele. Um de cada lado, e só um.
@@ -1777,20 +1991,15 @@ async fn sessao(
                     canal,
                     dados,
                 }) => {
-                    // Imagem de um estranho não abre descodificadores meus. Cada fluxo novo
-                    // custa um MediaSource, um <video> e um descodificador de hardware; a
-                    // interface criava-os para qualquer chave que mandasse bytes.
-                    if !conhecido(&leitura_app, &peer_leitura) {
-                        continue;
-                    }
-                    if let Ok(mut n) = rede_leitura.contagem.lock() {
-                        n.entry(peer_leitura.clone()).or_default().ecra_rec += 1;
-                    }
-                    if tipo == "camara" {
-                        crate::comandos::camara_recebida(&peer_leitura, dados);
-                    } else {
-                        crate::comandos::ecra_recebido(&peer_leitura, &servidor, &canal, dados);
-                    }
+                    entregar_video(
+                        &rede_leitura,
+                        &leitura_app,
+                        &peer_leitura,
+                        &tipo,
+                        &servidor,
+                        &canal,
+                        dados,
+                    );
                 }
                 Ok(Quadro::Controlo(Msg::Ola {
                     nome,
@@ -2116,12 +2325,35 @@ async fn sessao(
                             if let Ok(mut n) = rede.contagem.lock() {
                                 n.entry(peer.clone()).or_default().ecra_env += 1;
                             }
-                            Some(Quadro::Video {
+                            let q = Quadro::Video {
                                 tipo: tipo.to_string(),
                                 servidor,
                                 canal,
                                 dados: dados.as_ref().clone(),
-                            })
+                            };
+                            // CADA FRAGMENTO NO SEU STREAM (#134, passo 2).
+                            //
+                            // Sai daqui sem passar pelo `escrever_quadro`, portanto sem
+                            // segurar o stream de controlo: uma mensagem de texto deixa de
+                            // esperar por um fragmento de ecrã de centenas de kilobytes.
+                            //
+                            // E cada um na sua tarefa, porque abrir e escrever um stream
+                            // também espera — se isso corresse aqui, o laço do `select!`
+                            // ficava parado e voltávamos ao princípio.
+                            if crate::bandeiras::video_por_uni() {
+                                if let Ok(corpo) = corpo_do_quadro(&q) {
+                                    let c = conn.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(mut uni) = c.open_uni().await {
+                                            let _ = uni.write_all(&corpo).await;
+                                            let _ = uni.finish();
+                                        }
+                                    });
+                                }
+                                None
+                            } else {
+                                Some(q)
+                            }
                             }
                         }
                         Saida::Video { .. } => None,
@@ -2194,8 +2426,7 @@ async fn sessao(
                         let salas = salas_com(&app, &peer);
                         if !salas.is_empty() {
                             eprintln!(
-                                "[rede] a pedir o log de {} sala(s) a {} — o texto perdido \
-                                 no atraso volta por aqui",
+                                "[rede] a pedir o log de {} sala(s) a {}: o texto perdido volta por aqui",
                                 salas.len(),
                                 &peer[..8.min(peer.len())]
                             );
@@ -4026,5 +4257,95 @@ mod testes {
             .expect("não chegou a tempo")
             .expect("tarefa");
         assert_eq!(&recebido[..], b"ola voz");
+    }
+
+    /// O caminho POR RELAY, que o README promete e que não tinha um único teste (#126).
+    ///
+    /// # Porque é que isto estava a descoberto
+    ///
+    /// O teste acima usa `presets::N0DisableRelay` — desliga explicitamente o relay. Prova a
+    /// ligação directa, que é o caso bom. O README diz «se o router não se deixar furar, a
+    /// ligação passa por um relay em vez de falhar», e a barra da chamada di-lo — e esse
+    /// caminho, o do caso MAU, que é precisamente aquele em que se vai cair entre os EUA e o
+    /// Brasil quando o furo falhar, não tinha teste, nem bandeira, nem medição.
+    ///
+    /// # Porquê `#[ignore]`
+    ///
+    /// O relay público do n0 é infraestrutura de terceiros. Um teste que dependa dela no CI
+    /// fica intermitente, e um vermelho intermitente ensina-se a ignorar — o que é pior do
+    /// que não ter teste nenhum, porque o vermelho a seguir também será ignorado.
+    ///
+    /// Corre-se de propósito: `cargo test -p bruma -- --ignored atravessa_pelo_relay`.
+    #[tokio::test]
+    #[ignore = "depende do relay público do n0; corre-se à mão"]
+    async fn um_datagrama_atravessa_pelo_relay() {
+        use iroh::Watcher;
+
+        // O `N0` traz o relay; e força-se o caminho a passar por ele não dando ao outro lado
+        // nenhum endereço IP — só o do relay. É a situação de quem está atrás de um NAT que
+        // não se deixa furar, sem precisar de um NAT.
+        let a = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint A");
+        let b = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("endpoint B");
+
+        // Sem relay ligado dos dois lados não há caminho nenhum a testar, e o teste diria
+        // «passou» sobre uma ligação directa. Espera-se por ele, com tecto.
+        for (nome, ep) in [("A", &a), ("B", &b)] {
+            tokio::time::timeout(std::time::Duration::from_secs(20), ep.online())
+                .await
+                .unwrap_or_else(|_| panic!("{nome} não conseguiu relay em 20 s"));
+        }
+
+        // O endereço que se dá ao A é só o relay do B: sem IPs, o único caminho possível é
+        // por lá.
+        let relay_de_b = b
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .find(|r| r.is_connected())
+            .map(|r| r.url().clone())
+            .expect("B devia ter um relay ligado");
+        let endereco_b = EndpointAddr::from_parts(b.id(), [iroh::TransportAddr::Relay(relay_de_b)]);
+
+        let ouvinte = tokio::spawn(async move {
+            let incoming = b.accept().await.expect("ligação a chegar");
+            let conn = incoming.await.expect("aceitar");
+            conn.read_datagram().await.expect("datagrama")
+        });
+
+        let conn = a.connect(endereco_b, ALPN).await.expect("ligar pelo relay");
+
+        // E confirma-se que foi MESMO pelo relay: um teste que passasse por ter caído numa
+        // ligação directa provaria outra vez o que o teste de cima já prova.
+        let pelo_relay = conn
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.is_relay())
+            .unwrap_or(false);
+        assert!(
+            pelo_relay,
+            "o caminho escolhido não é o relay: este teste passaria pela razão errada"
+        );
+
+        assert!(
+            conn.max_datagram_size().is_some(),
+            "o par tem de aceitar datagramas mesmo por relay, senão a voz não passa"
+        );
+        conn.send_datagram(bytes::Bytes::from_static("ola pelo relay".as_bytes()))
+            .expect("enviar");
+
+        let recebido = tokio::time::timeout(std::time::Duration::from_secs(20), ouvinte)
+            .await
+            .expect("não chegou a tempo pelo relay")
+            .expect("tarefa");
+        assert_eq!(&recebido[..], b"ola pelo relay");
     }
 }

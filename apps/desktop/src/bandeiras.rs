@@ -129,6 +129,26 @@ pub fn atraso_da_escrita_ms() -> Option<u64> {
     None
 }
 
+/// O vídeo sai por streams unidireccionais em vez do stream de controlo (#134, passo 2).
+///
+/// # O interruptor da travessia de duas versões
+///
+/// A v0.21.0 LÊ os dois caminhos e escreve o antigo. Virar isto antes de as duas máquinas
+/// estarem nessa versão mata a partilha de ecrã para quem não actualizou — em silêncio, que
+/// é a pior forma. Enquanto isso não estiver confirmado (e a app mostra a versão do outro
+/// lado desde a v0.18.0), isto é uma bandeira de teste e mais nada: serve para o `--par`
+/// poder provar que o leitor do lado de lá funciona.
+///
+/// No dia em que virar, deixa de ser bandeira e passa a ser o comportamento.
+#[cfg(debug_assertions)]
+pub fn video_por_uni() -> bool {
+    std::env::var("BRUMA_VIDEO_POR_UNI").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn video_por_uni() -> bool {
+    false
+}
+
 /// Atrasa o sync de propósito, para a janela em que uma mensagem se pode perder ser
 /// observável em vez de instantânea.
 #[cfg(debug_assertions)]

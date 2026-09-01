@@ -60,6 +60,9 @@ const ANDAIMES: &[&str] = &[
     // por nada nesta maquina.
     "BRUMA_ESCRITA_LENTA_MS",
     "BRUMA_ESCRITA_LENTA_ATE_S",
+    // O video por streams unidireccionais: e o passo 2 do #134, ainda por virar. Fica
+    // andaime enquanto for bandeira; no dia em que virar, deixa de existir.
+    "BRUMA_VIDEO_POR_UNI",
     "BRUMA_SYNC_LENTO",
     "BRUMA_SO_VIGIA",
     "BRUMA_SEM_TRAVAO",
