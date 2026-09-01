@@ -1430,6 +1430,77 @@ pub static VOZ: std::sync::OnceLock<Arc<Voz>> = std::sync::OnceLock::new();
 /// ida e volta, sabe-se se a ligação é **direta** ou se está a passar por um relay — que é
 /// a diferença entre o router ter sido furado ou não, e a coisa mais útil que se pode
 /// mostrar a quem se está a queixar de que a chamada está má.
+/// Os últimos acontecimentos de rede, com hora (#119).
+///
+/// Existe para uma pessoa do outro hemisfério poder copiar isto e colá-lo, em vez de tentar
+/// descrever o que viu. E leva chaves e horas — que são metadados —, por isso quem o copia
+/// tem de saber o que está a copiar antes de o fazer; é o botão que o diz.
+#[tauri::command]
+pub fn diario_da_rede(rede: State<Arc<Rede>>) -> Vec<serde_json::Value> {
+    let Ok(d) = rede.diario.lock() else {
+        return Vec::new();
+    };
+    d.iter()
+        .map(|(h, t)| serde_json::json!({ "hora": h, "texto": t }))
+        .collect()
+}
+
+/// Por onde é que EU entro na rede (#54).
+///
+/// O `Endpoint` do iroh expõe isto desde sempre e o Bruma nunca perguntou. A consequência
+/// prática: quando a ligação não pega, não havia como distinguir «o meu relay não está a
+/// atender» de «ele está offline» de «o furo falhou». Três causas com o mesmo sintoma e
+/// nenhuma forma de as separar.
+///
+/// Mostrar o nome de um servidor do n0 na app pode chocar quem leu «sem servidor» — e é bom
+/// que choque: é a verdade, e já está no README.
+#[tauri::command]
+pub fn entrada_na_rede(rede: State<Arc<Rede>>) -> Vec<serde_json::Value> {
+    use iroh::Watcher;
+    rede.endpoint
+        .home_relay_status()
+        .get()
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "url": r.url().to_string(),
+                "ligado": r.is_connected(),
+                "erro": r.last_error().map(|e| e.to_string()),
+            })
+        })
+        .collect()
+}
+
+/// TODAS as ligações abertas — e não só as que a interface se lembrou de perguntar (#48).
+///
+/// # A avaria que isto fecha
+///
+/// O painel de rede pedia a qualidade de `voz.presentes`, e o `voz.presentes` só se enche
+/// com eventos de `presenca`, que só existem quando alguém está numa sala de VOZ. Fora de
+/// uma chamada — que é a maior parte do tempo — o painel escrevia «Ninguém ligado neste
+/// momento» com ligações abertas por baixo. Um painel de diagnóstico que só funciona quando
+/// não é preciso.
+///
+/// Cada linha leva a RAZÃO de estar ligada. Sem isso, ver aqui gente com quem não há
+/// nenhuma sala aberta neste momento parece uma fuga — e é o contrário: é o vigia a manter
+/// de pé exactamente as ligações que os servidores partilhados justificam.
+#[tauri::command]
+pub fn ligacoes(
+    rede: State<Arc<Rede>>,
+    nucleo: State<Arc<crate::estado::App>>,
+) -> Vec<serde_json::Value> {
+    let Ok(l) = rede.ligacoes.lock() else {
+        return Vec::new();
+    };
+    l.keys()
+        .map(|p| {
+            // Os IDs das salas, e não os nomes: o nome de uma sala vive dentro do log
+            // cifrado, não na struct. A interface já os tem resolvidos na `vista`.
+            serde_json::json!({ "peer": p, "salas": crate::rede::salas_com(&nucleo, p) })
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::Value> {
     let Ok(ligacoes) = rede.ligacoes.lock() else {
@@ -1444,7 +1515,8 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
             // aparecer com o RTT da última vez que esteve viva é a resposta errada.
             if let Some(razao) = c.close_reason() {
                 return Some(serde_json::json!({
-                    "peer": p, "relay": false, "ms": null, "morta": razao.to_string(),
+                    "peer": p, "caminho": "morta", "relay": false, "ms": null,
+                    "morta": razao.to_string(),
                     "enviados": 0, "recebidos": 0, "envS": 0, "recS": 0,
                     "haQuantoRec": null, "vozFalhados": 0, "perda": null,
                     "disseTerEnviado": 0, "filaLivre": 0,
@@ -1460,12 +1532,21 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
             // ou o RTT ainda não existe — ou seja, o estado «não sei» pintava-se de «óptimo».
             // Agora o RTT é `null` quando não foi medido, e quem lê tem de decidir o que
             // fazer com isso em vez de o confundir com um bom resultado.
-            let (relay, ms) = match escolhido {
-                Some(x) => (
-                    x.is_relay(),
-                    c.rtt(x.id()).map(|d| d.as_secs_f64() * 1000.0),
-                ),
-                None => (false, None),
+            // TRES ESTADOS, E NÃO UM BOOLEANO (#49).
+            //
+            // Quando não há caminho escolhido, isto devolvia `false` — «não é relay» — e a
+            // interface traduzia-o literalmente para «directa». Ou seja: **não sabermos por
+            // onde a ligação vai era afirmado como o melhor caso possível**, que é a mesma
+            // família de mentira do RTT a zero (#171) e do «Voz conectada» sem voz (#32).
+            //
+            // O painel vai passar a dizer «caminho desconhecido» com alguma frequência. É
+            // desconfortável e é a informação verdadeira.
+            let (caminho, ms) = match escolhido {
+                Some(x) if x.is_relay() => {
+                    ("relay", c.rtt(x.id()).map(|d| d.as_secs_f64() * 1000.0))
+                }
+                Some(x) => ("directa", c.rtt(x.id()).map(|d| d.as_secs_f64() * 1000.0)),
+                None => ("desconhecido", None),
             };
             let agora = std::time::Instant::now();
             let n = rede
@@ -1480,7 +1561,7 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 .unwrap_or_default();
             let (n, ha_quanto) = n;
             Some(serde_json::json!({
-                "peer": p, "relay": relay, "ms": ms,
+                "peer": p, "caminho": caminho, "relay": caminho == "relay", "ms": ms,
                 "enviados": n.voz_env, "recebidos": n.voz_rec,
                 // O que o painel precisa para falar do AGORA e não do acumulado (#32, #33):
                 // pacotes por segundo em cada sentido, há quanto tempo chegou o último, e
@@ -1488,6 +1569,11 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 "envS": n.env_s, "recS": n.rec_s,
                 "haQuantoRec": ha_quanto,
                 "vozFalhados": n.voz_falhados,
+                // O TEMPO DE ESCRITA E O QUE SE CORTOU (#114). Sem estes, o `Lagged` era um
+                // acontecimento sem causa visivel.
+                "escritaPiorMs": n.escrita_pior_ms,
+                "escritaUltimaMs": n.escrita_ultima_ms,
+                "videoCortado": n.video_cortado,
                 // ESPAÇO LIVRE NA FILA DE DATAGRAMAS (#173). É o que permite saber se os
                 // 16 KiB são apertados ou folgados sem adivinhar: se isto nunca se aproximar
                 // de zero, a fila nunca esteve perto de encher e há margem para a reduzir.

@@ -260,6 +260,20 @@ pub struct Contagem {
     /// Com este número ao lado do `voz_env`, os dois casos deixam de se confundir: um é uns
     /// poucos em milhares, o outro é todos.
     pub voz_falhados: u64,
+    /// A escrita mais LENTA para este par, em ms, e a última (#114).
+    ///
+    /// Dentro do `select!` da sessão, o `escrever_quadro` fica à espera quando a janela de
+    /// fluxo do outro lado enche. Enquanto espera, esta sessão **não está a ler do canal de
+    /// difusão** — e é assim que se chega ao `Lagged` que deitava fora mensagens de texto
+    /// (#53). Não havia nenhum número, em lado nenhum, que dissesse «a escrita para este
+    /// par demorou três segundos».
+    pub escrita_pior_ms: u64,
+    pub escrita_ultima_ms: u64,
+    /// Quantos fragmentos de vídeo se deitaram fora por a escrita estar atrasada (#114).
+    ///
+    /// A imagem parte — e parte no PRESENTE, em vez de chegar atrasada e continuar a segurar
+    /// o texto atrás dela. É uma decisão que se vê, e não uma que se adivinha.
+    pub video_cortado: u64,
     /// Quando saiu e quando entrou o ÚLTIMO datagrama de voz, e o que os contadores diziam há
     /// um segundo (#33).
     ///
@@ -346,6 +360,8 @@ pub struct Rede {
     /// deixa de ser um palpite: ou não estamos a enviar, ou não estamos a receber, ou o
     /// problema está no som e não na rede — e são três sítios diferentes para procurar.
     pub contagem: std::sync::Mutex<std::collections::HashMap<String, Contagem>>,
+    /// Os ultimos acontecimentos de rede, com hora (#119). Ver `anotar_na_rede`.
+    pub diario: std::sync::Mutex<Vec<(String, String)>>,
     /// As ligações abertas, por peer.
     ///
     /// O resto do módulo trabalha por difusão: escreve-se num canal e cada sessão decide
@@ -423,6 +439,7 @@ impl Rede {
 
         let (tx, _) = broadcast::channel(512);
         let rede = Arc::new(Rede {
+            diario: std::sync::Mutex::new(Vec::new()),
             endpoint: endpoint.clone(),
             tx,
             ligacoes: Default::default(),
@@ -752,6 +769,29 @@ impl Adiamento {
         self.proxima.get(peer).is_some_and(|q| agora < *q)
     }
 
+    /// A rede mudou por baixo de nós: o castigo acumulado deixa de fazer sentido (#55).
+    ///
+    /// # A avaria que isto fecha
+    ///
+    /// O recuo cresce de 2 até 60 segundos e nada o encurtava a não ser uma ligação que
+    /// pegasse. Cenário do enunciado, e não é hipotético: o amigo passa do Wi-Fi para os
+    /// dados do telemóvel a meio de uma conversa. As ligações antigas morrem, o vigia tenta,
+    /// falha — porque o endereço mudou e o de cá ainda não sabe —, e a cada falha o recuo
+    /// duplica. Ao fim de meia dúzia de tentativas ficam **sessenta segundos** de silêncio à
+    /// espera de uma religação que já podia ter acontecido.
+    ///
+    /// O que o encurta é o único facto que diz «tudo o que aprendi sobre alcançar esta gente
+    /// deixou de valer»: a máquina mudou de rede.
+    ///
+    /// O mínimo absoluto fica: um hotspot fraco gera mudanças em rajada, e sem ele isto
+    /// transformava o recuo em nada e o vigia num martelo.
+    fn a_rede_mudou(&mut self) -> usize {
+        let quantos = self.espera.len();
+        self.espera.clear();
+        self.proxima.clear();
+        quantos
+    }
+
     /// Discou-se. Agenda a próxima tentativa e faz o recuo crescer — **aconteça o que
     /// acontecer à ligação**. Devolve os segundos que acabou de agendar, para quem os
     /// quiser dizer.
@@ -822,8 +862,52 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
 
     let mut adiamento = Adiamento::default();
     let mut voltas: u64 = 0;
+    // O SINAL DE QUE A MÁQUINA MUDOU DE REDE (#55) — e a primeira versão disto estava
+    // ERRADA de uma forma que vale a pena escrever.
+    //
+    // Eu li o `Endpoint::network_change()` como um `await` que resolve QUANDO a rede muda, e
+    // pu-lo num ciclo. Não é isso: é um método que se CHAMA para dizer ao iroh que a rede
+    // pode ter mudado — uma entrada, não uma saída. O ciclo estava a mandar o iroh refazer a
+    // detecção de rede 44 vezes em 80 segundos, e a escrever «a rede mudou» outras tantas.
+    // Não era ruído no registo: era trabalho a mais imposto à biblioteca, para nada.
+    //
+    // O sinal a sério é o `home_relay_status()`, que é um `Watcher`: o relay de casa mudar
+    // de URL, cair ou voltar É a rede a mudar por baixo de nós, e é observável em vez de
+    // presumido.
+    let (aviso_de_rede, mut mudou_a_rede) = tokio::sync::mpsc::channel::<()>(4);
+    {
+        let mut relogio = rede.endpoint.home_relay_status();
+        tokio::spawn(async move {
+            let mut antes = resumo_dos_relays(&relogio.get());
+            loop {
+                let Ok(agora) = relogio.updated().await else {
+                    return;
+                };
+                let agora = resumo_dos_relays(&agora);
+                if agora == antes {
+                    continue;
+                }
+                antes = agora;
+                if aviso_de_rede.send(()).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
     loop {
         voltas += 1;
+        // A REDE MUDOU: o recuo acumulado deixa de fazer sentido, e a volta corre JÁ.
+        //
+        // E fica escrito no registo com a hora, que é metade do diagnóstico quando alguém
+        // do outro hemisfério diz «desligou-se sozinho».
+        if mudou_a_rede.try_recv().is_ok() {
+            let quantos = adiamento.a_rede_mudou();
+            anotar_na_rede(
+                &rede,
+                &janela,
+                format!("a rede desta máquina mudou; {quantos} recuo(s) limpo(s)"),
+            );
+        }
         let conhecidos: Vec<String> = {
             let Ok(s) = app.servidores.lock() else {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -954,9 +1038,13 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                     "[rede] discado para {}; se pegar, o recuo limpa-se na volta seguinte",
                     &peer[..8.min(peer.len())]
                 ),
-                Err(e) => eprintln!(
-                    "[rede] {} não atendeu ({e}); nova tentativa daqui a {s}s",
-                    &peer[..8.min(peer.len())]
+                Err(e) => anotar_na_rede(
+                    &rede,
+                    &janela,
+                    format!(
+                        "{} não atendeu ({e}); nova tentativa daqui a {s}s",
+                        &peer[..8.min(peer.len())]
+                    ),
                 ),
             }
         }
@@ -1014,6 +1102,45 @@ fn reservar(
     !ja && fila.insert(peer.to_string())
 }
 
+/// O anel dos últimos acontecimentos de rede (#119).
+///
+/// # Porque é que isto existe
+///
+/// Tudo o que a camada de rede sabe saía num `eprintln!` para o `bruma.log`: «religado a»,
+/// «não atendeu», «atrasou-se e perdeu N pedaços», «a rede mudou». Nenhum desses factos
+/// chegava à interface — e quem os precisa é a pessoa do outro hemisfério que está a tentar
+/// descrever o que viu, não quem tem o ficheiro à mão.
+///
+/// Duzentos chegam: a esta cadência são horas de conversa, e o ficheiro continua a ter tudo
+/// para quem quiser mais.
+pub const TECTO_DO_DIARIO: usize = 200;
+
+/// Escreve no registo E no diário que a interface pode mostrar.
+///
+/// Um sítio só, para não haver acontecimentos que vão a um e não ao outro — que é como
+/// metade deles ficou invisível até agora.
+pub fn anotar_na_rede(rede: &Rede, janela: &AppHandle, texto: String) {
+    eprintln!("[rede] {texto}");
+    if let Ok(mut d) = rede.diario.lock() {
+        if d.len() >= TECTO_DO_DIARIO {
+            d.remove(0);
+        }
+        d.push((agora_hms(), texto.clone()));
+    }
+    let _ = janela.emit("rede-aconteceu", texto);
+}
+
+/// A hora local em `hh:mm:ss`, para o diário.
+#[cfg(windows)]
+fn agora_hms() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
+}
+#[cfg(not(windows))]
+fn agora_hms() -> String {
+    String::new()
+}
+
 /// Quanto tempo tem de passar entre dois pedidos de log ao mesmo par (#53).
 ///
 /// Um par cronicamente atrasado — um portátil a nadar, uma ligação por relay saturada —
@@ -1022,11 +1149,32 @@ fn reservar(
 /// mensagem, e muito mais do que a rajada de `Lagged` que um único engasgo produz.
 const RESYNC_MINIMO: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// O que define «a mesma rede», para efeitos do #55: que relays estão ligados.
+///
+/// Compara-se um RESUMO e não o valor inteiro: o `RelayStatus` traz o último erro, que muda
+/// sozinho sem a rede ter mudado, e comparar isso daria uma «mudança de rede» a cada
+/// tentativa falhada.
+fn resumo_dos_relays(rs: &[iroh::endpoint::RelayStatus]) -> Vec<(String, bool)> {
+    let mut v: Vec<(String, bool)> = rs
+        .iter()
+        .map(|r| (r.url().to_string(), r.is_connected()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Acima de quantos ms de escrita se deixa de enfileirar vídeo para um par (#114).
+///
+/// Meio segundo é muito mais do que uma escrita saudável — no par local ela fica em zero ou
+/// um — e muito menos do que o tempo em que um frame ainda interessa. Acima disto, tudo o
+/// que se enfileirar chega tarde E segura o texto que vem atrás.
+const ESCRITA_LENTA_MS: u64 = 500;
+
 /// As salas que eu partilho com este par.
 ///
 /// É a mesma pergunta que o sync dirigido faz — «este peer é conhecido nesta sala?» — e a
 /// resposta é a lista de logs que faz sentido voltar a oferecer-lhe.
-fn salas_com(app: &Arc<App>, peer: &str) -> Vec<String> {
+pub fn salas_com(app: &Arc<App>, peer: &str) -> Vec<String> {
     let Ok(s) = app.servidores.lock() else {
         return Vec::new();
     };
@@ -1943,6 +2091,28 @@ async fn sessao(
                         Saida::Video { tipo, para, servidor, canal, dados }
                             if para == peer && participa(&app, &servidor, &peer) =>
                         {
+                            // A ESCRITA ESTÁ ATRASADA? ENTÃO ESTE FRAGMENTO NÃO VAI (#114).
+                            //
+                            // Um fragmento que fica na fila enquanto a escrita não passa é
+                            // duas coisas más ao mesmo tempo: chega atrasado — e um frame
+                            // atrasado não interessa a ninguém — e segura o texto que vem
+                            // atrás dele, porque é tudo o mesmo stream ordenado.
+                            //
+                            // Deitá-lo fora parte a imagem. Parte no presente, que é a
+                            // única altura em que partir serve para alguma coisa.
+                            let atrasado = rede
+                                .contagem
+                                .lock()
+                                .ok()
+                                .and_then(|n| n.get(&peer).map(|c| c.escrita_ultima_ms))
+                                .unwrap_or(0)
+                                > ESCRITA_LENTA_MS;
+                            if atrasado {
+                                if let Ok(mut n) = rede.contagem.lock() {
+                                    n.entry(peer.clone()).or_default().video_cortado += 1;
+                                }
+                                None
+                            } else {
                             if let Ok(mut n) = rede.contagem.lock() {
                                 n.entry(peer.clone()).or_default().ecra_env += 1;
                             }
@@ -1952,6 +2122,7 @@ async fn sessao(
                                 canal,
                                 dados: dados.as_ref().clone(),
                             })
+                            }
                         }
                         Saida::Video { .. } => None,
                     };
@@ -1971,7 +2142,17 @@ async fn sessao(
                                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             }
                         }
-                        if escrever_quadro_partido(&mut envia, q).await.is_err() {
+                        // CRONOMETRAR A ESCRITA (#114). É o número que explica o
+                        // `Lagged`: enquanto isto espera, a sessão não lê do canal.
+                        let antes = std::time::Instant::now();
+                        let falhou = escrever_quadro_partido(&mut envia, q).await.is_err();
+                        let demorou = antes.elapsed().as_millis() as u64;
+                        if let Ok(mut n) = rede.contagem.lock() {
+                            let e = n.entry(peer.clone()).or_default();
+                            e.escrita_ultima_ms = demorou;
+                            e.escrita_pior_ms = e.escrita_pior_ms.max(demorou);
+                        }
+                        if falhou {
                             break;
                         }
                     }
@@ -1994,7 +2175,14 @@ async fn sessao(
                     // O que se faz é separar o que se recupera do que não se recupera. O
                     // `merge` é idempotente e endereçado por conteúdo, portanto pedir o log
                     // outra vez não custa nada a quem já o tem.
-                    eprintln!("[rede] {peer} atrasou-se e perdeu {n} pedaços");
+                    anotar_na_rede(
+                        &rede,
+                        &janela,
+                        format!(
+                            "{} atrasou-se e perdeu {n} pedaços",
+                            &peer[..8.min(peer.len())]
+                        ),
+                    );
                     // O TRAVÃO. Um par cronicamente atrasado pediria sincronizações de logs
                     // grandes a cada soluço, o que agrava o próprio atraso que as causou.
                     let agora = std::time::Instant::now();

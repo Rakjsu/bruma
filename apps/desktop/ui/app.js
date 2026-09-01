@@ -2596,6 +2596,9 @@ function camaraDe(chave) {
   c.descodificador = new VideoDecoder({
     output: quadro => {
       c.frames += 1;
+      // E a imagem (#66): `frames` conta o que o descodificador DESENHOU, que e a unica
+      // prova de que a imagem voltou a andar e nao so de que chegaram bytes.
+      if (cauEm && !imagemVoltouEm) imagemVoltouEm = Math.round(performance.now() - cauEm);
       if (tela.width !== quadro.displayWidth || tela.height !== quadro.displayHeight) {
         tela.width = quadro.displayWidth;
         tela.height = quadro.displayHeight;
@@ -2783,6 +2786,10 @@ function tocar(chave, som) {
     return;
   }
   som.close();
+
+  // E O SOM VOLTOU, se tinha caido (#66). Aqui e o unico sitio que prova que ha mesmo
+  // audio a sair para as colunas -- e nao so pacotes a chegar.
+  if (cauEm && !somVoltouEm) somVoltouEm = Math.round(performance.now() - cauEm);
 
   // VOLTOU A SAIR SOM: a marca conta o PRESENTE e não o passado (#37).
   //
@@ -3231,6 +3238,21 @@ let ligadosMax = 0;
 let jaSePerdeu = false;
 let jaVoltou = false;
 
+/* QUANTO TEMPO DEMORA A VOLTAR (#66).
+ *
+ * O `vigiar_ligacoes` religa com recuo de 2 a 60 segundos e a documentacao explica muito
+ * bem porque. O `TESTE-COM-AMIGO.md` afirma «reatar depois de a rede cair -- deve funcionar
+ * desde a v0.10.3» sem um unico numero por tras. Estes sao esses numeros: do instante em que
+ * a ligacao caiu ate a pessoa voltar a aparecer, ate voltar a sair som dela, e ate a imagem
+ * dela voltar a andar.
+ *
+ * Sao numeros com variacao natural -- nao se gateia nada com eles. O que se gateia e
+ * «recuperou / nao recuperou»; os tempos sao informacao. */
+let cauEm = 0;
+let voltouEm = 0;
+let somVoltouEm = 0;
+let imagemVoltouEm = 0;
+
 /* A LISTA MANDA (#50, #51).
  *
  * O contador somava `peer-ligado` e subtraía `peer-desligado`, e numa substituição de
@@ -3252,13 +3274,20 @@ listen('peers-ligados', ev => {
     if (vivos.has(chave) || paresPerdidos.has(chave)) continue;
     paresPerdidos.add(chave);
     jaSePerdeu = true;
+    // O relogio arranca aqui. Os tres tempos seguintes sao todos a partir deste instante.
+    cauEm = performance.now();
+    voltouEm = 0; somVoltouEm = 0; imagemVoltouEm = 0;
     // Fecha-se o que consome: descodificadores, fluxos e câmaras de alguém que já não está
     // do outro lado seguram memória de vídeo e não vão receber mais nada.
     esquecerOQueEleMandava(chave);
     mexeu = true;
   }
   for (const chave of vivos) {
-    if (paresPerdidos.delete(chave)) { mexeu = true; jaVoltou = true; }
+    if (paresPerdidos.delete(chave)) {
+      mexeu = true;
+      jaVoltou = true;
+      if (cauEm && !voltouEm) voltouEm = Math.round(performance.now() - cauEm);
+    }
   }
   // E os perdidos que entretanto saíram da sala a sério deixam de existir aqui.
   for (const chave of [...paresPerdidos]) {
@@ -3637,20 +3666,99 @@ async function desenharDiagnostico() {
   }
   if (!relogioDiag) relogioDiag = setInterval(desenharDiagnostico, 1500);
 
-  const gente = [...voz.presentes.keys()];
+  alvo.textContent = '';
+
+  // A TUA ENTRADA NA REDE (#54).
+  //
+  // Quando a ligação não pega, há três causas com o mesmo sintoma: o meu relay não está a
+  // atender, o dele está offline, ou o furo falhou. Sem isto não havia como as separar — e
+  // o `Endpoint` do iroh sabe a resposta desde sempre; nunca ninguém lhe perguntou.
+  const entrada = await invoke('entrada_na_rede').catch(() => []);
+  const sec = elemento('div', 'diag__sec');
+  sec.append(elemento('div', 'members__label', 'A tua entrada na rede'));
+  if (!entrada.length) {
+    sec.append(elemento('div', 'diag__linha diag__mudo',
+      'Sem relay de casa. Sem ele, ligar a quem está atrás de um router que não se deixa '
+      + 'furar não funciona — só a ligação directa.'));
+  }
+  for (const r of entrada) {
+    const l = elemento('div', 'diag__linha');
+    l.append(elemento('span', 'diag__quem', r.ligado ? 'ligado' : 'em baixo'));
+    // O nome de um servidor do n0 numa app que diz «sem servidor» pode chocar. É bom que
+    // choque: é a verdade, e já está no README.
+    l.append(elemento('span', r.ligado ? null : 'diag__mudo',
+      r.url + (r.erro ? ` · último erro: ${r.erro}` : '')));
+    sec.append(l);
+  }
+  alvo.append(sec);
+
+  // O DIÁRIO DA REDE (#119).
+  //
+  // Tudo isto saía num `eprintln!` para o `bruma.log` e mais lado nenhum. Quem precisa
+  // destes factos é a pessoa do outro hemisfério que está a tentar descrever o que viu —
+  // não quem tem o ficheiro à mão.
+  const diario = await invoke('diario_da_rede').catch(() => []);
+  if (diario.length) {
+    const sec2 = elemento('div', 'diag__sec');
+    const cab = elemento('div', 'members__label', 'O que aconteceu à rede');
+    sec2.append(cab);
+    for (const d of diario.slice(-12).reverse()) {
+      const l = elemento('div', 'diag__linha');
+      l.append(elemento('span', 'diag__quem', d.hora));
+      l.append(elemento('span', null, d.texto));
+      sec2.append(l);
+    }
+    const bt = elemento('button', 'def__bt',
+      `Copiar as últimas ${diario.length} linhas`);
+    // O QUE SE COPIA DIZ-SE ANTES DE SE COPIAR. Isto leva horas e pedaços de chaves
+    // públicas — é metadado, e mandá-lo a alguém é uma decisão, não um clique.
+    bt.title = 'Copia horas e pedaços de chaves públicas para a área de transferência. '
+      + 'É metadado sobre com quem falas e quando: só o cola onde te der jeito que ele seja '
+      + 'lido.';
+    bt.onclick = () => {
+      const texto = diario.map(d => `${d.hora} ${d.texto}`).join('\n');
+      navigator.clipboard.writeText(texto).then(() => {
+        bt.textContent = 'Copiado';
+        setTimeout(() => { bt.textContent = `Copiar as últimas ${diario.length} linhas`; }, 2000);
+      }).catch(() => { bt.textContent = 'Não consegui copiar'; });
+    };
+    sec2.append(bt);
+    alvo.append(sec2);
+  }
+
+  // TODAS AS LIGAÇÕES, E NÃO SÓ AS DA CHAMADA (#48).
+  //
+  // Isto pedia a qualidade de `voz.presentes`, que só se enche com eventos de `presenca` —
+  // e esses só existem quando alguém está numa sala de VOZ. Fora de uma chamada, que é a
+  // maior parte do tempo, o painel escrevia «Ninguém ligado neste momento» com ligações
+  // abertas por baixo. Um painel de diagnóstico que só servia quando não era preciso.
+  const abertas = await invoke('ligacoes').catch(() => []);
+  const naChamada = new Set(voz.presentes.keys());
+  const gente = [...new Set([...naChamada, ...abertas.map(l => l.peer)])];
+  const porque = new Map(abertas.map(l => [l.peer, l.salas || []]));
   if (!gente.length) {
-    alvo.textContent = 'Ninguém ligado neste momento.';
+    alvo.append(elemento('div', 'diag__linha', 'Nenhuma ligação aberta neste momento.'));
     return;
   }
   const estado = await invoke('qualidade', { peers: gente }).catch(() => []);
-  alvo.textContent = '';
   if (!estado.length) {
-    alvo.textContent = `${gente.length} presente(s), nenhuma ligação aberta ainda.`;
+    alvo.append(elemento('div', 'diag__linha',
+      `${gente.length} par(es) conhecido(s), nenhuma ligação aberta ainda.`));
     return;
   }
   for (const e of estado) {
     const linha = elemento('div', 'diag__linha');
     linha.append(elemento('span', 'diag__quem', nomeDoPeer(e.peer)));
+    // PORQUE É QUE ESTA LIGAÇÃO EXISTE. Ver aqui gente com quem não há nenhuma sala aberta
+    // neste momento parece uma fuga sem isto — e é o contrário: é o vigia a manter de pé
+    // exactamente as ligações que os servidores partilhados justificam.
+    if (!naChamada.has(e.peer)) {
+      const salas = (porque.get(e.peer) || [])
+        .map(id => (vista.servidores.find(x => x.id === id) || {}).nome)
+        .filter(Boolean);
+      linha.append(elemento('span', 'diag__porque',
+        salas.length ? `fora da chamada · ${salas.join(', ')}` : 'fora da chamada'));
+    }
     // UMA LIGACAO MORTA DIZ-SE (#142), em vez de dar o RTT da ultima vez que esteve viva.
     if (e.morta) {
       linha.append(elemento('span', 'diag__mudo',
@@ -3658,7 +3766,11 @@ async function desenharDiagnostico() {
       alvo.append(linha);
       continue;
     }
-    const caminho = e.relay ? 'por relay' : 'direta';
+    // O CAMINHO TEM TRÊS ESTADOS (#49). «directa» era o que se escrevia quando não havia
+    // caminho escolhido — ou seja, não sabermos era afirmado como o melhor caso possível.
+    const caminho = e.caminho === 'relay' ? 'por relay'
+      : e.caminho === 'directa' ? 'direta'
+      : 'caminho desconhecido';
     // `null` é «ninguém mediu», e é diferente de zero (#171).
     // «<1 ms» e não «0 ms»: um RTT medido que arredonda a zero escrevia exactamente o mesmo
     // que um RTT inexistente, que é a confusão que o #171 existe para desfazer.
@@ -3673,6 +3785,12 @@ async function desenharDiagnostico() {
     const calouSeAgora = e.recebidos > 0 && e.recS === 0
       && typeof e.haQuantoRec === 'number' && e.haQuantoRec > 3000;
     const recusado = e.vozFalhados > 0 ? ` · ${e.vozFalhados} recusados pelo transporte` : '';
+    // O TEMPO DE ESCRITA (#114). E o numero que explica o `Lagged`: enquanto a escrita para
+    // este par nao passa, a sessao dele nao le do canal, e o que la estiver perde-se.
+    const escrita = e.escritaPiorMs > 100
+      ? ` · escrita pior ${e.escritaPiorMs} ms (agora ${e.escritaUltimaMs})` : '';
+    const cortado = e.videoCortado > 0
+      ? ` · ${e.videoCortado} fragmentos de imagem cortados por atraso` : '';
     // A PERDA (#124). Até aqui era impossível: o receptor não tinha como distinguir «ele
     // calou-se» de «perdi trinta pacotes». Agora o outro lado diz quantos mandou.
     const perda = typeof e.perda === 'number'
@@ -3688,7 +3806,7 @@ async function desenharDiagnostico() {
         + ` ${c.saltado.toFixed(1)} s saltados) · folga ${Math.round(c.folga * 1000)} ms`
       : '';
     const d = elemento('span', (mudoDesdeSempre || calouSeAgora) ? 'diag__mudo' : null,
-      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}${cortes}`);
+      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}${cortes}${escrita}${cortado}`);
     linha.append(d);
     alvo.append(linha);
   }
@@ -6334,7 +6452,7 @@ function pararDeAssistir() {
         // de «a chamada esteve viva». E os recusados pelo transporte (#34), que até agora
         // não eram contados em lado nenhum — um par que recuse todos os datagramas dava
         // exactamente o mesmo que um par calado.
-        `${e.peer.slice(0, 6)} ${e.relay ? 'relay' : 'direta'} ↑${e.enviados} ↓${e.recebidos}`
+        `${e.peer.slice(0, 6)} ${e.caminho || 'sem-caminho'} ↑${e.enviados} ↓${e.recebidos}`
         + ` (${e.envS}/s ↑, ${e.recS}/s ↓)`
         + ` rtt=${typeof e.ms === 'number' && e.ms > 0
           ? (e.ms < 0.5 ? '<1ms' : Math.round(e.ms) + 'ms') : 'por-medir'}`
@@ -6368,6 +6486,8 @@ function pararDeAssistir() {
         // ser 1: acima disso e o contador a somar eventos que nao se anulam.
         + ` | ligados=${ligados} max=${ligadosMax} perdidos=${paresPerdidos.size}`
         + ` caiu=${jaSePerdeu} voltou=${jaVoltou}`
+        + (cauEm ? ` religou: presenca=${voltouEm || '?'}ms som=${somVoltouEm || '?'}ms`
+          + ` imagem=${imagemVoltouEm || '?'}ms` : '')
         + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`
         + ` | câmaras: ${cams || 'nenhuma'} (anunciadas: ${voz.comCamara.size})`);
 
@@ -7291,6 +7411,36 @@ function pararDeAssistir() {
     diz('ui seletor: NAO ABRIU');
   }
   fechar('veu-fontes');
+
+  // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----
+  //
+  // Estes tres so se veem quando NAO ha chamada nenhuma -- que e o estado em que o
+  // `--medir-ui` corre, e era exactamente o estado em que o painel estava cego.
+  try {
+    const entrada = await invoke('entrada_na_rede').catch(() => 'rebentou');
+    const abertas = await invoke('ligacoes').catch(() => 'rebentou');
+    // O painel desenha-se a serio: abre-se o veu e conta-se o que ficou la dentro.
+    abrir('veu-rede');
+    await desenharDiagnostico();
+    await new Promise(r => setTimeout(r, 400));
+    const alvo = document.querySelector('#diag-rede');
+    const texto = alvo ? alvo.textContent : '';
+    const temEntrada = /A tua entrada na rede/.test(texto);
+    // O painel dizia «Ninguem ligado neste momento» com ligacoes abertas por baixo. Agora,
+    // sem chamada, ou diz o que ha ou diz que nao ha nada -- mas nunca fica em branco.
+    const emBranco = texto.trim().length === 0;
+    // E NUNCA escreve «direta» sem ter caminho escolhido (#49): sem chamada nenhuma, se
+    // houver alguma linha de par, o caminho tem de ser um dos tres nomes.
+    const inventaDirecta = /\bdireta\b/.test(texto) && !/caminho desconhecido|por relay/.test(texto)
+      && !Array.isArray(abertas);
+    fechar('veu-rede');
+    diz(`ui painel de rede: entrada=${Array.isArray(entrada) ? entrada.length : entrada}`
+      + ` ligacoes=${Array.isArray(abertas) ? abertas.length : abertas}`
+      + ` seccao-da-entrada=${temEntrada} em-branco=${emBranco}`
+      + ` inventa-directa=${inventaDirecta}`);
+  } catch (e) {
+    diz(`ui painel de rede: REBENTOU ${e && e.message ? e.message : e}`);
+  }
 
   // ---- O MICROFONE HONESTO (#35, #105, #106, #164, #191) ----
   //

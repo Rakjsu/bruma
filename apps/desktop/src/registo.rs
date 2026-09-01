@@ -108,26 +108,116 @@ fn sem_consola() -> bool {
     }
 }
 
-/// Troca os descritores de saída do processo pelo ficheiro.
+/// Troca os descritores de saída do processo por um CANO, e carimba o que sai dele (#143).
 ///
 /// Mexe-se nos descritores do PROCESSO e não só nos do Rust, porque o `windows-capture`, o
 /// `iroh` e o próprio WebView2 também escrevem para lá quando se queixam — e essas queixas
 /// são exactamente as que não se conseguiam ler.
+///
+/// # Porque é que agora há um cano pelo meio
+///
+/// O registo não tinha horas. E as linhas que mais interessam neste projecto são todas
+/// sobre TEMPO: «religado a X», «X não atendeu; nova tentativa daqui a N s», «X atrasou-se e
+/// perdeu N pedaços», «a rede mudou». Sem hora, saber que a ligação caiu não diz se caiu
+/// há dez segundos ou há duas horas — e é essa a pergunta.
+///
+/// Carimbar no `eprintln!` não servia: metade das linhas vem de dentro de bibliotecas, que
+/// é precisamente o motivo por que se trocam os descritores do processo. Por isso o handle
+/// que vai para o `SetStdHandle` passa a ser a ponta de escrita de um cano anónimo, e uma
+/// linha de execução lê a outra ponta, parte por `\n` e escreve no ficheiro com a hora à
+/// frente.
+///
+/// # Os dois cuidados que isto obriga
+///
+/// **Escritas parciais.** Uma biblioteca pode escrever meia linha e o resto a seguir. O
+/// leitor guarda o que sobra num tampão e só carimba quando aparece o `\n` — senão o
+/// carimbo aparecia a meio de uma frase.
+///
+/// **A linha que nunca acaba.** Se alguém escrever muito sem um `\n`, o tampão cresceria
+/// sem fim. Ao fim de 64 KiB escreve-se o que há, com uma marca a dizer que foi cortado.
 #[cfg(windows)]
 fn encaminhar(ficheiro: std::fs::File) {
-    use std::os::windows::io::AsRawHandle;
+    use std::io::{Read, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::System::Pipes::CreatePipe;
 
-    let h = HANDLE(ficheiro.as_raw_handle());
-    unsafe {
-        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-        let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+    let mut ler = windows::Win32::Foundation::HANDLE::default();
+    let mut escrever = windows::Win32::Foundation::HANDLE::default();
+    let feito = unsafe { CreatePipe(&mut ler, &mut escrever, None, 0) };
+    if feito.is_err() {
+        // Sem cano não há carimbo, mas o registo continua a existir: vale mais um ficheiro
+        // sem horas do que nenhum. É o mesmo princípio de toda esta função — falhar aqui
+        // nunca impede a app de arrancar.
+        let h = HANDLE(ficheiro.as_raw_handle());
+        unsafe {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+        }
+        std::mem::forget(ficheiro);
+        return;
     }
-    // `forget` do PRÓPRIO ficheiro, e é deliberado: os descritores do processo apontam
-    // para ele durante toda a vida da app. Da primeira vez esqueci-me de um CLONE e deixei
-    // o original ser destruído no fim da função — o handle fechava, os descritores ficavam
-    // a apontar para nada, e o registo escrevia para o vazio. O cabeçalho aparecia à mesma
-    // (esse vai directo ao ficheiro) e portanto parecia estar tudo bem.
-    std::mem::forget(ficheiro);
+
+    unsafe {
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, escrever);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, escrever);
+    }
+
+    // O `HANDLE` do `windows` é um `*mut c_void`, que não é `Send`. Converte-se JÁ AQUI
+    // para um `File` — que é `Send` — em vez de o atravessar em cru: o handle passa a ser
+    // dono de si próprio antes de mudar de linha de execução, e é o `File` que viaja.
+    let entrada = unsafe { std::fs::File::from_raw_handle(ler.0 as *mut _) };
+
+    // A ponta de leitura e o ficheiro vivem nesta linha de execução, e ela vive para
+    // sempre. O `ficheiro` entra por valor precisamente por isso.
+    std::thread::spawn(move || {
+        let mut entrada = entrada;
+        let mut saida = ficheiro;
+        let mut sobra: Vec<u8> = Vec::new();
+        let mut bloco = [0u8; 8192];
+        loop {
+            let n = match entrada.read(&mut bloco) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            sobra.extend_from_slice(&bloco[..n]);
+            while let Some(fim) = sobra.iter().position(|b| *b == b'\n') {
+                let linha: Vec<u8> = sobra.drain(..=fim).collect();
+                let texto = String::from_utf8_lossy(&linha[..linha.len() - 1]);
+                let texto = texto.trim_end_matches('\r');
+                let _ = writeln!(saida, "{} {}", agora_curto(), texto);
+            }
+            // A linha que nunca acaba: despeja-se o que há e diz-se que foi cortada.
+            if sobra.len() > 64 * 1024 {
+                let texto = String::from_utf8_lossy(&sobra);
+                let _ = writeln!(
+                    saida,
+                    "{} {texto} [linha cortada aos 64 KiB]",
+                    agora_curto()
+                );
+                sobra.clear();
+            }
+            let _ = saida.flush();
+        }
+    });
+}
+
+/// A hora LOCAL, curta, para carimbar cada linha do registo.
+///
+/// Sem dependências novas: o `chrono` não está aqui e não vale a pena trazê-lo por isto. A
+/// data completa também não vale — o ficheiro roda a cada 4 MiB e o cabeçalho de arranque
+/// diz quando a sessão começou; o que falta a cada linha é a hora dentro dessa sessão.
+///
+/// # Porque é que não é o relógio de UTC
+///
+/// A primeira versão disto contava segundos desde a época e fazia as contas à mão. Dava
+/// UTC, e o comentário dizia «hora local» — uma diferença de três a oito horas para as duas
+/// pessoas que usam isto. Quem lê um registo compara-o com o que se lembra de ter
+/// acontecido, e uma hora que não bate com o relógio da parede é pior do que nenhuma:
+/// manda procurar no sítio errado.
+#[cfg(windows)]
+fn agora_curto() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("[{:02}:{:02}:{:02}]", t.wHour, t.wMinute, t.wSecond)
 }
