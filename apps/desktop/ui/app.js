@@ -2598,7 +2598,12 @@ function camaraDe(chave) {
       c.frames += 1;
       // E a imagem (#66): `frames` conta o que o descodificador DESENHOU, que e a unica
       // prova de que a imagem voltou a andar e nao so de que chegaram bytes.
-      if (cauEm && !imagemVoltouEm) imagemVoltouEm = Math.round(performance.now() - cauEm);
+      {
+        const q = relogioDaQueda.get(chave);
+        if (q && q.caiuEm && !q.imagemEm) {
+          q.imagemEm = Math.round(performance.now() - q.caiuEm);
+        }
+      }
       if (tela.width !== quadro.displayWidth || tela.height !== quadro.displayHeight) {
         tela.width = quadro.displayWidth;
         tela.height = quadro.displayHeight;
@@ -2788,8 +2793,11 @@ function tocar(chave, som) {
   som.close();
 
   // E O SOM VOLTOU, se tinha caido (#66). Aqui e o unico sitio que prova que ha mesmo
-  // audio a sair para as colunas -- e nao so pacotes a chegar.
-  if (cauEm && !somVoltouEm) somVoltouEm = Math.round(performance.now() - cauEm);
+  // audio a sair para as colunas -- e nao so pacotes a chegar. Da PESSOA de quem e o som.
+  {
+    const q = relogioDaQueda.get(chave);
+    if (q && q.caiuEm && !q.somEm) q.somEm = Math.round(performance.now() - q.caiuEm);
+  }
 
   // VOLTOU A SAIR SOM: a marca conta o PRESENTE e não o passado (#37).
   //
@@ -3248,10 +3256,20 @@ let jaVoltou = false;
  *
  * Sao numeros com variacao natural -- nao se gateia nada com eles. O que se gateia e
  * «recuperou / nao recuperou»; os tempos sao informacao. */
-let cauEm = 0;
-let voltouEm = 0;
-let somVoltouEm = 0;
-let imagemVoltouEm = 0;
+/* POR PESSOA, e nao globais. Numa sala de duas isto dava na mesma; numa de tres, a queda
+ * de um e a recuperacao de outro misturavam-se no mesmo relogio e os numeros passavam a ser
+ * sobre ninguem. E se a mesma pessoa cair duas vezes, a segunda queda tem de comecar do
+ * zero -- os campos so se escreviam uma vez, portanto a segunda religacao nao era medida. */
+const relogioDaQueda = new Map();
+
+function quedaDe(chave) {
+  let q = relogioDaQueda.get(chave);
+  if (!q) {
+    q = { caiuEm: 0, voltouEm: 0, somEm: 0, imagemEm: 0 };
+    relogioDaQueda.set(chave, q);
+  }
+  return q;
+}
 
 /* A LISTA MANDA (#50, #51).
  *
@@ -3274,9 +3292,11 @@ listen('peers-ligados', ev => {
     if (vivos.has(chave) || paresPerdidos.has(chave)) continue;
     paresPerdidos.add(chave);
     jaSePerdeu = true;
-    // O relogio arranca aqui. Os tres tempos seguintes sao todos a partir deste instante.
-    cauEm = performance.now();
-    voltouEm = 0; somVoltouEm = 0; imagemVoltouEm = 0;
+    // O relogio arranca aqui, e RECOMECA: uma segunda queda da mesma pessoa e uma segunda
+    // medicao, nao um numero velho que sobrevive.
+    relogioDaQueda.set(chave, {
+      caiuEm: performance.now(), voltouEm: 0, somEm: 0, imagemEm: 0,
+    });
     // Fecha-se o que consome: descodificadores, fluxos e câmaras de alguém que já não está
     // do outro lado seguram memória de vídeo e não vão receber mais nada.
     esquecerOQueEleMandava(chave);
@@ -3286,7 +3306,8 @@ listen('peers-ligados', ev => {
     if (paresPerdidos.delete(chave)) {
       mexeu = true;
       jaVoltou = true;
-      if (cauEm && !voltouEm) voltouEm = Math.round(performance.now() - cauEm);
+      const q = quedaDe(chave);
+      if (q.caiuEm && !q.voltouEm) q.voltouEm = Math.round(performance.now() - q.caiuEm);
     }
   }
   // E os perdidos que entretanto saíram da sala a sério deixam de existir aqui.
@@ -3791,6 +3812,7 @@ async function desenharDiagnostico() {
       ? ` · escrita pior ${e.escritaPiorMs} ms (agora ${e.escritaUltimaMs})` : '';
     const cortado = e.videoCortado > 0
       ? ` · ${e.videoCortado} fragmentos de imagem cortados por atraso` : '';
+    void cortado;
     // A PERDA (#124). Até aqui era impossível: o receptor não tinha como distinguir «ele
     // calou-se» de «perdi trinta pacotes». Agora o outro lado diz quantos mandou.
     const perda = typeof e.perda === 'number'
@@ -6467,6 +6489,10 @@ function pararDeAssistir() {
         // O ESPACO LIVRE NA FILA (#173). E o unico numero que diz se os 16 KiB sao
         // apertados: se ele nunca desce perto de zero, a fila nunca esteve perto de encher.
         + ` fila-livre=${typeof e.filaLivre === 'number' ? e.filaLivre + 'B' : '?'}`
+        // O FERROLHO DO #114: `cortados` a crescer com `ecra-env` parado e o corte a nunca
+        // mais abrir. Com a medida a caducar, os dois voltam a andar juntos.
+        + ` escrita=${e.escritaUltimaMs}ms/${e.escritaPiorMs}ms cortados=${e.videoCortado}`
+        + ` ecra-env=${e.ecraEnviado}`
         // Os cortes tambem saem no --par (#65): sem isto, a unica forma de saber que a voz
         // picou era alguem estar a ouvi-la no momento.
         + (() => {
@@ -6486,8 +6512,11 @@ function pararDeAssistir() {
         // ser 1: acima disso e o contador a somar eventos que nao se anulam.
         + ` | ligados=${ligados} max=${ligadosMax} perdidos=${paresPerdidos.size}`
         + ` caiu=${jaSePerdeu} voltou=${jaVoltou}`
-        + (cauEm ? ` religou: presenca=${voltouEm || '?'}ms som=${somVoltouEm || '?'}ms`
-          + ` imagem=${imagemVoltouEm || '?'}ms` : '')
+        + [...relogioDaQueda.entries()]
+          .filter(([, q]) => q.caiuEm)
+          .map(([k, q]) => ` religou ${k.slice(0, 6)}: presenca=${q.voltouEm || '?'}ms`
+            + ` som=${q.somEm || '?'}ms imagem=${q.imagemEm || '?'}ms`)
+          .join('')
         + ` | a ouvir ${voz.audio.size} | ${ecra || '—'}`
         + ` | câmaras: ${cams || 'nenhuma'} (anunciadas: ${voz.comCamara.size})`);
 
@@ -7429,15 +7458,26 @@ function pararDeAssistir() {
     // O painel dizia «Ninguem ligado neste momento» com ligacoes abertas por baixo. Agora,
     // sem chamada, ou diz o que ha ou diz que nao ha nada -- mas nunca fica em branco.
     const emBranco = texto.trim().length === 0;
-    // E NUNCA escreve «direta» sem ter caminho escolhido (#49): sem chamada nenhuma, se
-    // houver alguma linha de par, o caminho tem de ser um dos tres nomes.
-    const inventaDirecta = /\bdireta\b/.test(texto) && !/caminho desconhecido|por relay/.test(texto)
-      && !Array.isArray(abertas);
+    // ISTO NUNCA PODIA DISPARAR, e por isso nao provava nada (#49).
+    //
+    // O ultimo termo era `!Array.isArray(abertas)`, e o `abertas` E um array sempre que o
+    // comando responde -- ou seja, a expressao inteira era `false` por construccao, com ou
+    // sem o defeito. Escrevi um guarda contra a mentira do «direta» e o guarda era ele
+    // proprio uma afirmacao vazia.
+    //
+    // O que interessa perguntar e outra coisa: o `caminho` que o Rust devolve para cada par
+    // e um dos QUATRO nomes possiveis? Um campo em falta -- que era o estado antigo, o
+    // booleano -- faz o painel escrever «direta» outra vez.
+    const estados = Array.isArray(abertas) && abertas.length
+      ? await invoke('qualidade', { peers: abertas.map(l => l.peer) }).catch(() => [])
+      : [];
+    const nomes = ['directa', 'relay', 'desconhecido', 'morta'];
+    const semCaminho = estados.filter(e => !nomes.includes(e.caminho)).length;
     fechar('veu-rede');
     diz(`ui painel de rede: entrada=${Array.isArray(entrada) ? entrada.length : entrada}`
       + ` ligacoes=${Array.isArray(abertas) ? abertas.length : abertas}`
       + ` seccao-da-entrada=${temEntrada} em-branco=${emBranco}`
-      + ` inventa-directa=${inventaDirecta}`);
+      + ` pares=${estados.length} sem-caminho-valido=${semCaminho}`);
   } catch (e) {
     diz(`ui painel de rede: REBENTOU ${e && e.message ? e.message : e}`);
   }

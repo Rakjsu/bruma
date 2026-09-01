@@ -269,6 +269,20 @@ pub struct Contagem {
     /// par demorou três segundos».
     pub escrita_pior_ms: u64,
     pub escrita_ultima_ms: u64,
+    /// Quando é que a `escrita_ultima_ms` foi medida.
+    ///
+    /// # O ferrolho que isto abre
+    ///
+    /// Sem este campo, o corte de vídeo era uma armadilha que se fechava sozinha e nunca mais
+    /// abria: cortar um fragmento significa NÃO escrever, não escrever significa não medir, e
+    /// não medir significa que a `escrita_ultima_ms` fica presa no valor alto que causou o
+    /// corte. Uma única escrita de 501 ms — trivial num relay saturado — matava a partilha de
+    /// ecrã para aquele par **para o resto da sessão**, e o `contagem` não é limpo na
+    /// religação, portanto também para as sessões seguintes.
+    ///
+    /// Numa partilha de ecrã com o microfone silenciado o vídeo é o único tráfego contínuo,
+    /// portanto não havia mais nada a passar por ali que voltasse a medir.
+    pub escrita_medida_em: Option<std::time::Instant>,
     /// Quantos fragmentos de vídeo se deitaram fora por a escrita estar atrasada (#114).
     ///
     /// A imagem parte — e parte no PRESENTE, em vez de chegar atrasada e continuar a segurar
@@ -769,6 +783,29 @@ impl Adiamento {
         self.proxima.get(peer).is_some_and(|q| agora < *q)
     }
 
+    /// Quanto tempo se espera quando a falha é NOSSA — sem relay de casa (#172).
+    ///
+    /// # Porque é que não é «o mesmo que da última vez»
+    ///
+    /// A primeira versão disto devolvia o valor guardado sem o fazer crescer. Só que o valor
+    /// guardado de um par que nunca foi tentado é 2 — e sem relay de casa TODAS as tentativas
+    /// falham. Resultado: discava-se de dois em dois segundos, para sempre, a um par que não
+    /// pode responder. É exactamente o martelo que a documentação do `Adiamento` descreve,
+    /// com a única diferença de a culpa ser nossa.
+    ///
+    /// Não punir o par continua certo — o recuo DELE não cresce. O que se acrescenta é um
+    /// intervalo próprio para este caso, fixo e maior, porque sem relay tentar depressa não
+    /// serve para nada.
+    const SEM_RELAY_S: u64 = 10;
+
+    fn sem_relay(&mut self, peer: &str, agora: std::time::Instant) -> u64 {
+        self.proxima.insert(
+            peer.to_string(),
+            agora + std::time::Duration::from_secs(Self::SEM_RELAY_S),
+        );
+        Self::SEM_RELAY_S
+    }
+
     /// A rede mudou por baixo de nós: o castigo acumulado deixa de fazer sentido (#55).
     ///
     /// # A avaria que isto fecha
@@ -804,19 +841,6 @@ impl Adiamento {
         );
         *s = (*s * 2).min(60);
         agendado
-    }
-
-    /// Volta a agendar SEM crescer o recuo (#172).
-    ///
-    /// Para quando a tentativa falhou por culpa nossa — sem relay de casa não há travessia
-    /// de NAT nem endereço publicado, e a falha não diz nada sobre o outro lado. Espera-se
-    /// o mesmo que da última vez e tenta-se outra vez; um par que nunca responde continua
-    /// a subir pelo `discou`, um que nunca foi tentado a sério não é castigado.
-    fn ainda_o_mesmo(&mut self, peer: &str, agora: std::time::Instant) -> u64 {
-        let s = *self.espera.get(peer).unwrap_or(&2);
-        self.proxima
-            .insert(peer.to_string(), agora + std::time::Duration::from_secs(s));
-        s
     }
 }
 
@@ -1031,7 +1055,7 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
                     "[rede] {} não atendeu, mas nós é que não temos relay: o recuo fica",
                     &peer[..8.min(peer.len())]
                 );
-                adiamento.ainda_o_mesmo(&peer, agora)
+                adiamento.sem_relay(&peer, agora)
             };
             match &resultado {
                 Ok(()) => eprintln!(
@@ -1191,9 +1215,29 @@ async fn guardar_onde_ele_estava(rede: &Rede, app: &Arc<App>, peer: &str) {
     let Some(info) = rede.endpoint.remote_info(id).await else {
         return;
     };
-    let onde: Vec<String> = info
+    // O QUE SE GUARDA, E POR QUE ORDEM.
+    //
+    // O `addrs()` vem de um mapa de dispersão: sem ordenar, os seis que se guardam são seis à
+    // sorte — e o do relay, que é o único que funciona sempre, podia ficar de fora. Ordena-se
+    // com ele à cabeça.
+    //
+    // **Não** se filtra por `usage()`, e a razão merece ficar escrita: o `TransportAddrUsage`
+    // só tem `Active` e `Inactive`, e `Inactive` quer dizer «não está a ser usado AGORA» —
+    // que é precisamente o estado do relay quando a ligação directa está a funcionar. Filtrar
+    // por ele deitaria fora o endereço mais valioso exactamente na situação em que ele é
+    // gratuito de guardar.
+    let mut escolhidos: Vec<(u8, String)> = info
         .addrs()
-        .filter_map(|a| endereco_para_texto(a.addr()))
+        .filter_map(|a| {
+            let peso = if a.addr().is_relay() { 0u8 } else { 1u8 };
+            endereco_para_texto(a.addr()).map(|t| (peso, t))
+        })
+        .collect();
+    escolhidos.sort();
+    escolhidos.dedup();
+    let onde: Vec<String> = escolhidos
+        .into_iter()
+        .map(|(_, t)| t)
         .take(MAX_ENDERECOS)
         .collect();
     if onde.is_empty() {
@@ -1266,6 +1310,40 @@ fn resumo_dos_relays(rs: &[iroh::endpoint::RelayStatus]) -> Vec<(String, bool)> 
 /// um — e muito menos do que o tempo em que um frame ainda interessa. Acima disto, tudo o
 /// que se enfileirar chega tarde E segura o texto que vem atrás.
 const ESCRITA_LENTA_MS: u64 = 500;
+
+/// Cortar este fragmento de vídeo, ou deixá-lo passar? (#114)
+///
+/// # A armadilha que esta função existe para não repetir
+///
+/// A primeira versão perguntava só `escrita_ultima_ms > ESCRITA_LENTA_MS`, e isso era um
+/// ferrolho que se fechava sozinho e nunca mais abria: cortar um fragmento significa NÃO
+/// escrever, não escrever significa não medir, e não medir significa que a
+/// `escrita_ultima_ms` fica presa no valor alto que causou o corte. Uma escrita de 501 ms —
+/// trivial num relay saturado — matava a partilha de ecrã para aquele par até ao fim do
+/// processo, porque o `contagem` também não é limpo na religação.
+///
+/// Numa partilha com o microfone silenciado, o vídeo é o único tráfego contínuo: não há mais
+/// nada a passar por ali que volte a medir.
+///
+/// A medida caduca ao fim de `VALIDADE_DA_MEDIDA`. No pior caso perde-se imagem durante dois
+/// segundos e mede-se outra vez; em vez de a perder para sempre.
+///
+/// Está aqui fora, e não no meio do `select!`, porque uma decisão com esta armadilha tem de
+/// poder ser testada sozinha — e no laço ela não podia, porque no teste de par há sempre
+/// outro tráfego a voltar a medir e a destapar o corte por acidente.
+fn corta_video(c: &Contagem, agora: std::time::Instant) -> bool {
+    let Some(medida) = c.escrita_medida_em else {
+        // Nunca se escreveu nada para este par: não há motivo para cortar.
+        return false;
+    };
+    c.escrita_ultima_ms > ESCRITA_LENTA_MS && agora.duration_since(medida) < VALIDADE_DA_MEDIDA
+}
+
+/// Durante quanto tempo uma medida de escrita ainda vale para decidir cortar vídeo.
+///
+/// Dois segundos. É mais do que o intervalo entre fragmentos de uma partilha a correr, e
+/// muito menos do que o tempo em que ficar sem imagem se nota. Ver `escrita_medida_em`.
+const VALIDADE_DA_MEDIDA: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// As salas que eu partilho com este par.
 ///
@@ -1469,11 +1547,29 @@ fn entregar_video(
     }
 }
 
-/// O tecto de um quadro de vídeo que chega por um stream unidireccional (#134).
+/// Quantos streams unidireccionais se aceitam de um par ao mesmo tempo (#134).
 ///
-/// O mesmo `MAX_FRAME` do stream de controlo: um par que mande mais do que isto está a
-/// tentar encher-me a memória, e o stream morre sem ser lido até ao fim.
-const MAX_UNI: usize = MAX_FRAME;
+/// # Porque é que o desenho mudou
+///
+/// A primeira versão era um stream POR FRAGMENTO, com `read_to_end(8 MiB)` cada um e uma
+/// tarefa por stream sem tecto nenhum. Duas coisas más, e a segunda é pior:
+///
+/// **A memória.** Cem streams abertos ao mesmo tempo são oitocentos megabytes reservados por
+/// um par que só precisa de os abrir. O stream de controlo tinha um tecto de 8 MiB no total;
+/// aquilo multiplicava-o por quantos o outro lado quisesse.
+///
+/// **A ordem.** Cada fragmento de ecrã é um segmento fMP4 que o outro lado passa ao
+/// `appendBuffer` de um `SourceBuffer`, e essa fila **tem** de estar em ordem. Streams
+/// unidireccionais entregam-se independentemente uns dos outros: dois fragmentos em dois
+/// streams chegam pela ordem que a rede quiser. Numa rede local isso quase nunca acontece — e
+/// foi por isso que a medição do par passou — mas entre os EUA e o Brasil, por relay, é o
+/// caso normal. Eu tinha escrito «provado» sobre um teste que não exercitava o problema.
+///
+/// Agora é UM stream para o vídeo todo, lido em quadros como o de controlo: separa o vídeo do
+/// controlo, que era o objectivo — uma mensagem de texto deixa de esperar por um fragmento de
+/// ecrã — e mantém a ordem entre fragmentos, que o vídeo exige. Dois de tecto, para o caso de
+/// o outro lado abrir mais do que devia.
+const MAX_UNI_ABERTOS: usize = 2;
 
 /// `iniciei` diz se fomos nós a ligar-nos ou se foi o outro lado.
 ///
@@ -1780,27 +1876,44 @@ async fn sessao(
         let app_uni = app.clone();
         let quem = peer.clone();
         guarda.tarefas.push(tokio::spawn(async move {
+            let mut abertos = 0usize;
             loop {
                 let Ok(mut recebe) = conn_uni.accept_uni().await else {
                     return;
                 };
+                abertos += 1;
+                if abertos > MAX_UNI_ABERTOS {
+                    // Mais do que isto é um par a abrir streams à custa da minha memória.
+                    // Fecha-se sem ler, que é o que o porteiro faria se pudesse correr antes
+                    // dos bytes.
+                    eprintln!(
+                        "[porteiro] {} abriu mais de {MAX_UNI_ABERTOS} streams de vídeo: fecho",
+                        &quem[..8.min(quem.len())]
+                    );
+                    return;
+                }
                 let rede_uni = rede_uni.clone();
                 let app_uni = app_uni.clone();
                 let quem = quem.clone();
-                // Cada fragmento no seu stream, e cada stream na sua tarefa: um fragmento
-                // lento deixa de segurar o seguinte, que é a razão de existir disto.
+                // O stream é lido em QUADROS, com o mesmo enquadramento do stream de
+                // controlo — e não de uma vez até ao fim. É isso que mantém a ordem entre
+                // fragmentos e o tecto de memória num quadro de cada vez.
                 tokio::spawn(async move {
-                    let Ok(bytes) = recebe.read_to_end(MAX_UNI).await else {
-                        return;
-                    };
-                    if let Ok(Quadro::Video {
-                        tipo,
-                        servidor,
-                        canal,
-                        dados,
-                    }) = interpretar(&bytes)
-                    {
-                        entregar_video(&rede_uni, &app_uni, &quem, &tipo, &servidor, &canal, dados);
+                    loop {
+                        match ler(&mut recebe).await {
+                            Ok(Quadro::Video {
+                                tipo,
+                                servidor,
+                                canal,
+                                dados,
+                            }) => entregar_video(
+                                &rede_uni, &app_uni, &quem, &tipo, &servidor, &canal, dados,
+                            ),
+                            // Um quadro que não é vídeo neste stream vem de uma versão que
+                            // ainda não existe: ignora-se, como o `Msg::Desconhecida`.
+                            Ok(_) => continue,
+                            Err(_) => return,
+                        }
                     }
                 });
             }
@@ -2200,6 +2313,9 @@ async fn sessao(
     // O travão do #53 vive aqui, ao lado do laço que o usa: é por sessão, e uma sessão
     // nova tem direito a pedir o log outra vez sem esperar pelo relógio da anterior.
     let mut ultimo_resync: Option<std::time::Instant> = None;
+    // O stream por onde o vídeo sai quando o #134 estiver virado. Abre-se à primeira e
+    // mantém-se: um por fragmento destruiria a ordem que o fMP4 do outro lado exige.
+    let mut canal_de_video: Option<SendStream> = None;
     let nasceu = std::time::Instant::now();
     let janela_lenta = std::time::Duration::from_secs(crate::bandeiras::escrita_lenta_ate_s());
     loop {
@@ -2313,9 +2429,11 @@ async fn sessao(
                                 .contagem
                                 .lock()
                                 .ok()
-                                .and_then(|n| n.get(&peer).map(|c| c.escrita_ultima_ms))
-                                .unwrap_or(0)
-                                > ESCRITA_LENTA_MS;
+                                .and_then(|n| {
+                                    n.get(&peer)
+                                        .map(|c| corta_video(c, std::time::Instant::now()))
+                                })
+                                .unwrap_or(false);
                             if atrasado {
                                 if let Ok(mut n) = rede.contagem.lock() {
                                     n.entry(peer.clone()).or_default().video_cortado += 1;
@@ -2341,14 +2459,22 @@ async fn sessao(
                             // também espera — se isso corresse aqui, o laço do `select!`
                             // ficava parado e voltávamos ao princípio.
                             if crate::bandeiras::video_por_uni() {
-                                if let Ok(corpo) = corpo_do_quadro(&q) {
-                                    let c = conn.clone();
-                                    tokio::spawn(async move {
-                                        if let Ok(mut uni) = c.open_uni().await {
-                                            let _ = uni.write_all(&corpo).await;
-                                            let _ = uni.finish();
-                                        }
-                                    });
+                                // UM stream para o vídeo todo, aberto à primeira vez e
+                                // mantido. Separa o vídeo do controlo — que é o objectivo —
+                                // sem lhe destruir a ordem, que o fMP4 do outro lado exige.
+                                //
+                                // Escreve-se AQUI e não numa tarefa: pôr isto a correr fora
+                                // do laço reordenava os fragmentos entre si, que é
+                                // exactamente o que este desenho existe para evitar. E o que
+                                // fica à espera passa a ser o vídeo e não o texto, porque o
+                                // texto já não vem por aqui.
+                                if canal_de_video.is_none() {
+                                    canal_de_video = conn.open_uni().await.ok();
+                                }
+                                if let Some(uni) = canal_de_video.as_mut() {
+                                    if escrever_quadro(uni, &q).await.is_err() {
+                                        canal_de_video = None;
+                                    }
                                 }
                                 None
                             } else {
@@ -2369,19 +2495,26 @@ async fn sessao(
                         // recuperação que nunca teve por onde sair. Uma rede que engasga e
                         // volta ao normal é o caso real; uma que nunca mais escreve é outro
                         // problema, e tem outro nome.
+                        // CRONOMETRAR A ESCRITA (#114). É o número que explica o
+                        // `Lagged`: enquanto isto espera, a sessão não lê do canal.
+                        //
+                        // O atraso de propósito fica DENTRO da medição, e isso foi uma
+                        // correcção: estava antes do `let antes`, portanto a bandeira que
+                        // existe para simular uma escrita lenta era a única coisa que a
+                        // medição não via — e o ramo do corte de vídeo, que depende dela,
+                        // não era exercitado por nada.
+                        let antes = std::time::Instant::now();
                         if let Some(ms) = crate::bandeiras::atraso_da_escrita_ms() {
                             if nasceu.elapsed() < janela_lenta {
                                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             }
                         }
-                        // CRONOMETRAR A ESCRITA (#114). É o número que explica o
-                        // `Lagged`: enquanto isto espera, a sessão não lê do canal.
-                        let antes = std::time::Instant::now();
                         let falhou = escrever_quadro_partido(&mut envia, q).await.is_err();
                         let demorou = antes.elapsed().as_millis() as u64;
                         if let Ok(mut n) = rede.contagem.lock() {
                             let e = n.entry(peer.clone()).or_default();
                             e.escrita_ultima_ms = demorou;
+                            e.escrita_medida_em = Some(std::time::Instant::now());
                             e.escrita_pior_ms = e.escrita_pior_ms.max(demorou);
                         }
                         if falhou {
@@ -4257,6 +4390,43 @@ mod testes {
             .expect("não chegou a tempo")
             .expect("tarefa");
         assert_eq!(&recebido[..], b"ola voz");
+    }
+
+    /// O corte de vídeo do #114 não pode ser um ferrolho de sentido único.
+    ///
+    /// Esta é a propriedade que o teste de par **não** consegue isolar: lá há sempre outro
+    /// tráfego — presença, sync, a conversa privada — cujas escritas voltam a medir e
+    /// destapam o corte por acidente. Sabotei a validade e o par recuperou na mesma, o que
+    /// diz que aquela medição não estava a provar isto. Aqui prova.
+    #[test]
+    fn o_corte_de_video_destranca_se_sozinho() {
+        let agora = std::time::Instant::now();
+        let mut c = Contagem::default();
+
+        // Nunca se escreveu nada: não há motivo para cortar.
+        assert!(!corta_video(&c, agora), "sem medida nenhuma não se corta");
+
+        // Uma escrita lenta agora mesmo: corta-se, que é o comportamento que se quer.
+        c.escrita_ultima_ms = ESCRITA_LENTA_MS + 1;
+        c.escrita_medida_em = Some(agora);
+        assert!(
+            corta_video(&c, agora),
+            "uma escrita lenta recente tem de cortar"
+        );
+
+        // A MESMA medida, passada a validade: já não decide nada. É este o passo que
+        // faltava — sem ele, o valor acima ficava a cortar para sempre, porque cortar é
+        // precisamente o que impede a escrita seguinte de o actualizar.
+        let depois = agora + VALIDADE_DA_MEDIDA + std::time::Duration::from_millis(1);
+        assert!(
+            !corta_video(&c, depois),
+            "uma medida caducada não pode continuar a cortar: é o ferrolho"
+        );
+
+        // E uma escrita rápida não corta, esteja fresca ou velha.
+        c.escrita_ultima_ms = ESCRITA_LENTA_MS;
+        c.escrita_medida_em = Some(agora);
+        assert!(!corta_video(&c, agora), "no limiar ainda não se corta");
     }
 
     /// O caminho POR RELAY, que o README promete e que não tinha um único teste (#126).
