@@ -11,7 +11,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use data_encoding::HEXLOWER;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 use spike_common::log as blog;
@@ -252,7 +252,7 @@ pub struct Contagem {
     /// Quantos datagramas de voz o `send_datagram` RECUSOU (#34).
     ///
     /// Só se contava o que saía bem. O ramo do erro não existia — não contava, não registava,
-    /// não avisava. Uma perda ocasional por buffer cheio é legítima (uma partilha de ecrã a 60
+    /// não avisava. Uma recusa ocasional é legítima (uma partilha de ecrã a 60
     /// fps ao lado enche-o), mas uma recusa PERMANENTE — um par cujo transporte não aceita
     /// datagramas de todo — dava exactamente a mesma coisa: silêncio, com a app a dizer «Voz
     /// conectada».
@@ -374,9 +374,49 @@ impl Rede {
         // O fio dos porteiros para a interface (#139). Um envenenamento do mapa de
         // servidores põe todos eles a recusar; sem isto, recusariam em silêncio.
         let _ = JANELA.set(janela.clone());
+        // A FILA DE SAÍDA DOS DATAGRAMAS: 1 MB por omissão, e isso são MINUTOS de voz (#173).
+        //
+        // O Bruma nunca chamou `transport_config`, portanto herdava o `datagram_send_buffer_size`
+        // por omissão do QUIC: 1 MiB. A voz sai a 24 kbps de Opus mais 32 bytes de chave por
+        // pedaço, uns 4,6 KB/s por par — 1 MiB é **mais de três minutos** de fala à espera de
+        // sair. Quando a ligação engasga, o que enche essa fila não é dado que valha a pena
+        // guardar: é voz que, quando chegasse, já não interessava a ninguém.
+        //
+        // A política do QUIC quando a fila enche é deitar fora os MAIS VELHOS, que é exactamente
+        // a certa para voz — e é por isso que a correcção é só escolher o tamanho.
+        //
+        // # Porque 16 KiB, e o que este número NÃO é
+        //
+        // No fio vai só o Opus — a chave de quem falou é acrescentada na recepção, não no
+        // envio (`enviar_voz` manda `dados` tal e qual). A 24 kbps são 3000 bytes por
+        // segundo, portanto 16 KiB são uns **5,5 segundos** de fala, e não os 3,5 que aqui
+        // estiveram escritos por eu ter contado um prefixo que não existe neste sentido.
+        //
+        // E 5,5 s continua muito acima do que a reprodução do outro lado consegue usar: a
+        // folga vai de 80 a 200 ms, logo tudo o que esteja nesta fila há mais de meio segundo
+        // já chega tarde. O valor não foi escolhido por esse critério — foi escolhido com
+        // margem larga e MEDIDO: no teste de par a perda fica em 0,0%. Apertá-lo mais é
+        // possível e não foi feito, porque não há medida que o justifique ainda.
+        //
+        // O instrumento para essa medida existe e passa a estar no painel: o
+        // `datagram_send_buffer_space()` diz quanto espaço LIVRE resta nesta fila. Se ele
+        // nunca descer perto de zero, o buffer nunca esteve sequer perto de encher.
+        //
+        // E há como saber se este número é pequeno de mais, sem adivinhar. Não é pelo
+        // `voz_falhados`: uma fila cheia **não** faz o `send_datagram` devolver `Err` — ele
+        // aceita e deita fora os velhos, em silêncio. Quem denuncia é a PERDA do outro lado
+        // (#124), que compara os que eu digo ter mandado com os que ele contou. Se este valor
+        // estivesse apertado de mais, a perda subiria no par — e ela mede-se lá.
+        //
+        // Isto não afecta o ecrã nem a câmara: só a voz vai por datagramas (`enviar_voz`); o
+        // vídeo vai por `Saida::Video`, que são streams.
+        let transporte = QuicTransportConfig::builder()
+            .datagram_send_buffer_size(16 * 1024)
+            .build();
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&app.semente))
             .alpns(vec![ALPN.to_vec()])
+            .transport_config(transporte)
             .bind()
             .await
             .map_err(|e| anyhow!("não consegui abrir a rede: {e}"))?;
@@ -599,8 +639,11 @@ impl Rede {
     /// nunca mais encolhe. Um pacote de voz perdido não vale a pena reenviar, porque
     /// quando chegasse já tinha passado a vez dele.
     ///
-    /// Falhas aqui são normais e não se registam: um datagrama grande de mais ou um buffer
-    /// cheio significa que aquele bocado de som se perdeu, e é assim que deve ser.
+    /// Falhas aqui são um datagrama grande de mais ou um par que não aceita datagramas —
+    /// **não** uma fila cheia. Com a fila cheia o `send_datagram` devolve `Ok` e o QUIC
+    /// deita fora os mais velhos, em silêncio; quem denuncia esse caso é a perda que o
+    /// outro lado calcula (#124), e não este contador. Contam-se na mesma (#34): todas as
+    /// recusas seguidas são um par que não recebe voz nenhuma.
     pub fn enviar_voz(&self, para: &[String], dados: &[u8]) {
         let Ok(ligacoes) = self.ligacoes.lock() else {
             return;

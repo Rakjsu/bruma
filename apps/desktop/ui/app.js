@@ -824,6 +824,190 @@ function aplicarMovimento() {
 }
 aplicarMovimento();
 
+/** O que o último teste do microfone disse. Sobrevive a redesenhos do painel (#107). */
+let testeDoMicro = null;
+let testeACorrer = false;
+
+/** Prova o microfone SEM precisar do amigo online (#107).
+ *
+ *  # Porque é que isto tinha de existir
+ *
+ *  O `--par` prova a metade do meio, mas exige duas instâncias e uma linha de comandos. O
+ *  autoteste de voz já fazia exactamente o circuito certo — microfone → Opus → descodificador
+ *  — mas corria só sob `--autoteste` e escrevia para a consola do Rust, que a pessoa que
+ *  carrega no botão do microfone nunca vê.
+ *
+ *  Prova TRÊS coisas de uma vez, e nomeia qual das três falhou: o dispositivo capta, o codec
+ *  desta máquina existe e funciona, e a saída toca.
+ *
+ *  # Grava primeiro, toca depois
+ *
+ *  Nunca ao mesmo tempo. Tocar a própria voz pelas colunas com o microfone aberto é
+ *  realimentação garantida — o teste faria barulho em vez de dizer alguma coisa.
+ */
+/** Devolve `true` se chegou a correr — incluindo quando o veredicto é «está mau», porque
+ *  nomear a metade que falhou É o trabalho — e `false` só quando se RECUSOU a correr.
+ *
+ *  Uma função que se pode recusar a fazer o trabalho tem de o dizer a quem a chamou — e é
+ *  também a única forma de a medição provar a guarda de reentrância em vez de a afirmar.
+ */
+async function testarMicrofone() {
+  if (testeACorrer) return false;
+  // NÃO DURANTE UMA CHAMADA, e o motivo não é cautela — é que o teste ficaria a mentir das
+  // duas pontas ao mesmo tempo.
+  //
+  // O teste fecha a SUA captura antes de tocar, e é isso que impede a realimentação dele
+  // próprio. Mas numa chamada há um SEGUNDO microfone aberto — o `voz.micro` — e esse
+  // continua a captar: a gravação sairia pelas colunas e entrava por ele, ou seja o outro
+  // lado ouvia a minha voz repetida sem perceber porquê. E a gravação apanharia a voz DELE
+  // vinda das colunas, portanto o «captou som» deixava de ser sobre o meu microfone.
+  //
+  // E numa chamada este teste não é preciso: há alguém do outro lado, que é a prova.
+  if (voz.canal) {
+    testeDoMicro = {
+      estado: 'mau',
+      texto: 'Este teste toca-te a tua própria voz de volta, e com uma chamada aberta isso '
+        + 'entrava outra vez pelo teu microfone — o outro lado ouvia-se a ele próprio. Sai '
+        + 'da chamada para testar. (Numa chamada já tens quem te diga se te ouve.)',
+    };
+    await mostrarPainel('voz');
+    return false;
+  }
+  testeACorrer = true;
+  testeDoMicro = { estado: 'a gravar', texto: 'A gravar 3 segundos… fala agora.' };
+  await mostrarPainel('voz');
+
+  let mic = null;
+  const falhou = (onde, porque) => {
+    testeDoMicro = { estado: 'mau', texto: `${onde}: ${porque}` };
+  };
+  try {
+    if (typeof MediaStreamTrackProcessor === 'undefined') {
+      falhou('O codec desta máquina', 'esta versão do WebView2 não sabe entregar som ao '
+        + 'codificador. Actualizar o Edge WebView2 resolve.');
+      return true;
+    }
+    try {
+      mic = await abrirMicrofone();
+    } catch (e) {
+      falhou('O dispositivo', `não abriu (${e && e.message ? e.message : e}).`);
+      return true;
+    }
+    const faixa = mic.getAudioTracks()[0];
+    if (!faixa) { falhou('O dispositivo', 'abriu e não deu nenhuma faixa de som.'); return true; }
+
+    // O MESMO codificador e descodificador do caminho a sério, com a mesma configuração:
+    // um teste com outra configuração provaria outra coisa.
+    const pedacos = [];
+    let codificados = 0, erroDoCodec = null;
+    const dec = new AudioDecoder({
+      output: som => {
+        const f = new Float32Array(som.numberOfFrames);
+        try { som.copyTo(f, { planeIndex: 0, format: 'f32-planar' }); pedacos.push(f); }
+        catch (e) { /* formato inesperado */ }
+        som.close();
+      },
+      error: e => { erroDoCodec = e; },
+    });
+    dec.configure({ codec: 'opus', sampleRate: VOZ_HZ, numberOfChannels: 1 });
+    const enc = new AudioEncoder({
+      output: p => {
+        codificados += 1;
+        const b = new Uint8Array(p.byteLength);
+        p.copyTo(b);
+        try {
+          dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: p.timestamp, data: b }));
+        } catch (e) { /* segue */ }
+      },
+      error: e => { erroDoCodec = e; },
+    });
+    enc.configure({
+      codec: 'opus', sampleRate: VOZ_HZ, numberOfChannels: 1,
+      bitrate: VOZ_BITRATE, opus: { frameDuration: VOZ_QUADRO_US },
+    });
+
+    const leitor = new MediaStreamTrackProcessor({ track: faixa }).readable.getReader();
+    const fim = performance.now() + 3000;
+    let cruas = 0, energiaCrua = 0;
+    while (performance.now() < fim) {
+      const { value, done } = await leitor.read().catch(() => ({ done: true }));
+      if (done) break;
+      // A energia mede-se ANTES do codec: é isso que separa «não captaste nada» de
+      // «captaste e o codec comeu».
+      try {
+        const f = new Float32Array(value.numberOfFrames);
+        value.copyTo(f, { planeIndex: 0, format: 'f32-planar' });
+        for (let i = 0; i < f.length; i++) energiaCrua += f[i] * f[i];
+        cruas += f.length;
+      } catch (e) { /* formato inesperado */ }
+      // COM GUARDA. Um `AudioEncoder` que entra em erro passa a `closed`, e `encode()`
+      // sobre ele ATIRA — a excepção saltava daqui para o `catch` do bloco todo e o
+      // veredicto saía «O teste: ...» em vez de «O codec desta máquina: ...», que é
+      // precisamente a metade que o teste existe para nomear.
+      if (enc.state === 'configured') {
+        try { enc.encode(value); } catch (e) { erroDoCodec = erroDoCodec || e; }
+      }
+      value.close();
+    }
+    await enc.flush().catch(() => {});
+    await dec.flush().catch(() => {});
+    try { leitor.cancel(); } catch (e) { /* já */ }
+    // FECHA-SE A CAPTURA ANTES DE TOCAR. Esta linha é o teste todo: com ela aberta, o que
+    // sai das colunas volta a entrar pelo microfone.
+    mic.getTracks().forEach(t => t.stop());
+    mic = null;
+    try { enc.close(); } catch (e) { /* já */ }
+    try { dec.close(); } catch (e) { /* já */ }
+
+    const rms = cruas ? Math.sqrt(energiaCrua / cruas) : 0;
+    if (rms < CHAO_DO_MICRO) {
+      falhou('O teu microfone', `abriu mas não captou nada (nível ${rms.toFixed(4)}). Está `
+        + 'silenciado no Windows, tem o botão físico desligado, ou é o dispositivo errado.');
+      return true;
+    }
+    if (erroDoCodec || !codificados || !pedacos.length) {
+      falhou('O codec desta máquina', `captou som (nível ${rms.toFixed(3)}) mas o Opus não `
+        + `fechou o circuito: ${codificados} pedaços codificados, ${pedacos.length} `
+        + `descodificados${erroDoCodec ? ` (${erroDoCodec.message || erroDoCodec})` : ''}.`);
+      return true;
+    }
+
+    // E toca-se o que passou pelo codec — não o que entrou. É a única forma de a pessoa
+    // ouvir exactamente o que o outro lado ouviria.
+    const total = pedacos.reduce((a, f) => a + f.length, 0);
+    const ctx = contextoDeAudio();
+    const buf = ctx.createBuffer(1, total, VOZ_HZ);
+    const canal = buf.getChannelData(0);
+    let i = 0;
+    for (const f of pedacos) { canal.set(f, i); i += f.length; }
+    const fonte = ctx.createBufferSource();
+    fonte.buffer = buf;
+    fonte.connect(ctx.destination);
+    testeDoMicro = {
+      estado: 'bom',
+      texto: `Captou (nível ${rms.toFixed(3)}), o Opus fechou o circuito `
+        + `(${codificados} pedaços) e está a tocar-te de volta ${(total / VOZ_HZ).toFixed(1)} s. `
+        + 'Se ouvires a tua voz, as três metades estão boas.',
+    };
+    await mostrarPainel('voz');
+    fonte.start();
+    fonte.onended = async () => {
+      if (testeDoMicro && testeDoMicro.estado === 'bom') {
+        testeDoMicro = { estado: 'bom', texto: testeDoMicro.texto.replace('está a tocar-te',
+          'tocou-te') };
+        if (aVerAsDefinicoesDaVoz()) await mostrarPainel('voz');
+      }
+    };
+  } catch (e) {
+    falhou('O teste', String(e && e.message ? e.message : e));
+  } finally {
+    if (mic) mic.getTracks().forEach(t => t.stop());
+    testeACorrer = false;
+    if (aVerAsDefinicoesDaVoz()) await mostrarPainel('voz');
+  }
+  return true;
+}
+
 /** Um interruptor com título e explicação, como os do Discord. */
 function interruptor(titulo, explica, ligado, aoMudar) {
   const l = elemento('label', 'def__linha');
@@ -1214,13 +1398,107 @@ const PAINEIS = {
       painel.append(elemento('h2', null, 'Voz e vídeo'));
 
       const s1 = seccao('Microfone');
+
+      // A ESCOLHA DE DISPOSITIVO, que não existia (#105). A secção «Câmara» aqui em baixo
+      // era exemplar a admitir que não tinha escolha; esta calava a mesma limitação, e no
+      // microfone ela é muito mais grave: uma câmara errada vê-se de imediato, um microfone
+      // errado só se descobre quando alguém diz que não se ouve nada.
+      const escolha = document.createElement('select');
+      escolha.className = 'def__escolha';
+      const porOmissao = document.createElement('option');
+      porOmissao.value = '';
+      porOmissao.textContent = 'O que o Windows tiver como predefinido';
+      escolha.append(porOmissao);
+      escolha.value = microfoneEscolhido();
+      escolha.onchange = () => {
+        localStorage.setItem(MICROFONE, escolha.value);
+        // O resultado é sobre o dispositivo que foi testado. Deixá-lo no ecrã ao lado de
+        // outro dispositivo é a mesma família de mentira que o `vozPartida` que não se
+        // limpava: uma frase verdadeira sobre um mundo que já não é este.
+        testeDoMicro = null;
+        // Aplica-se JÁ, e não só na próxima chamada: um interruptor que só faz efeito
+        // depois de sair e voltar a entrar é um interruptor que parece não funcionar.
+        if (voz.canal) reabrirMicrofone('escolheste outro microfone', true);
+        mostrarPainel('voz');
+      };
+      const linhaEscolha = elemento('div', 'def__linha');
+      const rotulo = elemento('span');
+      rotulo.append(elemento('b', null, 'Dispositivo'));
+      rotulo.append(elemento('i', null,
+        'A escolha fica guardada. Se o dispositivo desaparecer, volta-se ao predefinido e '
+        + 'diz-se aqui.'));
+      linhaEscolha.append(rotulo, escolha);
+      s1.append(linhaEscolha);
+
+      if (microfoneRecuado) {
+        s1.append(elemento('div', 'def__valor',
+          'O microfone que escolheste não está disponível agora — estás a usar o '
+          + 'predefinido do Windows.'));
+      }
+
+      // A lista chega depois: `enumerateDevices` é assíncrono e o painel desenha-se já.
+      // E os nomes só existem depois de o microfone ter sido autorizado uma vez — por isso
+      // é que se diz isso em vez de mostrar uma lista de dispositivos sem nome.
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        navigator.mediaDevices.enumerateDevices().then(ds => {
+          const micros = ds.filter(d => d.kind === 'audioinput' && d.deviceId !== 'default'
+            && d.deviceId !== 'communications');
+          for (const d of micros) {
+            const o = document.createElement('option');
+            o.value = d.deviceId;
+            o.textContent = d.label || 'Microfone sem nome (autoriza-o uma vez para o veres)';
+            escolha.append(o);
+          }
+          // Se o que estava guardado já não está na lista, a caixa não pode ficar a
+          // mostrar o predefinido como se fosse a escolha — diz-se que ele sumiu.
+          const guardado = microfoneEscolhido();
+          if (guardado && !micros.some(d => d.deviceId === guardado)) {
+            const o = document.createElement('option');
+            o.value = guardado;
+            o.textContent = 'O que escolheste (não está ligado agora)';
+            escolha.append(o);
+          }
+          escolha.value = guardado;
+        }).catch(() => {
+          s1.append(elemento('div', 'def__valor',
+            'Não consegui listar os microfones desta máquina.'));
+        });
+      }
+
       s1.append(interruptor(
         'Supressão de ruído',
         'Tira o ventilador e o teclado, e cancela o eco do que sai das tuas colunas para o '
         + 'teu microfone.',
-        ruidoSuprimido,
-        () => $('#btn-ruido').click(),
+        ruidoReal === null ? ruidoSuprimido : ruidoReal,
+        // O valor vem da CAIXA, não de uma alternância cega: é o que o interruptor
+        // acabou de mostrar à pessoa, e é a isso que ela está a responder.
+        v => porRuido(v),
       ));
+      // O QUE O DISPOSITIVO DIZ, e não o que se lhe pediu (#35, #191).
+      if (ruidoReal !== null && ruidoReal !== ruidoSuprimido) {
+        s1.append(elemento('div', 'def__valor',
+          `Pediste ${ruidoSuprimido ? 'ligada' : 'desligada'} e o teu microfone está a `
+          + 'fazer o contrário — ele não deixa mudar isto.'));
+      } else if (voz.micro && ruidoReal === null) {
+        s1.append(elemento('div', 'def__valor',
+          'O teu microfone não diz se está mesmo a suprimir ruído, portanto não consigo '
+          + 'confirmar que isto está a ser respeitado.'));
+      }
+
+      // O TESTE (#107).
+      const bt = elemento('button', 'def__bt',
+        testeACorrer ? 'A testar…' : 'Testar o microfone');
+      bt.disabled = testeACorrer;
+      bt.onclick = () => testarMicrofone();
+      s1.append(bt);
+      s1.append(elemento('p', 'nota',
+        'Grava 3 segundos, passa-os pelo mesmo Opus que a chamada usa, e toca-os de volta — '
+        + 'sem ninguém do outro lado. Prova três coisas de uma vez: o dispositivo capta, o '
+        + 'codec desta máquina funciona, e a saída toca.'));
+      if (testeDoMicro) {
+        s1.append(elemento('div',
+          testeDoMicro.estado === 'mau' ? 'aviso' : 'def__valor', testeDoMicro.texto));
+      }
       painel.append(s1);
 
       const q = qualidadeDePartilha();
@@ -1365,6 +1643,23 @@ const ORDEM = ['conta', 'dados', 'permissoes', 'notificacoes', 'cobrancas',
   'voz', 'aparencia', 'acessibilidade', 'sistema', 'idioma', 'sobreposicao'];
 
 let painelActivo = 'conta';
+
+/** As definições estão abertas E na secção da voz?
+ *
+ *  Havia três sítios a perguntar isto com `$('#defs').classList.contains('is-on')` — e essa
+ *  classe **nunca é posta em lado nenhum**: o painel esconde-se com `hidden` (index.html) e
+ *  o `abrirDefinicoes`/`fecharDefinicoes` só mexem nisso. A condição era permanentemente
+ *  falsa, e o efeito era o pior possível: o `finally` do teste do microfone nunca
+ *  redesenhava, portanto TODOS os caminhos de falha — sem `MediaStreamTrackProcessor`, sem
+ *  microfone, microfone a entregar zeros — ficavam com «A gravar 3 segundos… fala agora.»
+ *  para sempre e a razão nunca aparecia. Exactamente os casos por que o botão existe.
+ *
+ *  E confirma-se o painel: redesenhar o da voz quando a pessoa já navegou para outro
+ *  arrancava-a de onde estava.
+ */
+function aVerAsDefinicoesDaVoz() {
+  return !$('#defs').hidden && painelActivo === 'voz';
+}
 
 function desenharMenuDeDefinicoes(filtro = '') {
   const menu = $('#defs-menu');
@@ -1624,12 +1919,124 @@ const VOZ_QUADRO_US = 20000;    // 20 ms por pedaço
  */
 const VOZ_FOLGA = 0.08;
 
+/* A FOLGA DEIXA DE SER UM NÚMERO ESCRITO À MÃO (#104, #117).
+ *
+ * Os 80 ms foram escolhidos para «a irregularidade normal». Entre os EUA e o Brasil, e
+ * sobretudo quando a ligação cai para relay, a irregularidade normal é outra — e o sintoma
+ * é a voz a picar. Sobe depressa (a cada rajada de cortes), desce devagar (só ao fim de um
+ * minuto inteiro sem nenhum), e nunca passa do tecto: uma folga que cresce e não encolhe
+ * transforma a conversa num walkie-talkie, que é o mesmo problema com outro nome.
+ */
+const VOZ_FOLGA_TECTO = 0.20;
+const VOZ_FOLGA_PASSO = 0.02;
+/** Quantos cortes numa janela de 10 s justificam subir a folga. */
+const CORTES_PARA_SUBIR = 2;
+const JANELA_DOS_CORTES = 10000;
+/** Quanto tempo limpo é preciso para descer um degrau. */
+const LIMPO_PARA_DESCER = 60000;
+
+/** Os cortes na reprodução, por pessoa (#65).
+ *
+ *  # Porque é que isto existe
+ *
+ *  `if (v.proximo < agora + 0.01 || v.proximo > agora + 0.6) v.proximo = agora + folga;` —
+ *  cada vez que esta linha corria, a reprodução tinha sido reposta, ou porque ficou para trás
+ *  ou porque secou. Isso OUVE-SE: é um estalo, ou uma sílaba que desaparece. E não deixava
+ *  rasto nenhum: nem contador, nem registo, nem uma linha no painel. É exactamente o género
+ *  de avaria que se descreve como «a voz está estranha» sem nada que a corrobore.
+ *
+ *  Vive fora do `voz.audio` de propósito: o `calarPeer` apaga a entrada de áudio quando a
+ *  pessoa sai da sala, e a contagem de uma chamada não devia desaparecer com ela.
+ */
+const cortesDaVoz = new Map();
+
+/** Os cortes dos últimos `quanto` ms — e a lista fica aparada.
+ *
+ *  A filtragem vivia DENTRO do ramo do corte, o que a tornava uma função de haver cortes
+ *  novos e não de haver tempo passado: com 14 cortes e a rede a melhorar, o painel escrevia
+ *  «som recomeçado 14x no último minuto» dez minutos depois do último. Aqui, quem lê é quem
+ *  apara, portanto a janela é mesmo uma janela.
+ */
+function cortesDesdeHa(c, quanto) {
+  const ms = performance.now();
+  c.quando = c.quando.filter(t => ms - t < 60000);
+  return quanto >= 60000 ? c.quando : c.quando.filter(t => ms - t < quanto);
+}
+function contaDosCortes(chave) {
+  let c = cortesDaVoz.get(chave);
+  if (!c) {
+    // `limpoDesde` e `null` -- e nao zero -- de proposito. Zero e um INSTANTE valido no
+    // relogio do `performance.now()`, e usa-lo tambem para dizer «nunca» faz as duas coisas
+    // deixarem de se distinguir: nos primeiros 60 s de vida da app, «nunca houve corte»
+    // passava a ler-se como «esta limpo desde o instante zero», que e uma afirmacao sobre o
+    // passado que ninguem mediu.
+    // `subiuEm` é `null` pelo MESMO motivo do `limpoDesde` — e ficou a zero na primeira
+    // escrita, que é o defeito que esta fase já corrigiu duas vezes. Com zero,
+    // `ms - 0 >= 10000` é falso nos primeiros dez segundos de vida da app: quem abrisse o
+    // Bruma e entrasse logo numa chamada tinha a adaptação DESLIGADA exactamente na janela
+    // em que a ligação ainda está a assentar.
+    c = { folga: VOZ_FOLGA, quando: [], total: 0, saltado: 0, subiuEm: null, limpoDesde: null };
+    cortesDaVoz.set(chave, c);
+  }
+  return c;
+}
+
 let vozCtx = null;
 function contextoDeAudio() {
   if (!vozCtx) vozCtx = new AudioContext({ sampleRate: VOZ_HZ });
   if (vozCtx.state === 'suspended') vozCtx.resume();
   return vozCtx;
 }
+
+/* O RELÓGIO DA SAÍDA PODE PARAR, E ISSO ENGOLE A CHAMADA (#38).
+ *
+ * O `contextoDeAudio` só chama `resume()` no instante em que é invocado — e ele é invocado
+ * uma vez por pessoa, quando ela aparece. Se o contexto for suspenso DEPOIS disso (o
+ * dispositivo de saída desaparece, o Windows suspende, a política de autoplay volta a
+ * morder), o `currentTime` deixa de avançar e o `tocar` continua a agendar `start()` contra
+ * um relógio parado: nada se ouve, nada falha, e nada é dito.
+ *
+ * O vigia olha para o único sinal que não mente — se o relógio ANDOU. Duas voltas paradas
+ * com a chamada aberta é uma avaria; uma pode ser escalonamento.
+ */
+let ultimoRelogioDaVoz = -1;
+let voltasParado = 0;
+
+/** Porque é que não estás a OUVIR, se não estás.
+ *
+ *  Separada do `vozFalhou` de propósito. O `vozFalhou` documenta-se como «porque é que a
+ *  TUA VOZ não está a sair» e pinta o botão do microfone: escrever nele uma avaria da SAÍDA
+ *  acendia o microfone a vermelho por causa dos altifalantes, e mandava procurar no sítio
+ *  errado. Esta vive no botão de silenciar tudo, que é o lado certo do problema.
+ */
+let saidaFalhou = null;
+
+setInterval(() => {
+  if (!voz.canal || !vozCtx) { ultimoRelogioDaVoz = -1; voltasParado = 0; return; }
+  const agora = vozCtx.currentTime;
+  if (ultimoRelogioDaVoz >= 0 && agora === ultimoRelogioDaVoz) {
+    voltasParado += 1;
+    if (vozCtx.state === 'suspended') vozCtx.resume().catch(() => {});
+    if (voltasParado >= 2 && !saidaFalhou) {
+      // E o conselho é verdade PORQUE o `sairDeVoz` passou a fechar e a esquecer o
+      // contexto. Antes, «sai e volta a entrar» reencontrava o mesmo `AudioContext`
+      // parado — o `vozCtx` era atribuído uma vez e nunca mais voltava a `null`, portanto
+      // o conselho mandava fazer uma coisa que não mudava nada.
+      saidaFalhou = 'O som de saída parou — o dispositivo de saída mudou? '
+        + 'Sai da chamada e volta a entrar.';
+      desenharRodape();
+    }
+  } else if (agora !== ultimoRelogioDaVoz) {
+    // Voltou a andar: se a queixa era esta, tira-se. Uma queixa que fica depois de o
+    // problema passar é a mesma família do `vozPartida` que nunca se limpava.
+    if (voltasParado > 0 && saidaFalhou) {
+      saidaFalhou = null;
+      desenharRodape();
+    }
+    voltasParado = 0;
+  }
+  ultimoRelogioDaVoz = agora;
+}, 2000);
 
 /* --- enviar ---------------------------------------------------------------- */
 
@@ -1647,14 +2054,84 @@ let vozFalhou = null;
  *  pessoa da chamada — ela continua a aparecer, e a suspeita cai nela. */
 const vozPartida = new Map();
 
+/** Quando é que o codificador entregou o último pedaço (#36).
+ *
+ *  É o que separa «estou a falar» de «estou a ser ouvido»: o microfone pode ter energia e
+ *  não sair nada da máquina, e era esse o caso em que o anel verde mentia.
+ */
+let ultimoPedacoSaiu = 0;
+/** Quanto tempo sem um pedaço a sair basta para o anel do próprio deixar de acender. */
+const SAIDA_RECENTE_MS = 300;
+
+/** O RMS mais alto do meu microfone nos últimos 15 s, e o instante em que o vi (#106).
+ *
+ *  O analisador já media isto oito vezes por segundo e o único uso que se lhe dava era
+ *  acender ou apagar um anel. O caso mais comum de todos numa chamada — o microfone está
+ *  aberto, não está silenciado, e entrega zeros porque o Windows o silenciou, porque tem o
+ *  botão físico desligado, ou porque é o dispositivo errado — não produzia mensagem nenhuma.
+ */
+/** O último instante em que o meu microfone passou do chão — ou `null` se ainda não medi.
+ *
+ *  # Porque é que isto substituiu um par de variáveis
+ *
+ *  Havia um `picoDoMicro` (o máximo dos últimos 15 s) e um `picoVistoEm` (quando a janela
+ *  rodou), e o leitor perguntava `agora - picoVistoEm > JANELA_DO_PICO`. Só que o ESCRITOR,
+ *  em `medirFala`, repunha `picoVistoEm = agora` com a MESMA condição — `t - picoVistoEm >
+ *  JANELA_DO_PICO` — oito vezes por segundo. Com o microfone a entregar zeros, a diferença
+ *  nunca passava de ~15,12 s, e só estava acima dos 15 000 ms durante os ≤120 ms entre a
+ *  janela rodar e o tique seguinte. O `desenharRodape` amostra de 3 em 3 s: a marca acendia
+ *  umas 4% das vezes, uma vez em cada poucos minutos, e apagava-se no redesenho a seguir.
+ *  Um microfone permanentemente morto dava um aviso a PISCAR em vez de um aviso.
+ *
+ *  Um relógio, um significado: aqui só se escreve quando há mesmo som. Quem lê subtrai e
+ *  ninguém lhe mexe por baixo.
+ */
+let acimaDoChaoEm = null;
+/** Abaixo disto não é «alguém calado»: é um microfone que não capta. */
+const CHAO_DO_MICRO = 0.002;
+/** Quanto tempo abaixo do chão é preciso para se dizer que o microfone não capta nada. */
+const JANELA_DO_PICO = 15000;
+
 function comecarAEnviarVoz(microfone) {
   pararDeEnviarVoz();
   const faixa = microfone && microfone.getAudioTracks()[0];
-  if (!faixa || typeof MediaStreamTrackProcessor === 'undefined') return;
+
+  // OS DOIS RETURNS CALADOS (#163).
+  //
+  // Aqui o `getUserMedia` JÁ correu: a luz do microfone acende, a app aparece presente e não
+  // silenciada, e nem um byte é codificado. O autoteste das capacidades imprime
+  // «MediaStreamTrackProcessor=não existe» para a consola do Rust — que a pessoa que carrega
+  // no botão do microfone nunca vê.
+  //
+  // E fecha-se a faixa no segundo caso: uma luz de microfone acesa é uma promessa, e não há
+  // nada que a cumpra nesta máquina.
+  if (!faixa) {
+    vozFalhou = 'O dispositivo abriu mas não deu nenhuma faixa de som.';
+    desenharRodape(); desenharVoz();
+    return;
+  }
+  if (typeof MediaStreamTrackProcessor === 'undefined') {
+    vozFalhou = 'Esta versão do WebView2 não sabe entregar som ao codificador — a tua voz '
+      + 'não sai daqui. Actualizar o Edge WebView2 resolve.';
+    try { faixa.stop(); } catch (e) { /* já */ }
+    desenharRodape(); desenharVoz();
+    return;
+  }
 
   let carimbo = 0;
   const codificador = new AudioEncoder({
     output: pedaco => {
+      // O QUE O CODIFICADOR ENTREGOU (#36). O anel verde do próprio vinha do analisador
+      // ligado à faixa CRUA do microfone — antes do codificador. Com o codificador morto ou
+      // sem `MediaStreamTrackProcessor`, eu falava, via o meu anel a acender, e concluía
+      // que estava a ser ouvido.
+      //
+      // E o que este carimbo NÃO cobre, dito à frente: ele é escrito aqui, antes do
+      // `invoke`, portanto prova que o pedaço foi CODIFICADO e não que saiu da máquina. Com
+      // o `send_datagram` a recusar tudo, o anel continua a acender. Esse caso tem
+      // instrumento próprio e está do outro lado — o `voz_falhados` (#34) e a perda que o
+      // outro lado calcula (#124) —, e é lá que se lê, não aqui.
+      ultimoPedacoSaiu = performance.now();
       // Só se envia a quem está mesmo na sala. Falar para uma lista vazia não custa nada
       // e não se manda nada para lado nenhum.
       const gente = [...voz.presentes.entries()]
@@ -1684,12 +2161,41 @@ function comecarAEnviarVoz(microfone) {
   });
 
   const leitor = new MediaStreamTrackProcessor({ track: faixa }).readable.getReader();
-  envio = { codificador, leitor, vivo: true };
+  // O LAÇO OLHA PARA O SEU PRÓPRIO ENVIO, e não para a variável de módulo.
+  //
+  // Isto foi um defeito a sério, e vale a pena dizer qual. O `while (envio && envio.vivo)`
+  // e o `if (envio && envio.vivo)` liam a GLOBAL. Ao trocar de microfone, o
+  // `comecarAEnviarVoz` novo corre `pararDeEnviarVoz()` — que põe `E1.vivo = false` e
+  // `envio = null` — e chega a `envio = E2` **sem um único `await` pelo meio**. Só depois
+  // é que a continuação do laço antigo acordava; e nessa altura `envio` já era o E2, com
+  // `vivo === true`. Ou seja: cada troca de microfone bem sucedida escrevia «o teu
+  // microfone deixou de entregar som» por cima do `vozFalhou = null` que a reabertura
+  // acabara de limpar, e deixava o botão vermelho até se sair da chamada.
+  const meu = { codificador, leitor, vivo: true };
+  envio = meu;
 
   (async () => {
-    while (envio && envio.vivo) {
+    while (meu.vivo) {
       const { value, done } = await leitor.read().catch(() => ({ done: true }));
-      if (done) break;
+      if (done) {
+        // OS DOIS FINS DESTE LAÇO NÃO SÃO A MESMA COISA (#101).
+        //
+        // Se o `vivo` ainda for verdadeiro, ninguém pediu para parar: a faixa acabou
+        // sozinha. É o que acontece quando os auscultadores saem, o dispositivo desaparece,
+        // ou o Windows muda o predefinido. O laço saía calado, e a app continuava a dizer
+        // que estavas a falar — com o anel a acender, porque ele media o microfone e não o
+        // que sai da máquina.
+        //
+        // `envio === meu` é a segunda metade: só quem AINDA é o envio em uso pode dizer
+        // que o microfone morreu. Um laço já substituído não fala por quem o substituiu.
+        if (meu.vivo && envio === meu) {
+          vozFalhou = 'O teu microfone deixou de entregar som (o dispositivo mudou ou '
+            + 'desapareceu). A tentar reabrir…';
+          desenharRodape(); desenharVoz();
+          reabrirMicrofone('a faixa acabou sozinha');
+        }
+        break;
+      }
       // O microfone silenciado não envia nada. Não basta baixar o volume: o que não sai
       // desta máquina é o que ninguém pode ouvir.
       const calado = !faixa.enabled;
@@ -1701,6 +2207,182 @@ function comecarAEnviarVoz(microfone) {
     }
   })();
   void carimbo;
+}
+
+/** O que se pede ao microfone. Num sítio só, porque é pedido em três. */
+/** Onde vive o microfone escolhido (#105). */
+const MICROFONE = 'bruma.microfone';
+/** Qual foi o último `deviceId` que se pediu e falhou, para não se insistir. */
+let microfoneRecuado = null;
+
+function microfoneEscolhido() {
+  return localStorage.getItem(MICROFONE) || '';
+}
+
+/** Abre o microfone, e RECUA para o predefinido se o escolhido já não existir (#105).
+ *
+ *  # Porque é que isto não é só um `getUserMedia`
+ *
+ *  Com `deviceId: { exact: … }`, um dispositivo que desapareceu — os auscultadores que
+ *  ficaram noutra casa, o dock que não está ligado — não faz o pedido recuar: faz o pedido
+ *  **falhar** com `OverconstrainedError`. Sem apanhar isso, escolher um microfone uma vez
+ *  trocava «o microfone errado» por «microfone nenhum», que é estritamente pior.
+ *
+ *  E o recuo diz-se em voz alta. Ficar calado a usar outro dispositivo é a mesma família de
+ *  mentira que o #102: continua a captar, e a captar o sítio errado.
+ */
+async function abrirMicrofone() {
+  const escolhido = microfoneEscolhido();
+  if (escolhido) {
+    try {
+      const m = await navigator.mediaDevices.getUserMedia(pedidoDeMicrofone(escolhido));
+      microfoneRecuado = null;
+      return m;
+    } catch (e) {
+      const nome = e && e.name;
+      if (nome !== 'OverconstrainedError' && nome !== 'NotFoundError') throw e;
+      microfoneRecuado = escolhido;
+      console.warn('o microfone escolhido não existe; a recuar para o predefinido', e);
+    }
+  } else {
+    // NÃO HÁ ESCOLHA, LOGO NÃO HÁ RECUO. O `microfoneRecuado = null` vivia só dentro do
+    // ramo de cima: quem escolhia um dispositivo desligado e depois voltava ao predefinido
+    // continuava a ver «o microfone que escolheste não está disponível agora» — uma frase
+    // sobre uma escolha que já não existe.
+    microfoneRecuado = null;
+  }
+  return navigator.mediaDevices.getUserMedia(pedidoDeMicrofone(''));
+}
+
+function pedidoDeMicrofone(qual) {
+  // O QUE FICOU GUARDADO É O QUE SE PEDE (#35). Antes pedia-se sempre `true`, seja qual
+  // fosse o valor da variável — o interruptor mexia numa coisa e o microfone abria noutra.
+  // E o `autoGainControl` entra aqui também: até agora só existia no `applyConstraints`,
+  // portanto o primeiro microfone da sessão abria sempre com ele ligado.
+  const audio = {
+    echoCancellation: ruidoSuprimido,
+    noiseSuppression: ruidoSuprimido,
+    autoGainControl: ruidoSuprimido,
+  };
+  // `exact` e não uma preferência: uma preferência que o motor ignora dá exactamente o
+  // sintoma que o #105 descreve — a app diz que está a usar um dispositivo e usa outro.
+  // Melhor falhar e recuar com uma frase do que acertar por acaso.
+  const qualUsar = qual === undefined ? microfoneEscolhido() : qual;
+  if (qualUsar) audio.deviceId = { exact: qualUsar };
+  return { audio };
+}
+
+/** Quando foi a última reabertura, para não entrar em ciclo. */
+let ultimaReabertura = 0;
+let reabrindo = false;
+
+/** Reabre o microfone quando ele muda ou morre (#101, #102).
+ *
+ *  # As duas avarias que isto cobre
+ *
+ *  **A faixa acaba sozinha** (#101): os auscultadores saem, o dispositivo desaparece, o
+ *  Windows muda o predefinido. O laço de envio saía calado e a app continuava a dizer que
+ *  estavas a falar.
+ *
+ *  **A faixa continua viva no dispositivo ERRADO** (#102): não havia um único
+ *  `devicechange` em toda a app. O `getUserMedia` era pedido uma vez, sem `deviceId`, e
+ *  ficava agarrado ao que era predefinido nesse instante. Ligar os auscultadores a meio da
+ *  chamada muda o predefinido do Windows — e a faixa aberta continua no antigo.
+ *
+ *  # Os dois cuidados
+ *
+ *  Um intervalo mínimo de 3 s: os docks USB fazem o dispositivo aparecer e desaparecer em
+ *  rajada, e sem isto reabria-se três vezes e ouviam-se três cortes. E uma bandeira de
+ *  reentrância, porque o `getUserMedia` é assíncrono e o `devicechange` chega várias vezes
+ *  seguidas por uma única ligação física.
+ */
+async function reabrirMicrofone(porque, deliberado) {
+  if (!voz.canal || reabrindo) return;
+  const agora = performance.now();
+  // O intervalo mínimo existe para as RAJADAS dos docks USB. Uma escolha feita à mão no
+  // painel não é uma rajada — e engoli-la em silêncio fazia o selector parecer partido.
+  if (!deliberado && agora - ultimaReabertura < 3000) return;
+  ultimaReabertura = agora;
+  reabrindo = true;
+  const canalNaAltura = voz.canal;
+  // ESTAVAS SILENCIADO ANTES? CONTINUAS SILENCIADO DEPOIS.
+  //
+  // Isto era um defeito de confiança, e dos maus. O «silenciado» não vive em variável
+  // nenhuma — vive só no `faixa.enabled` da faixa aberta (`$('#btn-mic').onclick` faz
+  // `t.enabled = !t.enabled`), e o «surdo» impõe `t.enabled = false`. As faixas de um
+  // `getUserMedia` novo nascem SEMPRE com `enabled === true`, e não havia uma linha que o
+  // repusesse. Silenciava-me para tossir, ligava os auscultadores, e voltava a transmitir
+  // sem o saber — com o botão ainda riscado durante até três segundos, porque o
+  // `is-cortado` só se recalcula no `desenharRodape` seguinte.
+  //
+  // Lê-se ANTES do `await`: a faixa antiga pode já ter sido parada quando lá chegarmos.
+  const faixaAntiga = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  const estavaCalado = !!faixaAntiga && !faixaAntiga.enabled;
+  try {
+    const antigo = voz.micro;
+    const novo = await abrirMicrofone();
+    // Saiu da sala enquanto se esperava: não se fica com um microfone aberto por engano.
+    if (voz.canal !== canalNaAltura) {
+      novo.getTracks().forEach(t => t.stop());
+      return;
+    }
+    if (antigo) antigo.getTracks().forEach(t => t.stop());
+    // E o surdo conta tanto como o silenciado: ficar a falar para uma chamada que não se
+    // está a ouvir é exactamente o que o botão de silenciar tudo existe para impedir.
+    const faixaNova = novo.getAudioTracks()[0];
+    if (faixaNova) faixaNova.enabled = !estavaCalado && !surdo;
+    voz.micro = novo;
+    comecarAEnviarVoz(novo);
+    vigiarAudio(voz.eu, novo);
+    lerRuidoReal();
+    vozFalhou = null;
+    console.info('microfone reaberto:', porque);
+  } catch (e) {
+    vozFalhou = `Não consegui reabrir o microfone (${porque}): ${e && e.message ? e.message : e}`;
+  } finally {
+    reabrindo = false;
+    desenharRodape();
+    desenharVoz();
+  }
+}
+
+/* O dispositivo mudou por baixo de nós (#102).
+   Comparar o `deviceId` em uso com o predefinido de agora: se mudou, a faixa aberta está no
+   dispositivo errado — continua a captar, e a captar o sítio errado, que é a forma de isto
+   passar despercebido. */
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', async () => {
+    if (!voz.canal || !voz.micro) return;
+    const faixa = voz.micro.getAudioTracks()[0];
+    if (!faixa) return reabrirMicrofone('a faixa desapareceu');
+    if (faixa.readyState === 'ended') return reabrirMicrofone('a faixa terminou');
+    try {
+      const emUso = faixa.getSettings().deviceId;
+      const todos = await navigator.mediaDevices.enumerateDevices();
+      // COM UM DISPOSITIVO FIXADO, O PREDEFINIDO NÃO INTERESSA (#105).
+      //
+      // A comparação abaixo é contra a entrada `default`. Se a pessoa escolheu o
+      // dispositivo X no painel — que é o caso normal de quem usa o selector —, o `groupId`
+      // do predefinido é PERMANENTEMENTE diferente do de X, e a condição passava a ser
+      // sempre verdadeira: cada `devicechange` reabria o microfone e dava um corte audível,
+      // por causa de uma diferença que o `exact: X` garante que é para existir.
+      //
+      // Com um fixado, o que importa é se ELE ainda lá está.
+      const fixado = microfoneEscolhido();
+      if (fixado) {
+        const aindaLa = todos.some(d => d.kind === 'audioinput' && d.deviceId === fixado);
+        if (!aindaLa) reabrirMicrofone('o microfone que escolheste desapareceu');
+        return;
+      }
+      const agora = todos.find(d => d.kind === 'audioinput' && d.deviceId === 'default');
+      // Só se compara quando há os dois lados. Sem `deviceId` no `getSettings` — e há
+      // motores que não o dão — não se conclui nada, que é melhor do que reabrir à toa.
+      if (emUso && agora && agora.groupId && faixa.getSettings().groupId
+          && agora.groupId !== faixa.getSettings().groupId) {
+        reabrirMicrofone('o dispositivo predefinido mudou');
+      }
+    } catch (e) { /* enumerateDevices pode falhar sem permissões; não se conclui nada */ }
+  });
 }
 
 function pararDeEnviarVoz() {
@@ -2027,19 +2709,61 @@ function vozDe(chave) {
   const ganho = ctx.createGain();
   ganho.connect(ctx.destination);
 
-  v = { ganho, proximo: 0, descodificador: null, ctx };
-  v.descodificador = new AudioDecoder({
-    output: som => tocar(chave, som),
-    error: e => {
-      console.warn('descodificador de voz de', chave, e);
-      vozPartida.set(chave, 'o áudio desta pessoa não está a descodificar');
-      desenharVoz();
-    },
-  });
-  v.descodificador.configure({ codec: 'opus', sampleRate: VOZ_HZ, numberOfChannels: 1 });
+  v = { ganho, comp: null, proximo: 0, descodificador: null, ctx, refeitos: [],
+    corte: contaDosCortes(chave) };
+  v.descodificador = novoDescodificador(chave, v);
   voz.audio.set(chave, v);
   ajustarVolume(chave);
   return v;
+}
+
+/** Quantas vezes se recria um descodificador partido antes de desistir, por minuto. */
+const REFAZER_NO_MINUTO = 3;
+
+/** Um descodificador de voz para uma pessoa — e o que fazer quando ele morre (#37).
+ *
+ *  # A avaria que isto corrige
+ *
+ *  O descodificador era criado UMA vez. No `error:` marcava-se `vozPartida` e mais nada: ele
+ *  ficava em estado de erro, e a partir daí a chegada de voz dessa pessoa era toda deitada
+ *  fora (`if (v.descodificador.state !== 'configured') return;`) — calada e permanentemente.
+ *  Um erro transitório calava uma pessoa **até ao fim da chamada**, e a marca `vozPartida`
+ *  também nunca era limpa por pessoa: só ao entrar noutra sala.
+ *
+ *  Recriar é seguro porque no Opus todos os pedaços se bastam a si próprios — não há estado
+ *  entre eles que se perca. O que se perde é o pedaço que estava a ser descodificado quando
+ *  falhou, e isso já estava perdido.
+ *
+ *  O tecto de três por minuto existe para a causa PERMANENTE — um formato que esta máquina
+ *  não lê — não virar um ciclo a gastar CPU. Quando ele é atingido, a marca fica com a razão
+ *  escrita, que é a informação que a pessoa precisa.
+ */
+function novoDescodificador(chave, v) {
+  const d = new AudioDecoder({
+    output: som => tocar(chave, som),
+    error: e => {
+      console.warn('descodificador de voz de', chave, e);
+      const agora = performance.now();
+      v.refeitos = (v.refeitos || []).filter(t => agora - t < 60000);
+      if (v.refeitos.length >= REFAZER_NO_MINUTO) {
+        vozPartida.set(chave, 'o áudio desta pessoa não descodifica nesta máquina — '
+          + `desisti ao fim de ${REFAZER_NO_MINUTO} tentativas`);
+        desenharVoz();
+        return;
+      }
+      v.refeitos.push(agora);
+      try { if (d.state !== 'closed') d.close(); } catch (err) { /* já */ }
+      // Só se substitui se este AINDA for o descodificador em uso: um `calarPeer` a meio,
+      // ou um segundo erro do mesmo, deixaria dois a escrever no mesmo sítio.
+      if (voz.audio.get(chave) === v && v.descodificador === d) {
+        v.descodificador = novoDescodificador(chave, v);
+        vozPartida.set(chave, 'o áudio desta pessoa falhou e está a ser retomado');
+        desenharVoz();
+      }
+    },
+  });
+  d.configure({ codec: 'opus', sampleRate: VOZ_HZ, numberOfChannels: 1 });
+  return d;
 }
 
 function tocar(chave, som) {
@@ -2056,6 +2780,16 @@ function tocar(chave, som) {
   }
   som.close();
 
+  // VOLTOU A SAIR SOM: a marca conta o PRESENTE e não o passado (#37).
+  //
+  // O `vozPartida` só era limpo ao entrar noutra sala. Depois de um erro transitório, a
+  // etiqueta «sem áudio» ficava colada à pessoa para o resto da chamada, mesmo com a voz
+  // dela a chegar outra vez — a dizer o contrário do que estava a acontecer.
+  if (vozPartida.has(chave)) {
+    vozPartida.delete(chave);
+    desenharVoz();
+  }
+
   // O anel verde de quem fala sai daqui: já se está a olhar para as amostras, não vale a
   // pena montar um analisador em paralelo só para as medir outra vez.
   medirNasAmostras(chave, amostras);
@@ -2067,10 +2801,60 @@ function tocar(chave, som) {
   fonte.connect(v.ganho);
 
   const agora = ctx.currentTime;
+  const c = v.corte;
+  const ms = performance.now();
   // Se ficámos para trás (a app esteve minimizada, a rede engasgou), não se tenta
   // recuperar o atraso a tocar tudo de enfiada: numa conversa ao vivo o que interessa é o
-  // presente. Recomeça-se com a folga normal.
-  if (v.proximo < agora + 0.01 || v.proximo > agora + 0.6) v.proximo = agora + VOZ_FOLGA;
+  // presente. Recomeça-se com a folga em uso.
+  if (v.proximo < agora + 0.01 || v.proximo > agora + 0.6) {
+    // O PRIMEIRO PEDAÇO NÃO É UM CORTE. Com `proximo` a zero esta condição é sempre
+    // verdadeira, e contá-la daria um corte a toda a gente que entra numa sala — um
+    // contador que acusa uma avaria em todas as chamadas é um contador que se aprende a
+    // ignorar, e deixa de servir para a avaria a sério.
+    if (v.proximo > 0) {
+      c.total += 1;
+      // Quanto som se saltou (ou se repetiu): a distância entre onde a reprodução ia e
+      // onde ela recomeça. É a duração do buraco que se ouviu.
+      //
+      // COM UM TECTO POR CORTE, e a razão é honestidade e não defesa. Se a app esteve
+      // minimizada dez minutos, esta distância dá 600 segundos — e o painel escreveria
+      // «600 s saltados», que se lê como uma avaria de áudio catastrófica quando o que
+      // houve foi ninguém estar a ouvir. Dois segundos é mais do que qualquer buraco que
+      // uma conversa ao vivo possa ter e ainda ser uma conversa.
+      c.saltado += Math.min(2, Math.abs(v.proximo - (agora + c.folga)));
+      c.quando.push(ms);
+      const em10s = cortesDesdeHa(c, JANELA_DOS_CORTES).length;
+      // Sobe no máximo um degrau por janela: uma rajada de seis cortes seguidos é UMA
+      // avaria, não seis, e subir seis degraus de uma vez atirava a folga para o tecto por
+      // causa de um engasgo de um segundo.
+      if (em10s >= CORTES_PARA_SUBIR && c.folga < VOZ_FOLGA_TECTO
+          && (c.subiuEm === null || ms - c.subiuEm >= JANELA_DOS_CORTES)) {
+        c.folga = Math.min(VOZ_FOLGA_TECTO, +(c.folga + VOZ_FOLGA_PASSO).toFixed(3));
+        c.subiuEm = ms;
+      }
+      // O relógio do «limpo» recomeça a cada corte: é isso que faz um minuto sem cortes ser
+      // mesmo um minuto sem cortes, e não um minuto desde o primeiro deles.
+      c.limpoDesde = ms;
+    }
+    v.proximo = agora + c.folga;
+  } else if (c.folga > VOZ_FOLGA && c.limpoDesde !== null
+      && ms - c.limpoDesde >= LIMPO_PARA_DESCER) {
+    // A DESCIDA TEM DE SER GARANTIDA, e por isso vive no caminho que corre 50 vezes por
+    // segundo — não num temporizador que se pode nunca ter armado. Um minuto inteiro sem um
+    // único corte devolve um degrau; o atraso que se acrescentou por causa de uma rede má
+    // não fica lá para sempre depois de ela melhorar.
+    c.folga = Math.max(VOZ_FOLGA, +(c.folga - VOZ_FOLGA_PASSO).toFixed(3));
+    c.limpoDesde = ms;
+    // E O ATRASO ENCOLHE MESMO. Sem esta linha, a folga descia no contador e não no
+    // ouvido: o `v.proximo` só era reescrito no ramo do CORTE, portanto os 20 ms que a
+    // adaptação acabou de devolver continuavam agendados até ao corte seguinte — que,
+    // numa rede que melhorou, pode não voltar a acontecer. A conversa ficava com o atraso
+    // de uma rede má e um painel a dizer que já não estava lá.
+    //
+    // Nunca abaixo de `agora + folga`: o que se recupera é a dianteira acumulada, não o
+    // direito a agendar som para um instante que já passou.
+    v.proximo = Math.max(agora + c.folga, v.proximo - VOZ_FOLGA_PASSO);
+  }
   fonte.start(v.proximo);
   v.proximo += buffer.duration;
 }
@@ -2080,15 +2864,110 @@ function calarPeer(chave) {
   if (!v) return;
   try { if (v.descodificador.state !== 'closed') v.descodificador.close(); } catch (e) { /* já */ }
   try { v.ganho.disconnect(); } catch (e) { /* já */ }
+  // O limitador também: um nó que fica ligado ao destino depois de a pessoa sair é um nó
+  // que ninguém volta a alcançar para desligar (#164).
+  if (v.comp) { try { v.comp.disconnect(); } catch (e) { /* já */ } }
   voz.audio.delete(chave);
   voz.falando.delete(chave);
 }
 
-/** O volume de uma pessoa: zero se estivermos surdos ou se ela estiver silenciada. */
+/** Onde vivem os volumes por pessoa (#164). */
+const VOLUMES = 'bruma.volumes';
+
+/** Os volumes, lidos UMA vez e guardados em memória.
+ *
+ *  O `oninput` do deslizador dispara a cada pixel de arrasto. Sem esta cache, cada um desses
+ *  disparos fazia um `JSON.parse`, um `JSON.stringify` e um `setItem` — que é síncrono e vai
+ *  ao disco — dezenas de vezes por segundo, a meio de uma chamada.
+ */
+let volumesEmMemoria = null;
+
+function volumesGuardados() {
+  if (volumesEmMemoria) return volumesEmMemoria;
+  let lido = {};
+  try { lido = JSON.parse(localStorage.getItem(VOLUMES) || '{}') || {}; }
+  catch (e) { lido = {}; }
+  // O que está no disco pode vir de uma mexida à mão, de uma versão futura, ou de um
+  // ficheiro meio escrito. Filtra-se à entrada, e não a cada leitura: um valor de 900 num
+  // `GainNode` não é um volume alto, é um estouro nas colunas de quem ouve.
+  volumesEmMemoria = {};
+  if (lido && typeof lido === 'object' && !Array.isArray(lido)) {
+    for (const [k, v] of Object.entries(lido)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 2 && v !== 1) {
+        volumesEmMemoria[k] = v;
+      }
+    }
+  }
+  return volumesEmMemoria;
+}
+
+/** O volume escolhido para uma pessoa, de 0 a 2. Um é o normal. */
+function volumeDe(chave) {
+  const v = volumesGuardados()[chave];
+  return typeof v === 'number' ? v : 1;
+}
+
+/** Quando é que o disco fica em dia. O som muda JÁ; só a escrita é que espera. */
+let gravarVolumes = null;
+
+function guardarVolume(chave, valor) {
+  const todos = volumesGuardados();
+  // Um volume normal não se guarda: um ficheiro que enche com «1» por cada pessoa que
+  // alguma vez esteve numa sala é ruído que nunca mais sai de lá.
+  if (valor === 1) delete todos[chave]; else todos[chave] = valor;
+  // O ganho aplica-se no mesmo instante — quem arrasta o deslizador quer ouvir o resultado
+  // enquanto arrasta. O que se adia é só o `setItem`.
+  ajustarVolume(chave);
+  if (gravarVolumes) clearTimeout(gravarVolumes);
+  gravarVolumes = setTimeout(() => {
+    gravarVolumes = null;
+    try { localStorage.setItem(VOLUMES, JSON.stringify(volumesEmMemoria || {})); }
+    catch (e) { console.warn('não consegui guardar os volumes:', e); }
+  }, 400);
+}
+
+/** O limitador que impede a amplificação de virar distorção (#164).
+ *
+ *  # Porque é que só se liga acima de 100%
+ *
+ *  Um ganho acima de 1 RECORTA: sem limitador, a «solução» soa pior do que o problema que
+ *  veio resolver. Mas um `DynamicsCompressorNode` custa uns milissegundos de atraso — e numa
+ *  chamada entre os EUA e o Brasil não se acrescenta atraso a toda a gente por causa de uma
+ *  pessoa que subiu o volume de outra. Por isso o caminho normal fica exactamente como
+ *  estava, e o nó só entra quando há mesmo o que limitar.
+ */
+function ligarLimitador(v, precisa) {
+  if (precisa === !!v.comp) return;
+  try { v.ganho.disconnect(); } catch (e) { /* já */ }
+  if (precisa) {
+    const c = v.ctx.createDynamicsCompressor();
+    c.threshold.value = -6;
+    c.knee.value = 12;
+    c.ratio.value = 12;
+    c.attack.value = 0.003;
+    c.release.value = 0.25;
+    v.ganho.connect(c);
+    c.connect(v.ctx.destination);
+    v.comp = c;
+  } else {
+    if (v.comp) { try { v.comp.disconnect(); } catch (e) { /* já */ } }
+    v.comp = null;
+    v.ganho.connect(v.ctx.destination);
+  }
+}
+
+/** O volume de uma pessoa: zero se estivermos surdos ou se ela estiver silenciada.
+ *
+ *  Havia um `GainNode` por pessoa, montado e pronto, a ser usado como INTERRUPTOR: `? 0 : 1`
+ *  (#164). Numa chamada de duas pessoas era precisamente o que faltava — se o amigo tem o
+ *  ganho baixo do lado dele, a única resposta que a app dava era «silencia-o».
+ */
 function ajustarVolume(chave) {
   const v = voz.audio.get(chave);
   if (!v) return;
-  v.ganho.gain.value = (surdo || voz.silenciados.has(chave)) ? 0 : 1;
+  const vol = (surdo || voz.silenciados.has(chave)) ? 0 : volumeDe(chave);
+  v.ganho.gain.value = vol;
+  ligarLimitador(v, vol > 1);
 }
 
 function ajustarTodosOsVolumes() {
@@ -2112,7 +2991,28 @@ function ajustarTodosOsVolumes() {
     // mesmo sem lá estar. A lista de presentes é o que distingue quem está de quem não está.
     if (voz.presentes.get(chave) !== voz.canal) return;
     const v = vozDe(chave);
-    if (v.descodificador.state !== 'configured') return;
+    // O TECTO ERA «TRÊS E ACABOU PARA SEMPRE», e a constante chama-se `REFAZER_NO_MINUTO`.
+    //
+    // Ao atingir o tecto, o `error:` desiste e não recria — e a partir daí não há mais
+    // erros, porque um descodificador morto não produz nenhum. Logo a lista `refeitos`
+    // nunca mais era filtrada e o minuto nunca mais passava: a pessoa ficava calada até ao
+    // fim da chamada, que é exactamente o defeito que o #37 veio corrigir.
+    //
+    // Aqui é o único sítio que continua a correr depois da desistência: cada pedaço que
+    // chega passa por esta linha. Se o minuto passou, tenta-se outra vez.
+    if (v.descodificador.state !== 'configured') {
+      const agora = performance.now();
+      const recentes = (v.refeitos || []).filter(t => agora - t < 60000);
+      if (recentes.length >= REFAZER_NO_MINUTO) return;
+      v.refeitos = recentes;
+      try {
+        if (v.descodificador.state !== 'closed') v.descodificador.close();
+      } catch (e) { /* já */ }
+      v.descodificador = novoDescodificador(chave, v);
+      vozPartida.set(chave, 'o áudio desta pessoa falhou e está a ser retomado');
+      desenharVoz();
+      if (v.descodificador.state !== 'configured') return;
+    }
     try {
       v.descodificador.decode(new EncodedAudioChunk({
         type: 'key',                        // no Opus todos os pedaços se bastam a si
@@ -2495,6 +3395,28 @@ function abrirMenu(x, y, itens) {
   menu.textContent = '';
   for (const it of itens) {
     if (it === '-') { menu.append(document.createElement('hr')); continue; }
+    // O DESLIZADOR DO VOLUME (#164). É o único item do menu que não é um botão, e por
+    // isso não fecha o menu ao ser mexido: quem está a acertar um volume quer ouvir o
+    // resultado enquanto mexe.
+    if (it.tipo === 'volume') {
+      const linha = elemento('div', 'menu__vol');
+      const r = document.createElement('input');
+      r.type = 'range'; r.min = '0'; r.max = '200'; r.step = '5';
+      r.value = String(Math.round(volumeDe(it.chave) * 100));
+      const n = elemento('i', null, `${r.value}%`);
+      r.oninput = () => {
+        n.textContent = `${r.value}%`;
+        guardarVolume(it.chave, Number(r.value) / 100);
+      };
+      linha.append(elemento('b', null, 'Volume'), r, n);
+      // O `click` global que fecha o menu está em fase de CAPTURA e sem filtro de alvo, e o
+      // `mouseup` de um arrasto produz um `click`. Sem isto, o comentário acima — «não fecha
+      // o menu ao ser mexido» — era uma afirmação sobre código que fazia o contrário.
+      linha.addEventListener('click', ev => ev.stopPropagation(), true);
+      linha.addEventListener('mousedown', ev => ev.stopPropagation(), true);
+      menu.append(linha);
+      continue;
+    }
     const b = elemento('button', it.perigo ? 'perigo' : null, it.rotulo);
     b.onclick = () => { menu.hidden = true; it.accao(); };
     menu.append(b);
@@ -2527,6 +3449,10 @@ document.addEventListener('contextmenu', ev => {
   if (membro && membro.dataset.chave) {
     const chave = membro.dataset.chave;
     itens.push({ rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(chave) });
+    // O volume só faz sentido de quem se está a ouvir agora (#164).
+    if (chave !== vista.chave && voz.audio.has(chave)) {
+      itens.push({ tipo: 'volume', chave });
+    }
     // Uma linha, e serve os três sítios que mostram pessoas — a lista de membros, quem está
     // na chamada e as fotinhas — porque todos põem a chave no `data-chave`.
     if (chave !== vista.chave) {
@@ -2681,8 +3607,17 @@ async function desenharDiagnostico() {
     const perda = typeof e.perda === 'number'
       ? ` · ${e.perda.toFixed(1)}% perdidos` : ' · perda por medir';
     const desde = calouSeAgora ? ` · sem som há ${Math.round(e.haQuantoRec / 1000)} s` : '';
+    // OS CORTES, QUE ATÉ AQUI NÃO DEIXAVAM RASTO NENHUM (#65). «recomeçou 14 vezes no
+    // último minuto» é o género de frase que transforma «está mau» em algo com sítio para
+    // procurar — e a folga em uso ao lado diz o que a adaptação escolheu (#104, #117).
+    const c = cortesDaVoz.get(e.peer);
+    const cortes = c && c.total > 0
+      ? ` · som recomeçado ${cortesDesdeHa(c, 60000).length}x no último minuto`
+        + ` (${c.total} nesta chamada,`
+        + ` ${c.saltado.toFixed(1)} s saltados) · folga ${Math.round(c.folga * 1000)} ms`
+      : '';
     const d = elemento('span', (mudoDesdeSempre || calouSeAgora) ? 'diag__mudo' : null,
-      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}`);
+      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}${cortes}`);
     linha.append(d);
     alvo.append(linha);
   }
@@ -2692,6 +3627,24 @@ $('#fechar-rede').onclick = () => fechar('veu-rede');
 async function entrarEmVoz(servidor, canal) {
   vozFalhou = null;
   vozPartida.clear();
+  // O PICO E A SAÍDA SÃO DESTA CHAMADA, e não da sessão (#36, #106).
+  //
+  // Sem isto, quem saísse de uma chamada depois de uns minutos calado voltava a entrar com
+  // o relógio do chão já com mais de 15 segundos da chamada anterior — e a marca «o
+  // teu microfone está aberto mas não capta nada há 15 s» aparecia no PRIMEIRO instante da
+  // chamada nova, antes de se ter medido o que quer que fosse. Uma acusação sobre um passado
+  // que já não é o desta chamada.
+  // O relógio arranca AGORA: os quinze segundos contam-se desde que a chamada abriu, e
+  // não desde um instante de outra chamada.
+  acimaDoChaoEm = performance.now();
+  ultimoPedacoSaiu = 0;
+  // E OS CORTES TAMBÉM (#65, #104). O `cortesDaVoz` sobrevive de propósito ao `calarPeer`,
+  // para uma pessoa que sai e volta a entrar na sala não zerar a contagem a meio da
+  // chamada. Mas sobreviver à CHAMADA é outra coisa: o painel escrevia «N na chamada» sobre
+  // o total desde o arranque da app, e — pior — a `folga` viajava. Uma chamada má subia-a
+  // para 200 ms e a seguinte, com rede boa, arrancava aos 200 e levava seis minutos limpos
+  // a voltar aos 80. É o walkie-talkie contra o qual o próprio tecto foi escrito.
+  cortesDaVoz.clear();
   if (voz.canal === canal) return;
   await sairDeVoz(false);
   voz.servidor = servidor;
@@ -2707,9 +3660,7 @@ async function entrarEmVoz(servidor, canal) {
     // Com limite de tempo: se ninguem responder ao pedido, entra-se sem microfone em vez
     // de ficar pendurado para sempre.
     voz.micro = await Promise.race([
-      navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
-      }),
+      abrirMicrofone(),
       new Promise((_, rej) => setTimeout(() => rej(new Error('sem resposta ao pedido')), 20000)),
     ]);
     if (voz.canal !== canal) {          // saiu enquanto se esperava
@@ -2717,8 +3668,18 @@ async function entrarEmVoz(servidor, canal) {
       voz.micro = null;
       return;
     }
+    // ENTRAR SURDO NÃO PODE DEIXAR O MICROFONE A TRANSMITIR. Este defeito é anterior à
+    // fase 5 — o `$('#btn-surdo').onclick` só põe `t.enabled = false` no instante do
+    // clique, e uma chamada aberta DEPOIS disso trazia uma faixa nova a `true` — mas é a
+    // mesma avaria que a reabertura tinha, e corrigir uma e deixar a outra seria escolher
+    // qual das duas vezes é que o botão mente.
+    const faixaNova = voz.micro.getAudioTracks()[0];
+    if (faixaNova && surdo) faixaNova.enabled = false;
     comecarAEnviarVoz(voz.micro);
     vigiarAudio(voz.eu, voz.micro);
+    // O que o dispositivo diz que está a fazer, mal ele abra (#35, #191): o painel desenhava
+    // o PEDIDO, e um `getUserMedia` pode ignorar metade do que se lhe pediu sem falhar.
+    lerRuidoReal();
     desenharVoz();
   } catch (e) {
     // Sem microfone continua a dar para ouvir e para partilhar ecra.
@@ -2762,6 +3723,23 @@ async function sairDeVoz(anunciar = true) {
   voz.aVer = null;
   voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.qualidadeEmUso = null;
   voz.canal = null;
+  // O CONTEXTO DE SAÍDA FECHA-SE E ESQUECE-SE (#38).
+  //
+  // O vigia do relógio diz «sai da chamada e volta a entrar» quando o `currentTime` pára.
+  // Sem estas três linhas o conselho era falso: o `vozCtx` era criado uma vez e nunca mais
+  // voltava a `null`, portanto voltar a entrar reencontrava o MESMO contexto parado e o
+  // `resume()` do `contextoDeAudio` era o mesmo que o vigia já tinha tentado sem sucesso.
+  // Agora a chamada seguinte constrói um contexto novo, que é o que a frase promete.
+  if (vozCtx) {
+    const velho = vozCtx;
+    vozCtx = null;
+    try { velho.close(); } catch (e) { /* já fechado */ }
+  }
+  saidaFalhou = null;
+  ultimoRelogioDaVoz = -1;
+  voltasParado = 0;
+  // O que o microfone dizia estar a fazer morreu com ele (#191).
+  ruidoReal = null;
   desenharVoz();
   desenharRodape();
 }
@@ -4213,25 +5191,72 @@ async function desenharRodape() {
     // ficava com um botão que não faz nada e não diz porquê.
     $('#btn-camara').title = camaraFalhou
       || (voz.camara ? 'Desligar a câmara' : 'Ligar a câmara');
-    $('#btn-ruido').classList.toggle('is-cortado', !ruidoSuprimido);
-    $('#btn-ruido').title = ruidoSuprimido
-      ? 'Supressão de ruído ligada'
-      : 'Supressão de ruído desligada';
+    // O BOTÃO MOSTRA O QUE O DISPOSITIVO FAZ, não o que se lhe pediu (#35, #191).
+    const ruidoMostrado = ruidoReal === null ? ruidoSuprimido : ruidoReal;
+    $('#btn-ruido').classList.toggle('is-cortado', !ruidoMostrado);
+    $('#btn-ruido').classList.toggle('is-avisado',
+      ruidoReal !== null && ruidoReal !== ruidoSuprimido);
+    $('#btn-ruido').title = ruidoReal !== null && ruidoReal !== ruidoSuprimido
+      ? `Pediste supressão de ruído ${ruidoSuprimido ? 'ligada' : 'desligada'} e o teu `
+        + `microfone está a fazer o contrário — ele não deixa mudar isto.`
+      : (ruidoMostrado ? 'Supressão de ruído ligada' : 'Supressão de ruído desligada');
   }
 
   const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
   $('#btn-mic').classList.toggle('is-cortado', (!!t && !t.enabled) || !!vozFalhou);
+  // MICROFONE ABERTO E A ENTREGAR ZEROS (#106). Não é um alarme — é uma marca discreta e
+  // uma frase no `title`, porque a alternativa legítima («está mesmo calado») existe. O que
+  // a distingue é o CHÃO: quinze segundos sem passar de 0,002 não é uma pessoa calada, é um
+  // microfone que não capta.
+  const mudoDeVerdade = !!t && t.enabled && !!voz.canal
+    && acimaDoChaoEm !== null && performance.now() - acimaDoChaoEm > JANELA_DO_PICO;
+  $('#btn-mic').classList.toggle('is-avisado', mudoDeVerdade && !vozFalhou);
   // A razão da avaria GANHA ao texto normal, como no botão da câmara.
   $('#btn-mic').title = vozFalhou
-    || (!t ? 'Sem microfone' : (t.enabled ? 'Silenciar microfone' : 'Ligar microfone'));
+    || (mudoDeVerdade
+      ? 'O teu microfone está aberto mas não capta nada há 15 s — está silenciado no '
+        + 'Windows, tem o botão físico desligado, ou é o dispositivo errado.'
+      : (!t ? 'Sem microfone' : (t.enabled ? 'Silenciar microfone' : 'Ligar microfone')));
   $('#btn-surdo').classList.toggle('is-cortado', surdo);
-  $('#btn-surdo').title = surdo ? 'Voltar a ouvir' : 'Silenciar tudo';
+  $('#btn-surdo').classList.toggle('is-avisado', !surdo && !!saidaFalhou);
+  $('#btn-surdo').title = saidaFalhou
+    || (surdo ? 'Voltar a ouvir' : 'Silenciar tudo');
 }
 
 /* --- botões ---------------------------------------------------------------- */
 
 let surdo = false;
-let ruidoSuprimido = true;
+
+/** Onde vive o estado da supressão de ruído (#35, #191). */
+const RUIDO = 'bruma.ruido';
+/* Era `let ruidoSuprimido = true` — uma variável de sessão, ao contrário dos avisos, do
+ * movimento reduzido, da detecção de jogo e da qualidade da partilha, que vão todos ao
+ * `localStorage`. Quem a desligava voltava a encontrá-la ligada no arranque seguinte, sem
+ * nada que o explicasse. */
+let ruidoSuprimido = localStorage.getItem(RUIDO) !== '0';
+
+/** O que o DISPOSITIVO diz que está a fazer — que não é o mesmo que o que se lhe pediu.
+ *
+ *  `null` enquanto não houver microfone aberto, ou quando o `getSettings()` não devolver o
+ *  campo. Não se conclui nada de um campo em falta: dizer «não consigo confirmar» é honesto,
+ *  e assumir que obedeceu é exactamente a mentira que o #191 aponta.
+ */
+let ruidoReal = null;
+
+/** Lê do microfone o que ele está MESMO a fazer, e ajusta o que se mostra (#35, #191).
+ *
+ *  O `applyConstraints` pode devolver `Ok` e não mudar nada — e o `getUserMedia` pode
+ *  simplesmente ignorar metade do que se lhe pediu. Até aqui o painel desenhava o PEDIDO.
+ */
+function lerRuidoReal() {
+  const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
+  // Sem microfone não há nada a afirmar. Sem isto, o painel continuava a dizer no PRESENTE
+  // — «o teu microfone está a fazer o contrário» — o que um dispositivo já fechado fazia.
+  if (!t || typeof t.getSettings !== 'function') { ruidoReal = null; return; }
+  let d = null;
+  try { d = t.getSettings(); } catch (e) { d = null; }
+  ruidoReal = d && typeof d.noiseSuppression === 'boolean' ? d.noiseSuppression : null;
+}
 
 $('#btn-mic').onclick = () => {
   const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
@@ -4249,8 +5274,17 @@ $('#btn-surdo').onclick = () => {
   desenharRodape();
 };
 
-$('#btn-ruido').onclick = async () => {
-  ruidoSuprimido = !ruidoSuprimido;
+/** Põe a supressão de ruído num estado CONCRETO.
+ *
+ *  Era um `!ruidoSuprimido` cego, e isso partia-se com o próprio #191: o interruptor do
+ *  painel mostra o que o DISPOSITIVO faz (`ruidoReal`), mas alternava o que se PEDIU
+ *  (`ruidoSuprimido`). Com o dispositivo a ignorar o pedido, os dois divergem — e clicar
+ *  numa caixa que mostra «ligado» pedia... ligado outra vez. O interruptor deixava de
+ *  responder ao que estava a ver.
+ */
+async function porRuido(para) {
+  ruidoSuprimido = !!para;
+  localStorage.setItem(RUIDO, ruidoSuprimido ? '1' : '0');
   const t = voz.micro ? voz.micro.getAudioTracks()[0] : null;
   if (t) {
     try {
@@ -4263,8 +5297,16 @@ $('#btn-ruido').onclick = async () => {
       console.warn('o microfone não aceitou a mudança:', e);
     }
   }
+  // Depois de pedir, PERGUNTA-SE. Um `applyConstraints` que não rejeita não é prova de
+  // que alguma coisa mudou (#35, #191).
+  lerRuidoReal();
   desenharRodape();
-};
+  if (aVerAsDefinicoesDaVoz()) mostrarPainel('voz');
+}
+
+// O botão da barra alterna a partir do que ELE mostra, que é o real quando ele existe.
+$('#btn-ruido').onclick = () =>
+  porRuido(!(ruidoReal === null ? ruidoSuprimido : ruidoReal));
 
 $('#btn-desligar').onclick = () => sairDeVoz();
 $('#btn-partilhar').onclick = () => alternarEcra();
@@ -4375,8 +5417,21 @@ function medirFala() {
     const proprioSilenciado =
       chave === voz.eu && (!voz.micro || !voz.micro.getAudioTracks()[0]?.enabled);
 
+    // O PRÓPRIO PASSOU DO CHÃO? (#106) Só se escreve quando SIM. Escrever também no caso
+    // do «não» — que era o que a versão anterior fazia, ao rodar a janela do pico — punha o
+    // escritor a apagar de dois em dois segundos a prova que o leitor precisava.
+    if (chave === voz.eu && rms >= CHAO_DO_MICRO) acimaDoChaoEm = performance.now();
+
+    // O ANEL DO PRÓPRIO EXIGE AS DUAS COISAS (#36): energia no microfone E um pedaço a
+    // sair. Quando há energia e não sai nada é isso mesmo que se quer mostrar — o anel
+    // apagado, e a razão no botão do microfone. Só se aplica a mim: dos outros, o que
+    // chega é a prova de que saiu.
+    const naoSai = chave === voz.eu
+      && performance.now() - ultimoPedacoSaiu > SAIDA_RECENTE_MS;
+
     const estava = voz.falando.has(chave);
-    const agora = proprioSilenciado ? false : (estava ? rms > LIMIAR_SAI : rms > LIMIAR_ENTRA);
+    const agora = (proprioSilenciado || naoSai)
+      ? false : (estava ? rms > LIMIAR_SAI : rms > LIMIAR_ENTRA);
     if (agora === estava) continue;
 
     if (agora) voz.falando.add(chave); else voz.falando.delete(chave);
@@ -5144,6 +6199,15 @@ function pararDeAssistir() {
         + ` perda=${typeof e.perda === 'number' ? e.perda.toFixed(1) + '%' : 'por medir'}`
         + ` ele-diz-ter-mandado=${e.disseTerEnviado}`
         + ` ultimo-rec=${typeof e.haQuantoRec === 'number' ? e.haQuantoRec + 'ms' : 'nunca'}`
+        // O ESPACO LIVRE NA FILA (#173). E o unico numero que diz se os 16 KiB sao
+        // apertados: se ele nunca desce perto de zero, a fila nunca esteve perto de encher.
+        + ` fila-livre=${typeof e.filaLivre === 'number' ? e.filaLivre + 'B' : '?'}`
+        // Os cortes tambem saem no --par (#65): sem isto, a unica forma de saber que a voz
+        // picou era alguem estar a ouvi-la no momento.
+        + (() => {
+          const c = cortesDaVoz.get(e.peer);
+          return c ? ` cortes=${c.total} folga=${Math.round(c.folga * 1000)}ms` : ' cortes=0';
+        })()
       ).join(' | ');
       const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
       // O que interessa na câmara é o mesmo que interessa no ecrã: não "chegaram bytes",
@@ -6076,4 +7140,429 @@ function pararDeAssistir() {
     diz('ui seletor: NAO ABRIU');
   }
   fechar('veu-fontes');
+
+  // ---- O MICROFONE HONESTO (#35, #105, #106, #164, #191) ----
+  //
+  // Tudo isto vive em caminhos que o par legitimo nao exercita: no par nada falha, nada
+  // desaparece e ninguem mexe num volume. Mede-se aqui, contra as funcoes a serio.
+  // TUDO O QUE ESTE BLOCO SUJA, CAPTURADO ANTES DE O SUJAR.
+  //
+  // A reposicao era inline e o unico `catch` nao repunha nada: bastava o
+  // `await desenharRodape()` rejeitar -- e ele espera pelo Rust a meio -- para a app ficar
+  // com `voz.canal = 'medicao'` (um canal que nao existe) e `voz.micro` a ser um objecto
+  // sem `getTracks()`, que faz o `sairDeVoz` rebentar. Uma medicao que estraga a app que
+  // esta a medir e pior do que nao medir.
+  const antes = {
+    ruido: ruidoSuprimido,
+    ruidoNoDisco: localStorage.getItem(RUIDO),
+    microNoDisco: localStorage.getItem(MICROFONE),
+    volumesNoDisco: localStorage.getItem(VOLUMES),
+    recuado: microfoneRecuado,
+    micro: voz.micro,
+    canal: voz.canal,
+    acimaDoChao: acimaDoChaoEm,
+    eu: voz.eu,
+    teste: testeDoMicro,
+  };
+  try {
+    // #35/#191: persiste, e o pedido honra o que ficou guardado.
+    // `guardado-e-lido` era uma tautologia: lia `typeof pedido.audio === 'object'`, que e
+    // verdade sempre. O que interessa e se o valor DO DISCO chega a variavel -- e isso e
+    // uma linha que so corre no arranque, portanto testa-se a expressao dela.
+    const ruidoAntes = ruidoSuprimido;
+    localStorage.setItem(RUIDO, '0');
+    const leDoDiscoDesligado = localStorage.getItem(RUIDO) !== '0';
+    localStorage.setItem(RUIDO, '1');
+    const leDoDiscoLigado = localStorage.getItem(RUIDO) !== '0';
+    localStorage.removeItem(RUIDO);
+    const semDiscoFicaLigado = localStorage.getItem(RUIDO) !== '0';
+    ruidoSuprimido = false;
+    const semRuido = pedidoDeMicrofone('');
+    ruidoSuprimido = true;
+    const comRuido = pedidoDeMicrofone('');
+    localStorage.setItem(RUIDO, ruidoAntes ? '1' : '0');
+    ruidoSuprimido = ruidoAntes;
+
+    // #105: o deviceId entra como `exact`, e so quando ha um escolhido.
+    const comId = pedidoDeMicrofone('xpto-123');
+    const semId = pedidoDeMicrofone('');
+
+    diz(`ui microfone pedido: disco-0-da-desligado=${leDoDiscoDesligado === false}`
+      + ` disco-1-da-ligado=${leDoDiscoLigado === true}`
+      + ` sem-disco-fica-ligado=${semDiscoFicaLigado === true}`
+      + ` desligado-pede-false=${semRuido.audio.noiseSuppression === false}`
+      + ` ligado-pede-true=${comRuido.audio.noiseSuppression === true}`
+      + ` ganho-automatico-no-pedido=${'autoGainControl' in comRuido.audio}`
+      + ` id-exacto=${comId.audio.deviceId && comId.audio.deviceId.exact === 'xpto-123'}`
+      + ` sem-escolha-sem-id=${!('deviceId' in semId.audio)}`);
+
+    // #105: o RECUO. Um dispositivo que ja nao existe nao pode trocar «o microfone errado»
+    // por «microfone nenhum» -- e e isso que o `exact` faz sozinho.
+    const escolhaAntes = localStorage.getItem(MICROFONE) || '';
+    localStorage.setItem(MICROFONE, 'este-dispositivo-nao-existe');
+    microfoneRecuado = null;
+    let recuou = 'sem-microfone-nesta-maquina';
+    try {
+      const m = await abrirMicrofone();
+      recuou = `${microfoneRecuado === 'este-dispositivo-nao-existe'}`
+        + ` faixas=${m.getAudioTracks().length}`;
+      m.getTracks().forEach(t => t.stop());
+    } catch (e) {
+      recuou = `nao-abriu(${e && e.name ? e.name : e})`;
+    }
+    localStorage.setItem(MICROFONE, escolhaAntes);
+    diz(`ui microfone recuo: ${recuou}`);
+
+    // #164: o volume por pessoa, e o limitador que so entra acima de 100%.
+    const CHV = 'medicao-do-volume';
+    const v = vozDe(CHV);
+    guardarVolume(CHV, 0.5);
+    const meio = { ganho: v.ganho.gain.value, comp: !!v.comp };
+    guardarVolume(CHV, 2);
+    const dobro = { ganho: v.ganho.gain.value, comp: !!v.comp };
+    guardarVolume(CHV, 1);
+    const normal = { ganho: v.ganho.gain.value, comp: !!v.comp };
+    const guardouOnormal = CHV in volumesGuardados();
+    // E um valor estragado no disco -- de uma mexida a mao ou de uma versao futura -- nao
+    // pode chegar ao `GainNode`: 900 num ganho nao e um volume alto, e um estouro.
+    const volAntes = localStorage.getItem(VOLUMES);
+    localStorage.setItem(VOLUMES, '{"a":900,"b":"alto","c":-3,"d":1.5}');
+    volumesEmMemoria = null;
+    const filtrados = [volumeDe('a'), volumeDe('b'), volumeDe('c'), volumeDe('d')];
+    localStorage.setItem(VOLUMES, '{ isto nao e json');
+    volumesEmMemoria = null;
+    const comLixo = volumeDe('a');
+    if (volAntes === null) localStorage.removeItem(VOLUMES);
+    else localStorage.setItem(VOLUMES, volAntes);
+    volumesEmMemoria = null;
+    // E o silenciar continua a ganhar ao volume: quem esta calado fica calado.
+    voz.silenciados.add(CHV);
+    guardarVolume(CHV, 2);
+    const silenciado = v.ganho.gain.value;
+    voz.silenciados.delete(CHV);
+    guardarVolume(CHV, 1);
+    calarPeer(CHV);
+    cortesDaVoz.delete(CHV);
+    diz(`ui volume: metade=${meio.ganho} sem-limitador=${!meio.comp}`
+      + ` dobro=${dobro.ganho} com-limitador=${dobro.comp}`
+      + ` normal=${normal.ganho} limitador-saiu=${!normal.comp}`
+      + ` normal-nao-se-guarda=${!guardouOnormal}`
+      + ` disco-estragado-filtrado=${JSON.stringify(filtrados)}`
+      + ` json-partido-nao-rebenta=${comLixo === 1}`
+      + ` silenciado-ganha=${silenciado === 0}`);
+
+    // #106: a marca do microfone que nao capta -- MEDIDA PELO CAMINHO QUE A PRODUZ.
+    //
+    // A versao anterior desta medicao punha o relogio a mao e chamava o `desenharRodape`.
+    // Media a CONDICAO e nao o caminho -- e por isso passava a verde por cima de um defeito
+    // grave: o escritor em `medirFala` repunha o relogio com a MESMA janela que o leitor
+    // testava, oito vezes por segundo, e a marca so podia acender durante ~120 ms em cada
+    // 15 s. Um microfone morto dava um aviso a piscar, e a medicao dizia que estava bem.
+    //
+    // Agora passa-se pelo `medirFala` a serio, com analisadores a serio: um em silencio
+    // (nada ligado -- da zeros) e um com um oscilador (da energia a valer). O que se exige
+    // e a propriedade que faltava: COM SILENCIO, O ESCRITOR NAO PODE MEXER NO RELOGIO.
+    const micAntes = voz.micro;
+    const canalAntes = voz.canal;
+    const euAntes = voz.eu;
+    const analisadorAntes = voz.analisadores.get(voz.eu);
+    const ctxM = contextoDeAudio();
+    const mudo = ctxM.createAnalyser();
+    mudo.fftSize = 512;
+    const alto = ctxM.createAnalyser();
+    alto.fftSize = 512;
+    const osc = ctxM.createOscillator();
+    osc.connect(alto);          // so ao analisador: nao vai as colunas
+    osc.start();
+    voz.micro = { getAudioTracks: () => [{ enabled: true }] };
+    voz.canal = canalAntes || 'medicao';
+    voz.eu = euAntes || 'medicao-de-mim';
+    voz.analisadores.set(voz.eu, { an: mudo, fonte: null, dados: new Float32Array(512) });
+    acimaDoChaoEm = performance.now() - (JANELA_DO_PICO + 1000);
+    const relogioAntes = acimaDoChaoEm;
+    // Oito voltas de `medirFala` com silencio -- as mesmas que davam num segundo real.
+    for (let i = 0; i < 8; i += 1) medirFala();
+    const relogioIntacto = acimaDoChaoEm === relogioAntes;
+    // O `desenharRodape` e ASSINCRONO -- ele espera pelo `qualidadeDaLigacao`, que vai ao
+    // Rust, antes de chegar ao botao do microfone. Sem este `await` lia-se o botao antes de
+    // ele ter sido tocado.
+    await desenharRodape();
+    const marcou = $('#btn-mic').classList.contains('is-avisado');
+    const disse = ($('#btn-mic').title || '').includes('não capta nada');
+    // E o contra-exemplo, tambem pelo caminho a serio: com energia, o escritor mexe no
+    // relogio e a marca sai.
+    voz.analisadores.set(voz.eu, { an: alto, fonte: null, dados: new Float32Array(512) });
+    await new Promise(r => setTimeout(r, 60));   // o oscilador tem de encher o analisador
+    medirFala();
+    const relogioAndou = acimaDoChaoEm > relogioAntes;
+    await desenharRodape();
+    const semMarca = !$('#btn-mic').classList.contains('is-avisado');
+    try { osc.stop(); osc.disconnect(); } catch (e) { /* ja */ }
+    try { mudo.disconnect(); alto.disconnect(); } catch (e) { /* ja */ }
+    voz.falando.delete(voz.eu);
+    if (analisadorAntes) voz.analisadores.set(euAntes, analisadorAntes);
+    else voz.analisadores.delete(voz.eu);
+    voz.micro = micAntes;
+    voz.canal = canalAntes;
+    voz.eu = euAntes;
+    await desenharRodape();
+    diz(`ui microfone mudo: silencio-nao-mexe-no-relogio=${relogioIntacto}`
+      + ` marcou=${marcou} disse-porque=${disse}`
+      + ` som-mexe-no-relogio=${relogioAndou} com-som-nao-marca=${semMarca}`);
+
+    // #2 DA REVISAO: o guarda das definicoes. Era
+    // `$('#defs').classList.contains('is-on')` -- uma classe que NINGUEM poe -- portanto
+    // sempre falso, e o `finally` do teste do microfone nunca redesenhava: todos os
+    // caminhos de falha ficavam com «A gravar 3 segundos...» para sempre.
+    const defsAntes = $('#defs').hidden;
+    const painelAntes = painelActivo;
+    $('#defs').hidden = true;
+    const fechadoDizNao = aVerAsDefinicoesDaVoz();
+    $('#defs').hidden = false;
+    painelActivo = 'voz';
+    const abertoNaVozDizSim = aVerAsDefinicoesDaVoz();
+    painelActivo = 'conta';
+    const noutroPainelDizNao = aVerAsDefinicoesDaVoz();
+    $('#defs').hidden = defsAntes;
+    painelActivo = painelAntes;
+    diz(`ui definicoes da voz: fechado=${fechadoDizNao} aberto-na-voz=${abertoNaVozDizSim}`
+      + ` noutro-painel=${noutroPainelDizNao}`);
+
+    // #1 DA REVISAO, e era o pior: TROCAR DE MICROFONE dizia que o microfone tinha morrido.
+    //
+    // O laco de envio lia a variavel de MODULO `envio`, e o `comecarAEnviarVoz` novo corre
+    // `pararDeEnviarVoz()` e chega a `envio = E2` sem um unico `await` pelo meio. Quando a
+    // continuacao do laco antigo acordava, `envio` ja era o E2 com `vivo === true`, e ele
+    // escrevia «o teu microfone deixou de entregar som» por cima do `vozFalhou = null` que
+    // a reabertura acabara de limpar.
+    //
+    // Isto reproduz a troca com dois microfones a serio. O par legitimo nunca troca de
+    // microfone, portanto nada disto era exercitado em lado nenhum.
+    let m1 = null, m2 = null;
+    let trocaLimpa = 'sem-microfone';
+    try {
+      m1 = await abrirMicrofone();
+      m2 = await abrirMicrofone();
+      vozFalhou = null;
+      comecarAEnviarVoz(m1);
+      const arrancou = !!envio;
+      comecarAEnviarVoz(m2);
+      // O `read()` do laco antigo so rejeita na volta seguinte do event loop.
+      await new Promise(r => setTimeout(r, 400));
+      trocaLimpa = `arrancou=${arrancou} sem-queixa=${vozFalhou === null}`
+        + ` queixa="${(vozFalhou || '').slice(0, 40)}"`;
+    } catch (e) {
+      trocaLimpa = `nao-deu(${e && e.name ? e.name : e})`;
+    } finally {
+      pararDeEnviarVoz();
+      if (m1) m1.getTracks().forEach(t => t.stop());
+      if (m2) m2.getTracks().forEach(t => t.stop());
+      vozFalhou = null;
+    }
+    diz(`ui trocar de microfone: ${trocaLimpa}`);
+
+    // O ACHADO A, e era o pior de todos: SILENCIADO ANTES, SILENCIADO DEPOIS.
+    //
+    // O «silenciado» so vive no `faixa.enabled`, e as faixas de um `getUserMedia` novo
+    // nascem sempre a `true`. Silenciava-me para tossir, ligava os auscultadores, e voltava
+    // a transmitir sem o saber. Isto corre o `reabrirMicrofone` A SERIO -- e o par legitimo
+    // nunca silencia nem troca de microfone, portanto nada disto era exercitado.
+    const surdoAntes = surdo;
+    const microAntes2 = voz.micro;
+    const canalAntes2 = voz.canal;
+    let calado = 'sem-microfone';
+    try {
+      voz.canal = canalAntes2 || 'medicao';
+      voz.micro = await abrirMicrofone();
+      voz.micro.getAudioTracks()[0].enabled = false;   // silenciei-me
+      ultimaReabertura = 0;
+      await reabrirMicrofone('medicao do silenciado', true);
+      const depoisDeSilenciado = voz.micro.getAudioTracks()[0].enabled;
+      // E o surdo: ficar a falar para uma chamada que nao se esta a ouvir e exactamente o
+      // que o botao de silenciar tudo existe para impedir.
+      voz.micro.getAudioTracks()[0].enabled = true;
+      surdo = true;
+      ultimaReabertura = 0;
+      await reabrirMicrofone('medicao do surdo', true);
+      const depoisDeSurdo = voz.micro.getAudioTracks()[0].enabled;
+      surdo = false;
+      // E o contra-exemplo: quem NAO estava silenciado continua a transmitir.
+      voz.micro.getAudioTracks()[0].enabled = true;
+      ultimaReabertura = 0;
+      await reabrirMicrofone('medicao do normal', true);
+      const depoisDeNormal = voz.micro.getAudioTracks()[0].enabled;
+      calado = `silenciado-continua=${depoisDeSilenciado === false}`
+        + ` surdo-nao-transmite=${depoisDeSurdo === false}`
+        + ` normal-continua=${depoisDeNormal === true}`;
+    } catch (e) {
+      calado = `nao-deu(${e && e.name ? e.name : e})`;
+    } finally {
+      pararDeEnviarVoz();
+      if (voz.micro && voz.micro !== microAntes2) {
+        voz.micro.getTracks().forEach(t => t.stop());
+      }
+      pararDeVigiar(voz.eu);
+      surdo = surdoAntes;
+      voz.micro = microAntes2;
+      voz.canal = canalAntes2;
+      vozFalhou = null;
+    }
+    diz(`ui microfone silenciado: ${calado}`);
+
+    // #107: o TESTE a serio, do principio ao fim. Grava 3 s, passa-os pelo Opus e toca-os
+    // -- o mesmo circuito que o `--autoteste` ja tinha e que ninguem conseguia alcancar.
+    // O que se exige daqui nao e «passou»: e que diga QUAL das tres metades falhou, porque
+    // «o microfone nao funciona» sem dizer qual e o mesmo que nao dizer nada.
+    // Primeiro a RECUSA: com uma chamada aberta o teste tem de se recusar a correr, senao a
+    // gravacao sai pelas colunas e entra pelo microfone DA CHAMADA.
+    const canalDoTeste = voz.canal;
+    voz.canal = 'medicao';
+    testeDoMicro = null;
+    await testarMicrofone();
+    const recusou = !!testeDoMicro && testeDoMicro.estado === 'mau'
+      && testeDoMicro.texto.includes('Sai da chamada');
+    voz.canal = canalDoTeste;
+    testeDoMicro = null;
+
+    // A REENTRANCIA, medida a serio. Antes lia-se `!jaCorria && !testeACorrer` com os dois
+    // a serem lidos quando nada estava a correr -- `true` em qualquer universo, mesmo com a
+    // guarda apagada. Agora chamam-se DUAS ao mesmo tempo e le-se o que a segunda devolve:
+    // `false` e a guarda a dizer que recusou.
+    const primeira = testarMicrofone();
+    const durante = testeACorrer;
+    const segunda = await testarMicrofone();
+    const correu = await primeira;
+    const r = testeDoMicro || {};
+    const nomeia = typeof r.texto === 'string' && (
+      r.texto.startsWith('O teu microfone') || r.texto.startsWith('O dispositivo')
+      || r.texto.startsWith('O codec desta máquina') || r.texto.startsWith('Captou'));
+    diz(`ui teste do microfone: recusa-com-chamada=${recusou}`
+      + ` estado=${r.estado} nomeia-a-metade=${nomeia}`
+      + ` marcou-a-correr=${durante} segunda-recusou=${segunda === false}`
+      + ` primeira-correu=${correu === true}`
+      + ` texto="${(r.texto || '').slice(0, 60)}"`);
+  } catch (e) {
+    diz(`ui microfone: REBENTOU ${e && e.message ? e.message : e}`);
+  } finally {
+    ruidoSuprimido = antes.ruido;
+    if (antes.ruidoNoDisco === null) localStorage.removeItem(RUIDO);
+    else localStorage.setItem(RUIDO, antes.ruidoNoDisco);
+    if (antes.microNoDisco === null) localStorage.removeItem(MICROFONE);
+    else localStorage.setItem(MICROFONE, antes.microNoDisco);
+    if (antes.volumesNoDisco === null) localStorage.removeItem(VOLUMES);
+    else localStorage.setItem(VOLUMES, antes.volumesNoDisco);
+    volumesEmMemoria = null;
+    microfoneRecuado = antes.recuado;
+    voz.micro = antes.micro;
+    voz.canal = antes.canal;
+    acimaDoChaoEm = antes.acimaDoChao;
+    voz.eu = antes.eu;
+    testeDoMicro = antes.teste;
+    voz.silenciados.delete('medicao-do-volume');
+    calarPeer('medicao-do-volume');
+    cortesDaVoz.delete('medicao-do-volume');
+    await desenharRodape().catch(() => {});
+  }
+
+  // ---- A FOLGA ADAPTATIVA, MEDIDA NO CODIGO A SERIO (#65, #104, #117) ----
+  //
+  // Isto chama o `tocar()` DE PRODUCAO, com `AudioData` a serio, e le o mesmo
+  // `cortesDaVoz` que o painel le. Nao ha copia da logica aqui: uma copia provaria que a
+  // copia funciona. Nao ha rede nenhuma envolvida -- o par legitimo nunca corta, e por
+  // isso nao exercita nada disto.
+  try {
+    const CH = 'medicao-da-folga';
+    const amostra = () => new AudioData({
+      format: 'f32-planar', sampleRate: VOZ_HZ, numberOfFrames: 960,
+      numberOfChannels: 1, timestamp: 0, data: new Float32Array(960),
+    });
+    const v = vozDe(CH);
+    const c = v.corte;
+    const ctx = v.ctx;
+
+    // 1. O PRIMEIRO PEDACO NAO E UM CORTE. Com `proximo` a zero a condicao e sempre
+    //    verdadeira, e conta-la dava um corte a toda a gente que entra numa sala.
+    v.proximo = 0;
+    tocar(CH, amostra());
+    const primeiro = c.total;
+
+    // 2. Dois cortes na mesma janela sobem UM degrau.
+    for (let i = 0; i < 2; i += 1) {
+      v.proximo = 0.001;  // atras do relogio: e um corte
+      tocar(CH, amostra());
+    }
+    const depoisDeDois = { total: c.total, folga: c.folga };
+
+    // 3. Um terceiro corte logo a seguir NAO sobe outra vez: uma rajada e UMA avaria.
+    v.proximo = 0.001;
+    tocar(CH, amostra());
+    const depoisDeTres = { total: c.total, folga: c.folga };
+
+    // 4. A DESCIDA. Finge-se um minuto inteiro limpo e toca-se dentro da janela boa.
+    //    O 0.3 e o MEIO da janela [+0.01, +0.6] de proposito: com +0.1, o relogio do
+    //    contexto avancava o suficiente entre esta linha e a leitura la dentro para o
+    //    valor cair fora, e o `tocar` seguia pelo ramo do CORTE -- a medicao dizia «nao
+    //    desceu» sobre uma descida que nunca foi pedida.
+    c.limpoDesde = performance.now() - (LIMPO_PARA_DESCER + 1000);
+    const antesDoRelogio = ctx.currentTime;
+    v.proximo = antesDoRelogio + 0.3;
+    tocar(CH, amostra());
+    const depoisDeDescer = c.folga;
+    const cortesNaDescida = c.total;
+
+    // 5. E a descida PARA no chao: um segundo minuto limpo nao a leva abaixo dos 80 ms.
+    c.limpoDesde = performance.now() - (LIMPO_PARA_DESCER + 1000);
+    v.proximo = ctx.currentTime + 0.3;
+    tocar(CH, amostra());
+    const noChao = c.folga;
+
+    // 6. E o tecto: mesmo com cortes a mais, nunca passa dos 200 ms.
+    for (let i = 0; i < 40; i += 1) {
+      c.subiuEm = 0;
+      c.quando = [performance.now(), performance.now()];
+      v.proximo = 0.001;
+      tocar(CH, amostra());
+    }
+    const noTecto = c.folga;
+
+    // 7. OS LIMITES, e nao so as guardas que os precedem.
+    //
+    //    Com os valores de hoje (80 ms + passos de 20 ms ate 200) a folga cai SEMPRE em
+    //    cima do tecto e do chao, portanto as guardas `folga < TECTO` e `folga > FOLGA`
+    //    ja param tudo e os `Math.min`/`Math.max` nunca chegam a morder. Isso descobriu-se
+    //    a sabotar: tirar qualquer um dos dois nao mudava um unico numero medido.
+    //
+    //    Um limite que nunca se exercita e um limite sobre o qual nao se sabe nada -- e
+    //    basta mudar o passo para 30 ms para ele passar a ser o unico a segurar. Por isso
+    //    poe-se a folga onde UM PASSO a atira para fora: 190 ms sobe para 210 (fica 200),
+    //    90 ms desce para 70 (fica 80).
+    c.folga = 0.19;
+    c.subiuEm = 0;
+    c.quando = [performance.now(), performance.now()];
+    v.proximo = 0.001;
+    tocar(CH, amostra());
+    const tectoAserio = c.folga;
+
+    c.folga = 0.09;
+    c.limpoDesde = performance.now() - (LIMPO_PARA_DESCER + 1000);
+    v.proximo = ctx.currentTime + 0.3;
+    tocar(CH, amostra());
+    const chaoAserio = c.folga;
+
+    diz(`ui folga: primeiro-nao-conta=${primeiro === 0}`
+      + ` dois-cortes=${depoisDeDois.total} subiu-para=${Math.round(depoisDeDois.folga * 1000)}ms`
+      + ` terceiro-nao-sobe=${depoisDeTres.folga === depoisDeDois.folga}`
+      + ` desceu-para=${Math.round(depoisDeDescer * 1000)}ms`
+      + ` descida-sem-corte=${cortesNaDescida === depoisDeTres.total}`
+      + ` chao=${Math.round(noChao * 1000)}ms`
+      + ` tecto-por-cima=${Math.round(tectoAserio * 1000)}ms`
+      + ` chao-por-baixo=${Math.round(chaoAserio * 1000)}ms`
+      + ` tecto=${Math.round(noTecto * 1000)}ms`
+      + ` saltado=${c.saltado.toFixed(2)}s`);
+
+    calarPeer(CH);
+    cortesDaVoz.delete(CH);
+  } catch (e) {
+    diz(`ui folga: REBENTOU ${e && e.message ? e.message : e}`);
+  }
 })();

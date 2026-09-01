@@ -1476,6 +1476,10 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 "envS": n.env_s, "recS": n.rec_s,
                 "haQuantoRec": ha_quanto,
                 "vozFalhados": n.voz_falhados,
+                // ESPAÇO LIVRE NA FILA DE DATAGRAMAS (#173). É o que permite saber se os
+                // 16 KiB são apertados ou folgados sem adivinhar: se isto nunca se aproximar
+                // de zero, a fila nunca esteve perto de encher e há margem para a reduzir.
+                "filaLivre": c.datagram_send_buffer_space(),
                 // A PERDA (#124): `null` enquanto o outro lado não tiver dito quantos
                 // mandou. Ausência de medida não é zero por cento — é a mesma distinção do
                 // RTT, e a mesma tentação de a pintar de bom resultado.

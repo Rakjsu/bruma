@@ -1282,6 +1282,29 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .ico2.is-on { background: var(--mist-lo); color: var(--mist); }
 
 .ico.is-cortado { color: var(--rose); }
+/* O âmbar do aviso: nem tudo o que está mal está CORTADO. Um microfone que não capta, ou
+   uma supressão de ruído que o dispositivo recusou mudar, são avisos — pintá-los de
+   vermelho dizia «desligado», que é outra coisa. */
+.ico.is-avisado { color: var(--amber); }
+
+/* A escolha de microfone, o botão do teste e o deslizador do volume (#105, #107, #164).
+   Herdam a linha das definições que já existia; o que é novo é só o controlo à direita. */
+.def__escolha {
+  background: var(--raise-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px;
+  max-width: 260px; flex: 0 1 auto;
+}
+.def__bt {
+  margin-top: 10px; background: var(--mist); color: #0b0e12; border: 0;
+  border-radius: 6px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer;
+}
+.def__bt:disabled { opacity: .55; cursor: default; }
+.menu__vol {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px; white-space: nowrap;
+}
+.menu__vol b { font-weight: 600; font-size: 13px; }
+.menu__vol i { font-style: normal; opacity: .7; font-size: 12px; min-width: 34px; text-align: right; }
+.menu__vol input { flex: 1 1 auto; min-width: 110px; accent-color: var(--mist); }
 
 /* --- chamada: quem fala, quem transmite ------------------------------------ */
 
