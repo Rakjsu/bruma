@@ -80,8 +80,14 @@ pub struct Estado {
 }
 
 impl Estado {
+    /// Há uma partilha VIVA — e não só um sinal guardado.
+    ///
+    /// Era `parar.is_some()`. Com a queixa a pôr o sinal a `true` (#40), uma partilha que
+    /// morreu sozinha continuava a responder «já estás a partilhar» a quem tentasse outra,
+    /// até a interface fazer a limpeza de volta. O sinal posto É a partilha a acabar; olha-se
+    /// ao valor e não à existência.
     pub fn a_partilhar(&self) -> bool {
-        self.parar.is_some()
+        matches!(&self.parar, Some(p) if !p.load(Ordering::Relaxed))
     }
 }
 
@@ -126,6 +132,10 @@ mod win {
         alt: u32,
         /// Tela persistente para onde se copiam frames de tamanho diferente do inicial.
         tela: Vec<u8>,
+        /// As dimensões do último frame que passou pela tela (#167). Quando mudam, a tela
+        /// limpa-se: sem isto, uma janela que encolhe deixava na margem uma orla do
+        /// conteúdo antigo, porque só se copiava por cima do que cabia.
+        tela_de: (u32, u32),
         /// Medição: entregues pelo Windows, enviados ao codificador, e largados por o
         /// codificador estar atrasado.
         recebidos: u64,
@@ -153,6 +163,27 @@ mod win {
         fps: u32,
     }
 
+    impl Sessao {
+        /// O veredicto da captura, para o registo. Chamado pelo vigia depois do `stop()`,
+        /// com a thread da captura já junta — é o único sítio de onde se consegue olhar
+        /// para a `Sessao` tenha ela acabado bem ou mal.
+        fn resumo(&self) -> String {
+            let s = self.inicio.elapsed().as_secs_f64().max(0.001);
+            format!(
+                "[ecrã] {:.1}s: {} entregues ({:.1}/s), {} enviados, {} largados, pedido \
+                 {} ips | intervalos: maior {} ms, {} acima de 400 ms",
+                s,
+                self.recebidos,
+                self.recebidos as f64 / s,
+                self.enviados,
+                self.largados,
+                self.fps,
+                self.maior_intervalo,
+                self.longos
+            )
+        }
+    }
+
     impl GraphicsCaptureApiHandler for Sessao {
         type Flags = Flags;
         type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -174,6 +205,7 @@ mod win {
                 lar,
                 alt,
                 tela: Vec::new(),
+                tela_de: (0, 0),
                 recebidos: 0,
                 enviados: 0,
                 largados: 0,
@@ -194,25 +226,24 @@ mod win {
             // e a paragem passa a depender SÓ do vigia. É a única forma de correr aqui o
             // caminho que, lá fora, acontece com uma janela minimizada.
             if self.parar.load(Ordering::Relaxed) && !crate::bandeiras::so_vigia() {
-                // O veredicto da CAPTURA. O relógio da média fica do lado do codificador,
-                // que o imprime quando fecha — aqui já não se lhe pode perguntar nada.
-                let s = self.inicio.elapsed().as_secs_f64().max(0.001);
-                eprintln!(
-                    "[ecrã] {:.1}s: {} entregues ({:.1}/s), {} enviados, {} largados, \
-                     pedido {} ips",
-                    s,
-                    self.recebidos,
-                    self.recebidos as f64 / s,
-                    self.enviados,
-                    self.largados,
-                    self.fps,
-                );
-                eprintln!(
-                    "[ecrã] intervalos: maior {} ms, {} acima de 400 ms",
-                    self.maior_intervalo, self.longos
-                );
+                // O veredicto da CAPTURA imprime-se no VIGIA, depois do `stop()`, e não
+                // aqui. Aqui só corre quando o Windows entrega um frame — e uma captura
+                // que morreu sozinha, ou um ecrã parado com `BRUMA_SO_VIGIA`, nunca mais
+                // entrega nenhum. Os números da sessão que mais interessam eram
+                // precisamente os da sessão que acabou mal, e esses nunca saíam.
                 controlo.stop();
                 return Ok(());
+            }
+            // `BRUMA_ITEM_FECHA_AOS=N` finge que o item se fechou ao fim de N segundos:
+            // devolve-se `Err` daqui, que o crate trata exactamente como o `Err` do
+            // `on_closed` — guarda-o e devolve-o no `stop()`. Não é o evento `Closed` a
+            // sério (esse só o Windows o dispara), mas é o mesmo caminho de saída.
+            if let Some(aos) = crate::bandeiras::item_fecha_aos() {
+                if self.inicio.elapsed().as_secs() >= aos {
+                    return Err("a janela ou o ecrã que estavas a partilhar desapareceu \
+                                (BRUMA_ITEM_FECHA_AOS)"
+                        .into());
+                }
             }
             self.recebidos += 1;
             {
@@ -239,17 +270,13 @@ mod win {
                     // para uma tela do tamanho original: encolher deixa margem preta,
                     // crescer corta. Imperfeito e assumido — a alternativa era a
                     // transmissão MORRER ao primeiro redimensionar, que é pior.
-                    let destino = (self.lar * self.alt * 4) as usize;
-                    if self.tela.len() != destino {
-                        self.tela = vec![0u8; destino];
-                    }
-                    let linhas = f_alt.min(self.alt) as usize;
-                    let largura = (f_lar.min(self.lar) * 4) as usize;
-                    for y in 0..linhas {
-                        let de = y * (f_lar * 4) as usize;
-                        let para = y * (self.lar * 4) as usize;
-                        self.tela[para..para + largura].copy_from_slice(&bytes[de..de + largura]);
-                    }
+                    compor(
+                        &mut self.tela,
+                        &mut self.tela_de,
+                        (self.lar, self.alt),
+                        bytes,
+                        (f_lar, f_alt),
+                    );
                     self.tela.clone()
                 };
                 // Larga-se o frame quando o codificador está atrasado: numa transmissão ao
@@ -278,8 +305,54 @@ mod win {
             Ok(())
         }
 
+        /// O item fechou-se por baixo de nós: a janela fechou, o monitor foi desligado, o
+        /// driver foi reposto (#39).
+        ///
+        /// Devolvia `Ok(())` e não fazia nada. A thread da captura acabava, o vigia saía
+        /// pelo `is_finished()` e chamava `stop()` — sem uma única queixa. A interface
+        /// ficava a dizer «estás a partilhar» para sempre, com o botão aceso e sem imagem.
+        ///
+        /// Um `Err` daqui é guardado pelo crate e devolvido pelo `stop()` do vigia como
+        /// `FrameHandlerError` — é esse o caminho pelo qual o texto chega à pessoa.
         fn on_closed(&mut self) -> Result<(), Self::Error> {
-            Ok(())
+            Err("a janela ou o ecrã que estavas a partilhar desapareceu".into())
+        }
+    }
+
+    /// Compõe um frame de tamanho diferente do inicial na tela do tamanho inicial (#167).
+    ///
+    /// Encolher deixa margem preta, crescer corta. Imperfeito e assumido — a alternativa
+    /// era a transmissão MORRER ao primeiro redimensionar, que é pior.
+    ///
+    /// A TELA LIMPA-SE QUANDO O TAMANHO MUDA. Era alocada uma vez com zeros e nunca mais
+    /// tocada fora do rectângulo que se copiava: uma janela que encolhia de 1200 para 800
+    /// de largura deixava 400 pixels de conteúdo velho em cada linha, e quem via ficava com
+    /// uma orla do que a janela mostrava há um minuto. Um `fill` de 20 MB só na transição —
+    /// e a transição é um arrasto de borda, onde alguns ms não se notam.
+    ///
+    /// Função e não código inline na tratadora: uma orla que fica é exactamente o género
+    /// de defeito que ninguém vê a olhar, e assim há um teste que a vê.
+    pub(super) fn compor(
+        tela: &mut Vec<u8>,
+        tela_de: &mut (u32, u32),
+        (lar, alt): (u32, u32),
+        bytes: &[u8],
+        (f_lar, f_alt): (u32, u32),
+    ) {
+        let destino = (lar * alt * 4) as usize;
+        if tela.len() != destino {
+            *tela = vec![0u8; destino];
+        }
+        if *tela_de != (f_lar, f_alt) {
+            tela.fill(0);
+            *tela_de = (f_lar, f_alt);
+        }
+        let linhas = f_alt.min(alt) as usize;
+        let largura = (f_lar.min(lar) * 4) as usize;
+        for y in 0..linhas {
+            let de = y * (f_lar * 4) as usize;
+            let para = y * (lar * 4) as usize;
+            tela[para..para + largura].copy_from_slice(&bytes[de..de + largura]);
         }
     }
 
@@ -413,6 +486,39 @@ mod win {
         queixa: super::Queixa,
         aviso: super::Aviso,
     ) -> Result<(u32, u32)> {
+        // A QUEIXA PÁRA TUDO O QUE ESTA FUNÇÃO LANÇOU (#40).
+        //
+        // Havia cinco sítios a queixar-se — o codificador que não abre, a morte pedida
+        // para o teste, o Media Foundation que se queixa a meio, o ecrã que desapareceu ao
+        // construir o item, a captura que não arrancou — e nenhum deles punha o `parar` a
+        // `true`. Quem o punha era a INTERFACE, ao receber `partilha-falhou` e chamar
+        // `parar_de_partilhar` de volta: um salto de ida e volta pela webview para
+        // desligar uma thread que está a meio metro daqui.
+        //
+        // Enquanto esse salto não chegava — ou se não chegasse, porque a interface estava
+        // presa ou porque o evento se perdeu — o laço do WASAPI continuava em
+        // `while !parar.load()` a captar o som do sistema e a mandá-lo para um
+        // codificador que já tinha morrido. Com a imagem morta, o som de quem partilha
+        // continuava a sair da máquina.
+        //
+        // O embrulho é um só, à entrada, e todos os sítios o herdam — incluindo a queixa
+        // nova do vigia (#39). Escrevê-lo em cada um era garantir que o próximo sítio a
+        // queixar-se ficava outra vez de fora, que foi exactamente como o terceiro deles
+        // escapou da primeira vez (ver o comentário no laço do codificador).
+        //
+        // `swap` e não `store`: se o sinal JÁ estava posto, a paragem foi pedida e o que
+        // vem a seguir não é uma avaria — é a consequência de parar. Não se queixa do que
+        // se pediu.
+        let queixa: super::Queixa = {
+            let p = parar.clone();
+            let q = queixa;
+            Arc::new(move |texto: String| {
+                if !p.swap(true, Ordering::Relaxed) {
+                    q(texto);
+                }
+            })
+        };
+
         let (lar, alt) = tamanho_do_alvo(alvo)?;
         let (ls, aa) = caber(lar, alt, qualidade.max_altura);
         let fps = qualidade.fps.clamp(15, 60);
@@ -637,8 +743,39 @@ mod win {
             while !vigia.load(Ordering::Relaxed) && !controlo.is_finished() {
                 std::thread::sleep(std::time::Duration::from_millis(120));
             }
-            if let Err(e) = controlo.stop() {
-                eprintln!("[ecrã] ao parar a captura: {e:?}");
+            // AS DUAS SAÍDAS DESTE LAÇO NÃO SÃO A MESMA COISA (#39).
+            //
+            // `vigia` a `true` é uma paragem PEDIDA — a pessoa carregou no botão, ou uma
+            // queixa anterior já a pôs. `is_finished()` sem o sinal é a captura a morrer
+            // sozinha: a janela fechou, o monitor foi desligado, o driver foi reposto. Até
+            // aqui as duas saídas eram tratadas como iguais, e a segunda passava sem uma
+            // palavra: a interface continuava a dizer «estás a partilhar».
+            //
+            // O `pedido` lê-se ANTES do `stop()`, que é o que fecha o `Closed` do lado do
+            // Windows: lê-lo depois confundia o sinal que a nossa própria queixa vai pôr.
+            let pedido = vigia.load(Ordering::Relaxed);
+            let sessao = controlo.callback();
+            let resultado = controlo.stop();
+            // O resumo sai SEMPRE por aqui, com a thread da captura já junta — tenha ela
+            // acabado bem ou mal. Era dentro da tratadora, e uma captura que morre não
+            // volta a correr a tratadora.
+            eprintln!("{}", sessao.lock().resumo());
+            if pedido {
+                if let Err(e) = resultado {
+                    eprintln!("[ecrã] ao parar a captura: {e:?}");
+                }
+            } else {
+                use windows_capture::capture::{CaptureControlError, GraphicsCaptureApiError};
+                let razao = match resultado {
+                    // O texto do `on_closed` (ou de um `Err` da tratadora) vem por aqui.
+                    Err(CaptureControlError::GraphicsCaptureApiError(
+                        GraphicsCaptureApiError::FrameHandlerError(e),
+                    )) => e.to_string(),
+                    Err(outra) => format!("a captura de ecrã parou sozinha: {outra:?}"),
+                    Ok(()) => "a janela ou o ecrã que estavas a partilhar desapareceu".into(),
+                };
+                eprintln!("[ecrã] a captura morreu sem ninguém pedir: {razao}");
+                queixa(razao);
             }
         });
 
@@ -706,4 +843,47 @@ pub fn parar(estado: &mut Estado) {
         p.store(true, Ordering::Relaxed);
     }
     estado.espectadores.lock().unwrap().clear();
+}
+
+#[cfg(all(test, windows))]
+mod testes {
+    /// A orla do conteúdo antigo (#167): uma janela que encolhe não pode deixar na margem
+    /// o que lá estava antes.
+    #[test]
+    fn a_tela_nao_guarda_a_orla_do_frame_antigo() {
+        let mut tela = Vec::new();
+        let mut tela_de = (0, 0);
+        // Primeiro frame: 4x4, tudo a 0xFF — enche a tela inteira.
+        let cheio = vec![0xFFu8; 4 * 4 * 4];
+        super::win::compor(&mut tela, &mut tela_de, (4, 4), &cheio, (4, 4));
+        assert!(
+            tela.iter().all(|b| *b == 0xFF),
+            "o primeiro frame devia encher a tela"
+        );
+        // Segundo frame: a janela encolheu para 2x2, tudo a 0x11.
+        let pequeno = vec![0x11u8; 2 * 2 * 4];
+        super::win::compor(&mut tela, &mut tela_de, (4, 4), &pequeno, (2, 2));
+        // O canto de 2x2 tem o frame novo...
+        for y in 0..2 {
+            for x in 0..2 {
+                let i = (y * 4 + x) * 4;
+                assert_eq!(
+                    &tela[i..i + 4],
+                    &[0x11; 4],
+                    "pixel ({x},{y}) devia ser do frame novo"
+                );
+            }
+        }
+        // ...e TUDO o resto tem de estar a zero: era aqui que ficava a orla de 0xFF.
+        let fora: usize = (0..4usize)
+            .flat_map(|y| (0..4usize).map(move |x| (x, y)))
+            .filter(|(x, y)| *x >= 2 || *y >= 2)
+            .map(|(x, y)| (y * 4 + x) * 4)
+            .filter(|i| tela[*i..*i + 4] != [0u8; 4])
+            .count();
+        assert_eq!(
+            fora, 0,
+            "{fora} pixels da margem ainda têm o conteúdo antigo: é a orla"
+        );
+    }
 }

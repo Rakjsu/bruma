@@ -895,6 +895,22 @@ pub struct Ecra {
     /// cabeçalho não é vídeo nenhum: chegam bytes e não aparece imagem. Guardam-se para
     /// se mandarem a cada espectador novo antes de tudo o resto.
     pub cabecalho: SyncMutex<Vec<Vec<u8>>>,
+    /// A GERAÇÃO da partilha: sobe a cada `parar_de_partilhar`.
+    ///
+    /// # A corrida que isto fecha
+    ///
+    /// `parar` não espera pelo codificador. A thread dele continua viva a drenar até
+    /// quatro frames da fila e depois faz o `Finalize`, que despeja o que o codificador de
+    /// hardware tinha em voo — e tudo isso sai pela closure `entrega` ANTIGA, que escreve
+    /// neste mesmo `Ecra`. Se entretanto começou uma partilha nova, o `cabecalho` — que só
+    /// verifica `len() < 2` — podia ficar com um segmento de MEDIA da partilha antiga no
+    /// lugar do `moov` da nova, e cada espectador que entrasse recebia lixo em vez do
+    /// segmento de inicialização, para toda a partilha.
+    ///
+    /// O recomeço não é automático — é um clique em «Transmitir» ou parar-e-escolher —, mas
+    /// um clique é mais rápido do que um `Finalize` de hardware. A closure guarda a geração
+    /// com que nasceu e cala-se se ela já não for a actual.
+    pub geracao: std::sync::atomic::AtomicU64,
 }
 
 /// Guarda-se o canal por onde o ecrã dos outros vai entrar. Um só, porque só se assiste a
@@ -985,10 +1001,18 @@ pub fn comecar_a_partilhar(
 
     ecra.cabecalho.lock().unwrap().clear();
     let eco = ecra.clone();
+    // A geração com que ESTA partilha nasce. Ver `Ecra::geracao`.
+    let nascida = ecra.geracao.load(std::sync::atomic::Ordering::SeqCst);
     let entrega: crate::ecra::Entrega = Arc::new(move |pedaco: &[u8]| {
         // Os dois primeiros pedaços são o codec e o segmento de inicialização.
         {
             let mut c = eco.cabecalho.lock().unwrap();
+            // UMA CLOSURE DE OUTRA GERAÇÃO NÃO ENTREGA NADA. A verificação vive DENTRO do
+            // lock do `cabecalho`, e não antes: entre olhar e escrever podia entrar o
+            // `parar` da partilha nova, e o segmento velho aterrava na mesma.
+            if eco.geracao.load(std::sync::atomic::Ordering::SeqCst) != nascida {
+                return;
+            }
             if c.len() < 2 {
                 c.push(pedaco.to_vec());
             }
@@ -1050,6 +1074,16 @@ pub fn comecar_a_partilhar(
 
 #[tauri::command]
 pub fn parar_de_partilhar(ecra: State<Arc<Ecra>>) {
+    // A geração sobe AQUI, antes de qualquer outra coisa: a partir deste instante, o que a
+    // closure da partilha antiga ainda entregar já não é desta partilha. Ver `Ecra::geracao`.
+    ecra.geracao
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // `BRUMA_UI_SURDA=1`: a interface deixa de fazer a limpeza de volta, para se poder
+    // provar que o Rust para o som SOZINHO quando a imagem morre (#40). So em debug.
+    if crate::bandeiras::ui_surda() {
+        eprintln!("[teste] parar_de_partilhar ignorado (BRUMA_UI_SURDA)");
+        return;
+    }
     if let Ok(mut e) = ecra.estado.lock() {
         crate::ecra::parar(&mut e);
     }

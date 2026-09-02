@@ -149,6 +149,37 @@ pub fn video_por_uni() -> bool {
     false
 }
 
+/// Ao fim de quantos segundos a tratadora de frames finge que o item se fechou (#39).
+///
+/// O evento `Closed` a sério só o Windows o dispara — quando a janela fecha, o monitor sai,
+/// o driver é reposto. Nesta máquina, durante um teste, nada disso acontece. O `Err` daqui
+/// segue o MESMO caminho que o `Err` do `on_closed`: o crate guarda-o e devolve-o no
+/// `stop()` do vigia. Não é o mesmo evento; é a mesma saída.
+#[cfg(debug_assertions)]
+pub fn item_fecha_aos() -> Option<u64> {
+    std::env::var("BRUMA_ITEM_FECHA_AOS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+#[cfg(not(debug_assertions))]
+pub fn item_fecha_aos() -> Option<u64> {
+    None
+}
+
+/// A interface deixa de responder ao `partilha-falhou` com `parar_de_partilhar` (#40).
+///
+/// Serve para provar que o Rust pára o som SOZINHO quando a imagem morre. Sem isto a prova
+/// não discrimina: o salto de ida e volta pela webview também parava o som, e a sabotagem
+/// passava.
+#[cfg(debug_assertions)]
+pub fn ui_surda() -> bool {
+    std::env::var("BRUMA_UI_SURDA").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn ui_surda() -> bool {
+    false
+}
+
 /// Atrasa o sync de propósito, para a janela em que uma mensagem se pode perder ser
 /// observável em vez de instantânea.
 #[cfg(debug_assertions)]

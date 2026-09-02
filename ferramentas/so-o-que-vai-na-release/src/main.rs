@@ -63,6 +63,10 @@ const ANDAIMES: &[&str] = &[
     // O video por streams unidireccionais: e o passo 2 do #134, ainda por virar. Fica
     // andaime enquanto for bandeira; no dia em que virar, deixa de existir.
     "BRUMA_VIDEO_POR_UNI",
+    // A morte da captura e a interface surda: os dois caminhos pelos quais uma partilha
+    // acaba sem ninguem pedir, que nesta maquina nao acontecem sozinhos.
+    "BRUMA_ITEM_FECHA_AOS",
+    "BRUMA_UI_SURDA",
     "BRUMA_SYNC_LENTO",
     "BRUMA_SO_VIGIA",
     "BRUMA_SEM_TRAVAO",

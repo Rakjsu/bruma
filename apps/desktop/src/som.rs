@@ -993,6 +993,10 @@ pub fn arrancar(
                 );
             }
         }
+        // A thread do som diz que acabou. Sem esta linha nao havia forma de provar, pelo
+        // registo, que o som PAROU quando a imagem morreu (#40) -- e essa prova e a unica
+        // que distingue «o Rust para tudo sozinho» de «a interface fez a limpeza de volta».
+        eprintln!("[som] fim: a captura do som parou");
     });
 }
 
