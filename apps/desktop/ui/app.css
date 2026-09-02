@@ -1287,6 +1287,18 @@ body.ghost .app { transition: filter .8s var(--ease); }
    vermelho dizia «desligado», que é outra coisa. */
 .ico.is-avisado { color: var(--amber); }
 
+/* A câmara que parou (#170): escurece-se a tela sem apagar o último frame — a pessoa vê que
+   está parada, e vê ONDE parou. A etiqueta reutiliza o estilo do «sem áudio». */
+.tile--sem-imagem .tile__video { filter: brightness(.3); }
+
+/* A câmara que parou (#170): escurece-se a tela sem apagar o último frame — a pessoa vê que
+   está parada, e vê ONDE parou. A etiqueta reutiliza o estilo do «sem áudio». */
+.tile--sem-imagem .tile__video { filter: brightness(.3); }
+
+/* A câmara que parou (#170): escurece-se a tela sem apagar o último frame — a pessoa vê que
+   está parada, e vê ONDE parou. A etiqueta reutiliza o estilo do «sem áudio». */
+.tile--sem-imagem .tile__video { filter: brightness(.3); }
+
 /* O painel de rede: a secção da entrada e a razão de cada ligação estar aberta (#48, #54). */
 .diag__sec { margin-bottom: 12px; }
 .diag__porque { color: var(--dim); font-size: 12px; margin-left: 6px; }

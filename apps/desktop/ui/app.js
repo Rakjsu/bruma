@@ -2424,6 +2424,28 @@ const CAM_DEBITO = 400_000;      // 400 kbps chega para uma cara a 360p
 const CAM_CHAVE_MS = 2000;
 
 let camaraEnvio = null;
+
+/** Decide se este frame da câmara se codifica, e se vai como chave (#169).
+ *
+ *  # A avaria que isto corrige
+ *
+ *  Marcava-se `ultimaChave = agora` ANTES de tentar codificar, e só se codificava se a fila
+ *  do codificador tivesse menos de três. Quando a fila estava cheia — que é precisamente
+ *  quando a máquina está a sofrer — o frame era largado, mas o relógio da chave já tinha
+ *  avançado: a chave seguinte só daqui a `CAM_CHAVE_MS`. Duas vezes seguidas, e eram seis
+ *  segundos sem um único frame que se descodificasse sozinho — quem entrava a meio ficava
+ *  seis segundos em preto.
+ *
+ *  Duas regras, e as duas vivem aqui para se poderem medir sem a câmara:
+ *  - a chave é ISENTA do tecto da fila: um frame-chave largado custa mais do que um frame
+ *    de diferenças acumulado;
+ *  - o relógio só avança DEPOIS de um `encode()` que deu — é quem chama que o faz, com o
+ *    `ultimaChave` que isto devolve.
+ */
+function decidirFrameDaCamara(agora, ultimaChave, fila) {
+  const chave = agora - ultimaChave >= CAM_CHAVE_MS;
+  return { chave, codifica: chave || fila < 3 };
+}
 /** Conta quantas vezes se ligou ou desligou a câmara.
  *
  *  Serve para uma corrida real: entre carregar no botão e o `getUserMedia` responder passam
@@ -2543,12 +2565,15 @@ async function comecarAEnviarCamara(fonte = null) {
       }
       {
         const agora = performance.now();
-        const chave = agora - ultimaChave >= CAM_CHAVE_MS;
-        if (chave) ultimaChave = agora;
         // Se a fila cresce, o codificador não está a acompanhar. Largar o frame é melhor
-        // do que o acumular: numa chamada ao vivo o que interessa é o presente.
-        if (codificador.encodeQueueSize < 3) {
-          try { codificador.encode(value, { keyFrame: chave }); } catch (e) { /* o próximo vai */ }
+        // do que o acumular: numa chamada ao vivo o que interessa é o presente. Mas a
+        // CHAVE nunca se larga, e o relógio dela só avança quando ela saiu (#169).
+        const { chave, codifica } = decidirFrameDaCamara(agora, ultimaChave, codificador.encodeQueueSize);
+        if (codifica) {
+          try {
+            codificador.encode(value, { keyFrame: chave });
+            if (chave) ultimaChave = agora;
+          } catch (e) { /* o próximo vai; e a chave fica por dar, não por dada */ }
         }
       }
       value.close();
@@ -2582,20 +2607,31 @@ function pararDeEnviarCamara() {
 /** Um descodificador por pessoa, e um <video> que se reaproveita entre redesenhos. */
 const camarasRecebidas = new Map();
 
-function camaraDe(chave) {
-  let c = camarasRecebidas.get(chave);
-  if (c) return c;
+/** De quem é que a câmara deixou de descodificar, e porquê (#170). Irmã do `vozPartida`.
+ *
+ *  Quando o descodificador falhava, o tratador escrevia um `console.warn` e punha
+ *  `esperaChave = true` — e a tela ficava com o último frame desenhado: uma cara parada,
+ *  indistinguível de alguém sentado quieto. Pior: o `esperaChave = true` era código morto,
+ *  porque o WebCodecs FECHA o descodificador antes de chamar o `error`, e a entrada deita
+ *  fora tudo o que chegue a um descodificador `closed`. A pessoa ficava congelada até ao fim
+ *  da chamada, sem uma palavra.
+ */
+const camaraPartida = new Map();
 
-  const tela = document.createElement('canvas');
-  tela.className = 'tile__video';
-  tela.width = CAM_LARGURA;
-  tela.height = CAM_ALTURA;
-  const pincel = tela.getContext('2d');
-
-  c = { tela, pincel, descodificador: null, frames: 0, esperaChave: true };
-  c.descodificador = new VideoDecoder({
+/** Um descodificador de câmara para uma pessoa — e o que fazer quando ele morre (#170).
+ *
+ *  O mesmo desenho do `novoDescodificador` da voz: recria-se, até três vezes por minuto, e
+ *  ao fim disso a marca fica com a razão escrita. Recriar é seguro porque em annexb cada
+ *  frame-chave traz os seus parâmetros — o novo descodificador espera pelo próximo SPS.
+ */
+function novoDescodificadorDeCamara(chave, c, tela, pincel) {
+  const d = new VideoDecoder({
     output: quadro => {
       c.frames += 1;
+      // VOLTOU IMAGEM: a marca conta o presente (#170), e o relógio da última imagem
+      // é o que deixa o painel dizer «sem imagem há N s» quando ela parar outra vez.
+      c.ultimoFrameEm = performance.now();
+      if (camaraPartida.delete(chave)) desenharVoz();
       // E a imagem (#66): `frames` conta o que o descodificador DESENHOU, que e a unica
       // prova de que a imagem voltou a andar e nao so de que chegaram bytes.
       {
@@ -2613,12 +2649,42 @@ function camaraDe(chave) {
     },
     error: e => {
       console.warn('descodificador da câmara de', chave, e);
-      // Um erro deixa o descodificador inutilizável: exige-se um frame completo antes de
-      // se lhe voltar a dar seja o que for, senão entra num ciclo de queixas.
-      c.esperaChave = true;
+      const agora = performance.now();
+      c.refeitos = (c.refeitos || []).filter(t => agora - t < 60000);
+      if (c.refeitos.length >= REFAZER_NO_MINUTO) {
+        camaraPartida.set(chave, 'não consigo descodificar a câmara desta pessoa — '
+          + `desisti ao fim de ${REFAZER_NO_MINUTO} tentativas`);
+        desenharVoz();
+        return;
+      }
+      c.refeitos.push(agora);
+      try { if (d.state !== 'closed') d.close(); } catch (err) { /* já */ }
+      // Só se substitui se este AINDA for o descodificador em uso.
+      if (camarasRecebidas.get(chave) === c && c.descodificador === d) {
+        c.descodificador = novoDescodificadorDeCamara(chave, c, tela, pincel);
+        c.esperaChave = true;
+        camaraPartida.set(chave, 'a câmara desta pessoa falhou e está a ser retomada');
+        desenharVoz();
+      }
     },
   });
-  c.descodificador.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+  d.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+  return d;
+}
+
+function camaraDe(chave) {
+  let c = camarasRecebidas.get(chave);
+  if (c) return c;
+
+  const tela = document.createElement('canvas');
+  tela.className = 'tile__video';
+  tela.width = CAM_LARGURA;
+  tela.height = CAM_ALTURA;
+  const pincel = tela.getContext('2d');
+
+  c = { tela, pincel, descodificador: null, frames: 0, esperaChave: true,
+    ultimoFrameEm: 0, refeitos: [] };
+  c.descodificador = novoDescodificadorDeCamara(chave, c, tela, pincel);
   camarasRecebidas.set(chave, c);
   return c;
 }
@@ -2658,6 +2724,51 @@ function camaraDe(chave) {
   };
   invoke('receber_camara', { canal }).catch(() => {});
 })();
+
+/** Quanto tempo sem imagem é preciso para se dizer que a câmara parou (#170). */
+const CAMARA_PARADA_MS = 3000;
+
+/** O que dizer sobre a câmara de uma pessoa que devia estar a chegar e não chega (#170).
+ *
+ *  `null` quando está tudo bem — ou quando ela nunca ligou a câmara, que não é uma avaria.
+ *  Só se fala de quem ANUNCIOU câmara (`voz.comCamara`) e de quem já se ouviu ou viu.
+ */
+function imagemDaCamaraParada(chave) {
+  if (chave === voz.eu || !voz.comCamara.has(chave)) return null;
+  const partida = camaraPartida.get(chave);
+  if (partida) return { rotulo: 'sem imagem', porque: partida };
+  const c = camarasRecebidas.get(chave);
+  if (!c || !c.ultimoFrameEm) return null;
+  const ha = performance.now() - c.ultimoFrameEm;
+  if (ha < CAMARA_PARADA_MS) return null;
+  const s = Math.round(ha / 1000);
+  return {
+    rotulo: `sem imagem há ${s} s`,
+    porque: 'A câmara desta pessoa deixou de chegar. Pode ser a rede, ou a câmara dela.',
+  };
+}
+
+/* O relógio da câmara parada: um tique por segundo, a mexer SÓ nas etiquetas — redesenhar
+ * o painel todo a cada segundo mataria a pré-visualização. O modelo é o `medirFala`. */
+setInterval(() => {
+  if (!voz.canal) return;
+  for (const chave of voz.comCamara) {
+    if (chave === voz.eu) continue;
+    const agora = imagemDaCamaraParada(chave);
+    document.querySelectorAll(`[data-chave="${chave}"]`).forEach(el => {
+      const tinha = el.classList.contains('tile--sem-imagem');
+      if (!!agora !== tinha) { desenharVoz(); return; }
+      if (agora) {
+        el.querySelectorAll('.tile__sem-imagem, .mini__vivo').forEach(sp => {
+          if (/sem imagem/i.test(sp.textContent)) {
+            sp.textContent = sp.classList.contains('mini__vivo')
+              ? agora.rotulo.toUpperCase() : agora.rotulo;
+          }
+        });
+      }
+    });
+  }
+}, 1000);
 
 /** Se este pedaço traz um SPS — ou seja, se é um frame que se descodifica sozinho.
  *
@@ -2703,6 +2814,7 @@ function meuEspelho() {
 }
 
 function fecharCamaraRecebida(chave) {
+  camaraPartida.delete(chave);
   const c = camarasRecebidas.get(chave);
   if (!c) return;
   try {
@@ -4615,6 +4727,17 @@ function painelDeVoz(chave, opcoes = {}) {
     t.append(aviso);
   }
 
+  // A CÂMARA PARADA DIZ-SE (#170), como a voz já dizia. Duas frases distintas: «não
+  // descodifica» é o descodificador a falhar; «sem imagem há N s» é o relógio a dizer que
+  // não chega nada — e uma cara parada é indistinguível de alguém quieto sem isto.
+  const semImagem = imagemDaCamaraParada(chave);
+  if (semImagem) {
+    const aviso = elemento('span', 'tile__sem-audio tile__sem-imagem', semImagem.rotulo);
+    aviso.title = semImagem.porque;
+    t.append(aviso);
+    t.classList.add('tile--sem-imagem');
+  }
+
   const partido = vozPartida.get(chave);
   if (partido) {
     // Sem isto, quem deixa de ouvir uma pessoa suspeita DELA — e ela continua ali, a
@@ -4882,6 +5005,15 @@ function fotinha(chave, noPalco) {
     aviso.style.color = '#16181c';
     aviso.title = 'A ligação a esta pessoa caiu; o Bruma volta a tentar sozinho.';
     m.append(aviso);
+  }
+  const semImagem = imagemDaCamaraParada(chave);
+  if (semImagem) {
+    const aviso = elemento('span', 'mini__vivo', semImagem.rotulo.toUpperCase());
+    aviso.style.background = 'var(--amber)';
+    aviso.style.color = '#16181c';
+    aviso.title = semImagem.porque;
+    m.append(aviso);
+    m.classList.add('tile--sem-imagem');
   }
   const partida = vozPartida.get(chave);
   if (partida) {
@@ -7440,6 +7572,84 @@ function pararDeAssistir() {
     diz('ui seletor: NAO ABRIU');
   }
   fechar('veu-fontes');
+
+  // ---- A CAMARA: a chave que nao se larga e a imagem que para (#169, #170) ----
+  //
+  // O par legitimo tem uma camara desenhada que nunca falha e uma fila que nunca enche.
+  // Aqui mede-se contra as funcoes de producao, com o estado fabricado.
+  try {
+    // #169, a decisao pura: a chave e isenta do tecto da fila; o resto nao.
+    const t0 = 100000;
+    const cheia = decidirFrameDaCamara(t0 + CAM_CHAVE_MS, t0, 5);
+    const cheiaSemChave = decidirFrameDaCamara(t0 + 100, t0, 5);
+    const vaziaSemChave = decidirFrameDaCamara(t0 + 100, t0, 0);
+    // E o relogio: com um `encode` que ATIRA, o `ultimaChave` nao pode avancar. Corre-se o
+    // mesmo par de linhas do laco de envio contra um codificador falso.
+    let ultimaChave = t0;
+    const falso = { encodeQueueSize: 5, encode() { throw new Error('fila cheia'); } };
+    {
+      const agora = t0 + CAM_CHAVE_MS;
+      const { chave, codifica } = decidirFrameDaCamara(agora, ultimaChave, falso.encodeQueueSize);
+      if (codifica) {
+        try { falso.encode(null, { keyFrame: chave }); if (chave) ultimaChave = agora; }
+        catch (e) { /* o proximo vai */ }
+      }
+    }
+    diz(`ui camara chave: cheia-com-chave-codifica=${cheia.codifica && cheia.chave}`
+      + ` cheia-sem-chave-larga=${!cheiaSemChave.codifica}`
+      + ` vazia-codifica=${vaziaSemChave.codifica && !vaziaSemChave.chave}`
+      + ` relogio-nao-avanca-se-o-encode-atira=${ultimaChave === t0}`);
+
+    // #170: a marca «sem imagem ha N s» e a «nao descodifica», no cartao a serio.
+    const CH = 'outro1';
+    const antes = { canal: voz.canal, eu: voz.eu, servidor: voz.servidor, srv: servidorAtual, cnl: canalAtual };
+    // UMA SALA DE VOZ A SERIO, como o `ui palco` faz: a vista olha para o canal
+    // SELECIONADO, e sem um canal de voz escolhido nao chega a desenhar cartao nenhum -- a
+    // primeira versao desta medicao fabricava so o `voz.canal` e o cartao nunca existia,
+    // portanto «cartao-escurecido=false» era a medicao a olhar para o vazio.
+    let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+    if (!srv) {
+      const id = await invoke('criar_servidor', { nome: 'medicao' });
+      await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+      await desenharTudo();
+      srv = vista.servidores.find(x => x.id === id);
+    }
+    const cv = srv.canais.find(c => c.tipo === 'voz');
+    servidorAtual = srv.id; canalAtual = cv.id;
+    voz.eu = 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id;
+    voz.presentes.set(CH, voz.canal);
+    voz.comCamara.add(CH);
+    const c = camaraDe(CH);
+    c.ultimoFrameEm = performance.now() - (CAMARA_PARADA_MS + 1500);
+    const parada = imagemDaCamaraParada(CH);
+    desenharVoz();
+    const cartao = document.querySelector(`.tile[data-chave="${CH}"]`);
+    const escurecido = !!cartao && cartao.classList.contains('tile--sem-imagem')
+      && getComputedStyle(cartao.querySelector('.tile__video')).filter.includes('brightness');
+    const disse = !!cartao && /sem imagem há \d+ s/.test(cartao.textContent);
+    // A imagem volta: o `output` do descodificador e quem limpa -- finge-se com o mesmo
+    // gesto que ele faz.
+    c.ultimoFrameEm = performance.now();
+    const limpa = imagemDaCamaraParada(CH) === null;
+    // O descodificador partido: a frase e outra, e nao depende do relogio.
+    camaraPartida.set(CH, 'não consigo descodificar a câmara desta pessoa — teste');
+    const partida = imagemDaCamaraParada(CH);
+    camaraPartida.delete(CH);
+    // E quem NAO anunciou camara nunca leva a marca, mesmo com o relogio velho.
+    voz.comCamara.delete(CH);
+    c.ultimoFrameEm = performance.now() - 60000;
+    const semCamaraSemMarca = imagemDaCamaraParada(CH) === null;
+    fecharCamaraRecebida(CH);
+    voz.presentes.delete(CH);
+    voz.canal = antes.canal; voz.eu = antes.eu; voz.servidor = antes.servidor;
+    servidorAtual = antes.srv; canalAtual = antes.cnl;
+    desenharVoz();
+    diz(`ui camara parada: marcou=${!!parada} rotulo="${parada ? parada.rotulo : ''}"`
+      + ` cartao-escurecido=${escurecido} cartao-diz=${disse} volta-limpa=${limpa}`
+      + ` partida-diz="${partida ? partida.rotulo : ''}" sem-camara-sem-marca=${semCamaraSemMarca}`);
+  } catch (e) {
+    diz(`ui camara: REBENTOU ${e && e.message ? e.message : e}`);
+  }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----
   //
