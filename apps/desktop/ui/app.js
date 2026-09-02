@@ -3766,6 +3766,10 @@ const voz = {
   /** O ritmo MEDIDO da captura (#113): `{ips, largados, s}`, vindo do vigia de segundo a
    *  segundo. É o que o selo mostra em vez do número do menu. */
   ritmoMedido: null,
+  /** O que cada espectador nos diz de 3 em 3 s sobre o que está a receber (#112):
+   *  `{pedacos, saltos, aparados, secas, atraso, selo, em}` por chave. Quem partilha é
+   *  quem tem o botão da resolução, e era o único que não sabia como estava a chegar. */
+  relatorios: new Map(),
   // Quem, do outro lado, percebe o que esta versão envia. Ver PROTOCOLO.
   entendeCamara: new Set(),
   entendeSom: new Set(),
@@ -4058,7 +4062,7 @@ async function sairDeVoz(anunciar = true) {
   voz.entendeSom.clear();
   voz.jaFalou.clear();
   voz.aVer = null;
-  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
+  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
   voz.canal = null;
   // O CONTEXTO DE SAÍDA FECHA-SE E ESQUECE-SE (#38).
   //
@@ -4095,8 +4099,24 @@ function sinalizar(peer, dados) {
  */
 async function receberSinal(de, dados) {
   if (dados.tipo === 'assistir') {
-    if (dados.ligado) voz.aSerVistoPor.add(de); else voz.aSerVistoPor.delete(de);
+    if (dados.ligado) voz.aSerVistoPor.add(de); else { voz.aSerVistoPor.delete(de); voz.relatorios.delete(de); }
     actualizarEspectadores();
+    return;
+  }
+  // O RELATÓRIO DE VOLTA (#112): quem assiste diz o que está a receber. Versões antigas
+  // não mandam isto e não faz mal; versões antigas que o RECEBAM ignoram-no, porque o
+  // `receberSinal` delas não conhece o tipo.
+  if (dados.tipo === 'assistindo') {
+    voz.relatorios.set(de, {
+      pedacos: Number(dados.pedacos) || 0,
+      saltos: Number(dados.saltos) || 0,
+      aparados: Number(dados.aparados) || 0,
+      secas: Number(dados.secas) || 0,
+      atraso: Number.isFinite(dados.atraso) ? dados.atraso : null,
+      selo: typeof dados.selo === 'string' ? dados.selo : '',
+      em: performance.now(),
+    });
+    actualizarSeloDosOlhos();
     return;
   }
   if (dados.tipo === 'estado') {
@@ -4410,6 +4430,9 @@ function fluxoDePedacos(comSom = false, aoAvariar = null) {
         pedacos: el.__pedacos,
         pausado: !!el.__pausaPedida,
         avaria,
+        // Quanto o leitor vai atrás da ponta do buffer, em segundos (#112).
+        atraso: el.buffered && el.buffered.length
+          ? Math.max(0, el.buffered.end(el.buffered.length - 1) - el.currentTime) : null,
       };
     },
     fechar() {
@@ -4540,12 +4563,26 @@ document.addEventListener('visibilitychange', () => {
 /** O tique de 1 s do palco: o selo e o diagnóstico mudam NO SÍTIO — redesenhar o palco
  *  inteiro por relógio matava a reprodução. E é aqui que a pausa por janela escondida se
  *  decide. */
+let tiquesDoPalco = 0;
 function tiqueDoPalco() {
   const agora = performance.now();
+  tiquesDoPalco += 1;
   if (voz.aVer && voz.aVer !== voz.eu && escondidaDesde != null
       && espectadorEscondido(document.visibilityState, agora - escondidaDesde)) {
     pausarPorEscondida();
   }
+  // O RELATÓRIO DE VOLTA (#112): de 3 em 3 s, e só enquanto se assiste a alguém.
+  if (tiquesDoPalco % 3 === 0 && voz.aVer && voz.aVer !== voz.eu && !pausaPorEscondida) {
+    const f = fluxosRecebidos.get(voz.aVer);
+    const st = f && f.estado ? f.estado() : null;
+    if (st) {
+      sinalizar(voz.aVer, {
+        tipo: 'assistindo', pedacos: st.pedacos, saltos: st.saltos, aparados: st.aparados,
+        secas: st.secas, atraso: st.atraso, selo: seloDoVivo(st, agora).texto,
+      });
+    }
+  }
+  if (voz.aVer === voz.eu) actualizarSeloDosOlhos();
   const selo = document.querySelector('.palco__selo--vivo');
   if (!selo || !voz.aVer) return;
   const f = voz.aVer === voz.eu ? voz.vejoMeuEcra : fluxosRecebidos.get(voz.aVer);
@@ -4776,7 +4813,7 @@ async function alternarEcra() {
     await invoke('parar_de_partilhar').catch(() => {});
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
-    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
+    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
     voz.aSerVistoPor.clear();   // parar de transmitir acaba com os pedidos de assistir
     anunciarEstado();
     desenharVoz();
@@ -4800,7 +4837,7 @@ function separarErroDePartilha(e) {
 function partilhaMorreu(razao) {
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
+  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
   voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
@@ -5078,6 +5115,42 @@ function espectadoresDe(quem) {
   return i ? i.espectadores : 0;
 }
 
+/** Os relatórios de quem me vê que ainda valem (#112): os de há mais de 10 s são de
+ *  espectadores que se calaram, e não contam. */
+function relatoriosVivos(agora) {
+  return [...voz.relatorios.entries()].filter(([, r]) => agora - r.em <= 10000);
+}
+
+/** O número do selo dos olhos e, quando há relatório, o que ele diz de pior (#112). */
+function textoDosOlhos(quem) {
+  const n = String(espectadoresDe(quem));
+  if (quem !== voz.eu) return n;
+  const vivos = relatoriosVivos(performance.now());
+  const saltos = vivos.reduce((a, [, r]) => a + r.saltos, 0);
+  const secas = vivos.reduce((a, [, r]) => a + r.secas, 0);
+  if (saltos > 0) return `${n} · ${saltos} saltos`;
+  if (secas > 0) return `${n} · ${secas} secas`;
+  return n;
+}
+
+function tituloDosOlhos(quem) {
+  if (quem !== voz.eu) return 'quantas pessoas estão a ver';
+  const vivos = relatoriosVivos(performance.now());
+  if (!vivos.length) return 'quantas pessoas estão a ver (ninguém disse ainda como está a chegar)';
+  return vivos.map(([k, r]) => `${nomeDoPeer(k)}: ${r.selo || '?'}, ${r.pedacos} pedaços,`
+    + ` ${r.saltos} saltos, ${r.aparados} aparados, ${r.secas} secas`
+    + (r.atraso != null ? `, ${r.atraso.toFixed(1)} s atrás` : '')).join('\n');
+}
+
+/** Muda o selo dos olhos no sítio, sem redesenhar o palco (#112). */
+function actualizarSeloDosOlhos() {
+  const olhos = document.querySelector('.palco__selo[data-olhos]');
+  if (!olhos || voz.aVer !== voz.eu) return;
+  const numero = olhos.querySelector('span');
+  if (numero) numero.textContent = textoDosOlhos(voz.eu);
+  olhos.title = tituloDosOlhos(voz.eu);
+}
+
 function qualidadeDe(quem) {
   if (quem === voz.eu) return rotuloDaQualidade();
   const i = voz.infoDaTransmissao.get(quem);
@@ -5175,10 +5248,12 @@ function palcoDeTransmissao(quem, canal, outros) {
     camadaDir.append(selo);
   }
   const olhos = elemento('span', 'palco__selo');
+  olhos.dataset.olhos = '1';   // o relatório de volta (#112) encontra-o por aqui
   olhos.innerHTML =
     '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor"'
     + ' stroke-width="1.4">' + ICO.olho + '</svg>';
-  olhos.append(elemento('span', null, String(espectadoresDe(quem))));
+  olhos.append(elemento('span', null, textoDosOlhos(quem)));
+  olhos.title = tituloDosOlhos(quem);
   camadaDir.append(olhos);
   // O selo diz a verdade (#42): nasce com o estado real do fluxo e o tique de 1 s
   // mantém-no. A linha de diagnóstico (#47) vive por baixo, escondida até fazer falta.
@@ -6978,6 +7053,9 @@ function pararDeAssistir() {
     // Deixar correr, e depois contar. O que interessa é `recebidos`: prova que o datagrama
     // saiu de uma instância e chegou ao descodificador da outra.
     let conversa = null;
+    // O `ecra-env` de cada par na volta anterior, para se dizer o DELTA (#71): a promessa
+    // «sem espectadores não sai um byte de ecrã» só se vê na diferença entre voltas.
+    const ecraAnterior = new Map();
     for (let volta = 1; volta <= 6; volta++) {
       await esperar(5000);
 
@@ -7072,6 +7150,9 @@ function pararDeAssistir() {
         // mais abrir. Com a medida a caducar, os dois voltam a andar juntos.
         + ` escrita=${e.escritaUltimaMs}ms/${e.escritaPiorMs}ms cortados=${e.videoCortado}`
         + ` ecra-env=${e.ecraEnviado}`
+        // O DELTA de ecra por volta (#71): tem de ser 0 depois de «parou de assistir» e >0
+        // depois de «voltou a assistir».
+        + ` ecra-delta=${e.ecraEnviado - (ecraAnterior.get(e.peer) || 0)}`
         // A camara a parte, os saltados no canal e o caminho (#133, #166, #115).
         + ` camara-env=${e.camaraEnviado} perdidos-canal=${e.perdidosNoCanal}`
         + ` tx=${typeof e.txKbps === 'number' ? Math.round(e.txKbps) + 'kbps' : '?'}`
@@ -7083,7 +7164,12 @@ function pararDeAssistir() {
           return c ? ` cortes=${c.total} folga=${Math.round(c.folga * 1000)}ms` : ' cortes=0';
         })()
       ).join(' | ');
+      for (const e of estado) ecraAnterior.set(e.peer, e.ecraEnviado || 0);
       const ecra = estado.map(e => `ecrã ↑${e.ecraEnviado} ↓${e.ecraRecebido}`).join(' | ');
+      // O que quem me ve diz de volta (#112).
+      const relatorios = [...voz.relatorios.entries()]
+        .map(([k, r]) => `${k.slice(0, 6)}:${r.pedacos}p/${r.saltos}s/${r.secas}x/${r.selo}`).join(',');
+      if (relatorios) diz(`par RELATORIOS de quem me ve: ${relatorios}`);
       // O que interessa na câmara é o mesmo que interessa no ecrã: não "chegaram bytes",
       // mas "saiu imagem". `frames` conta o que o descodificador DESENHOU.
       const cams = [...camarasRecebidas.entries()]
@@ -7110,7 +7196,11 @@ function pararDeAssistir() {
       // Assim que alguém aparecer a transmitir, o convidado carrega em Assistir e conta o
       // que o <video> conseguiu mesmo descodificar — que é o que separa "chegaram bytes"
       // de "vê-se imagem".
-      if (modo !== '' && !voz.aVer) {
+      // A volta 5 fica de fora de proposito (#71): a paragem da volta 4 tem de durar DUAS
+      // voltas para haver, no anfitriao, uma janela de 5 s inteira sem espectador -- as
+      // voltas das duas instancias estao desfasadas, e com uma volta so a janela do zero
+      // nunca calhava inteira (medido: delta 5 em vez de 0).
+      if (modo !== '' && !voz.aVer && volta !== 5) {
         const quem = [...voz.aPartilhar][0];
         if (quem) {
           const t0 = performance.now();
@@ -7188,6 +7278,17 @@ function pararDeAssistir() {
                 + ` selo="${seloDoVivo(st, performance.now()).texto}"`
               : ' saltos=? selo="?"';
           })());
+      }
+
+      // #71: NA VOLTA 4 O CONVIDADO DEIXA DE ASSISTIR, e na 5 volta a assistir -- o bloco
+      // de cima trata disso sozinho, porque `voz.aVer` fica vazio -- com uma PRIMEIRA
+      // IMAGEM nova, contada num <video> novo (o antigo guardava os frames e daria «0 ms»).
+      // No anfitriao, o `ecra-delta` da volta seguinte tem de ser 0, e o da outra >0.
+      if (modo !== '' && volta === 4 && voz.aVer && voz.aVer !== voz.eu) {
+        const quem = voz.aVer;
+        pararDeAssistir();
+        fecharFluxoRecebido(quem);
+        diz(`par CONVIDADO parou de assistir a ${quem.slice(0, 6)}`);
       }
     }
   } catch (e) {
@@ -8325,6 +8426,48 @@ function pararDeAssistir() {
       + ` meio-mantem=${JSON.stringify(a3)}/${a4 === null} poucos=${a5 === null}`);
   } catch (e) {
     diz(`ui aviso de rede: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O RELATORIO DE VOLTA NO SELO DOS OLHOS (#112) ----
+  try {
+    const antes = { canal: voz.canal, eu: voz.eu, servidor: voz.servidor, srv: servidorAtual,
+      cnl: canalAtual, aVer: voz.aVer, ecra: voz.ecra };
+    let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+    if (!srv) {
+      const id = await invoke('criar_servidor', { nome: 'medicao' });
+      await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+      await desenharTudo();
+      srv = vista.servidores.find(x => x.id === id);
+    }
+    const cv = srv.canais.find(c => c.tipo === 'voz');
+    servidorAtual = srv.id; canalAtual = cv.id;
+    voz.eu = voz.eu || 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id;
+    voz.presentes.set('outro1', cv.id); voz.aSerVistoPor.add('outro1');
+    voz.relatorios.clear();
+    voz.aVer = voz.eu;
+    desenharVoz();
+    const olhos = () => document.querySelector('.palco__selo[data-olhos]');
+    const semRelatorio = olhos() ? olhos().textContent.trim() : '';
+    // Um relatorio chega pelo mesmo caminho dos sinais: o selo muda NO SITIO.
+    await receberSinal('outro1', { tipo: 'assistindo', pedacos: 40, saltos: 2, aparados: 0, secas: 1, atraso: 0.6, selo: 'AO VIVO' });
+    const comRelatorio = olhos() ? olhos().textContent.trim() : '';
+    const titulo = olhos() ? olhos().title : '';
+    // Quem deixa de assistir leva o relatorio consigo.
+    await receberSinal('outro1', { tipo: 'assistir', ligado: false });
+    const depois = voz.relatorios.has('outro1');
+    // E um relatorio velho (>10 s) nao conta.
+    voz.relatorios.set('outro1', { pedacos: 1, saltos: 9, aparados: 0, secas: 0, atraso: null, selo: '', em: performance.now() - 11000 });
+    const velho = textoDosOlhos(voz.eu);
+    voz.relatorios.clear();
+    diz(`ui relatorio de volta: sem="${semRelatorio}" com="${comRelatorio}"`
+      + ` titulo="${titulo.replace(/\s+/g, ' ').slice(0, 70)}" saiu-com-ele=${!depois} velho-nao-conta="${velho}"`);
+    voz.presentes.delete('outro1'); voz.aSerVistoPor.delete('outro1');
+    voz.aVer = antes.aVer;
+    Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor });
+    servidorAtual = antes.srv; canalAtual = antes.cnl;
+    desenharVoz();
+  } catch (e) {
+    diz(`ui relatorio de volta: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----
