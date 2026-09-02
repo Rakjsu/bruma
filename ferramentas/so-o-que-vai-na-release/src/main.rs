@@ -80,6 +80,9 @@ const ANDAIMES: &[&str] = &[
     "BRUMA_SOM_NAO_VOLTA",
     "BRUMA_MOOF_CRU",
     "BRUMA_SOM_DEMORA_MS",
+    "BRUMA_SEM_FRAMES",
+    "BRUMA_SEM_FRAMES_ATE_S",
+    "BRUMA_CODIFICADOR_LENTO_MS",
     // Comandos que so servem para medir.
     "convites_de_teste",
     "escapou_alguma_coisa",

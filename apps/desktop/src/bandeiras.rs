@@ -321,3 +321,34 @@ pub fn som_demora_ms() -> Option<u64> {
 pub fn som_demora_ms() -> Option<u64> {
     None
 }
+
+/// O Windows não entrega frame nenhum (#41): `BRUMA_SEM_FRAMES=1` para sempre, ou
+/// `BRUMA_SEM_FRAMES_ATE_S=N` só nos primeiros N segundos — para se ver o aviso aparecer
+/// E ser retirado quando a imagem volta.
+#[cfg(debug_assertions)]
+pub fn sem_frames_ate_s() -> Option<u64> {
+    if let Ok(n) = std::env::var("BRUMA_SEM_FRAMES_ATE_S") {
+        return n.parse().ok();
+    }
+    std::env::var("BRUMA_SEM_FRAMES")
+        .is_ok()
+        .then_some(u64::MAX)
+}
+#[cfg(not(debug_assertions))]
+pub fn sem_frames_ate_s() -> Option<u64> {
+    None
+}
+
+/// O codificador demora estes milissegundos por frame (#41): a fila enche, os frames
+/// largam-se, e o vigia tem de o dizer.
+#[cfg(debug_assertions)]
+pub fn codificador_lento_ms() -> Option<u64> {
+    std::env::var("BRUMA_CODIFICADOR_LENTO_MS")
+        .ok()?
+        .parse()
+        .ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn codificador_lento_ms() -> Option<u64> {
+    None
+}

@@ -1075,14 +1075,30 @@ pub fn comecar_a_partilhar(
     };
     let aviso: crate::ecra::Aviso = {
         let app = app.clone();
-        Arc::new(move |razao: String| {
+        Arc::new(move |chave: &'static str, texto: String| {
             use tauri::Emitter;
-            let _ = app.emit("partilha-aviso", razao);
+            // Com chave (#41): a interface guarda um aviso por chave, e um texto vazio
+            // retira o dessa chave.
+            let _ = app.emit(
+                "partilha-aviso",
+                serde_json::json!({ "chave": chave, "texto": texto }),
+            );
+        })
+    };
+    // O ritmo medido (#113), de segundo a segundo, por evento próprio.
+    let ritmo: crate::ecra::Ritmo = {
+        let app = app.clone();
+        Arc::new(move |ips: f64, largados: u64, s: u64| {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "partilha-ritmo",
+                serde_json::json!({ "ips": ips, "largados": largados, "s": s }),
+            );
         })
     };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        match crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa, aviso) {
+        match crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa, aviso, ritmo) {
             Ok(t) => t,
             Err(e) => {
                 // O que se mudou em cima desfaz-se: um `Err` aqui não pode deixar o estado

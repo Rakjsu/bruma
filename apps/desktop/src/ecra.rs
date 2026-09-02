@@ -106,7 +106,16 @@ pub type Queixa = Arc<dyn Fn(String) + Send + Sync>;
 /// deixa-o de pé. Usar a queixa para um aviso desligava a transmissão por causa de uma
 /// imperfeição; usar um `eprintln!` deixava a pessoa a mandar a voz de toda a gente de
 /// volta sem nunca o saber.
-pub type Aviso = Arc<dyn Fn(String) + Send + Sync>;
+/// Cada aviso tem uma CHAVE (`som`, `imagem`, `codificador`): a interface guarda um por
+/// chave, e um texto vazio retira o dessa chave. Com uma string única, o aviso da imagem
+/// que não chega apagava o do eco — e o do eco é o que faz a pessoa desligar o som.
+pub type Aviso = Arc<dyn Fn(&'static str, String) + Send + Sync>;
+
+/// O ritmo medido da captura (#113), de segundo a segundo: frames enviados por segundo
+/// nos últimos 5 s, frames largados desde o início, e há quantos segundos a partilha
+/// começou. Evento próprio e não um `Aviso`: um aviso por segundo pintava o botão de
+/// âmbar sem parar.
+pub type Ritmo = Arc<dyn Fn(f64, u64, u64) + Send + Sync>;
 
 /// O que está a acontecer agora. Uma partilha de cada vez, como no Discord.
 #[derive(Default)]
@@ -203,6 +212,8 @@ mod win {
         ultimo_frame: Option<std::time::Instant>,
         maior_intervalo: u64,
         longos: u64,
+        /// Os mesmos números, partilhados com o vigia (#41, #113).
+        contadores: Arc<Contadores>,
     }
 
     /// O que a captura precisa de saber. Struct e não tuplo: quando isto era
@@ -216,6 +227,18 @@ mod win {
         alt: u32,
         parar: Arc<AtomicBool>,
         fps: u32,
+        contadores: Arc<Contadores>,
+    }
+
+    /// Os contadores que o VIGIA lê (#41, #113). A `Sessao` só corre quando o Windows
+    /// entrega um frame — e o que se quer detectar é precisamente a ausência deles. Os
+    /// números vivem em atómicos partilhados, e o vigia, que tem o único relógio
+    /// periódico do subsistema, é quem os olha de segundo a segundo.
+    #[derive(Default)]
+    pub struct Contadores {
+        pub recebidos: std::sync::atomic::AtomicU64,
+        pub enviados: std::sync::atomic::AtomicU64,
+        pub largados: std::sync::atomic::AtomicU64,
     }
 
     impl Sessao {
@@ -251,11 +274,13 @@ mod win {
                 alt,
                 parar,
                 fps,
+                contadores,
             } = ctx.flags;
             Ok(Self {
                 canal,
                 na_fila,
                 parar,
+                contadores,
                 scratch: Vec::new(),
                 lar,
                 alt,
@@ -300,7 +325,17 @@ mod win {
                         .into());
                 }
             }
+            // `BRUMA_SEM_FRAMES=1` (ou `BRUMA_SEM_FRAMES_ATE_S=N`) finge que o Windows não
+            // entrega frame nenhum: é a única forma de correr aqui o aviso da imagem que
+            // não chega (#41). DEPOIS da verificação do `parar`, senão a paragem a pedido
+            // deixava de funcionar com a bandeira posta.
+            if let Some(ate) = crate::bandeiras::sem_frames_ate_s() {
+                if self.inicio.elapsed().as_secs() < ate {
+                    return Ok(());
+                }
+            }
             self.recebidos += 1;
+            self.contadores.recebidos.fetch_add(1, Ordering::Relaxed);
             {
                 let agora = std::time::Instant::now();
                 if let Some(ant) = self.ultimo_frame {
@@ -346,13 +381,18 @@ mod win {
                 // juntos. Agora o som nunca é largado, e o vídeo tem o seu próprio teto.
                 if self.na_fila.load(Ordering::Relaxed) >= 4 {
                     self.largados += 1;
+                    self.contadores.largados.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.na_fila.fetch_add(1, Ordering::Relaxed);
                     match self.canal.send(Trabalho::Video(pronto)) {
-                        Ok(()) => self.enviados += 1,
+                        Ok(()) => {
+                            self.enviados += 1;
+                            self.contadores.enviados.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => {
                             self.na_fila.fetch_sub(1, Ordering::Relaxed);
                             self.largados += 1;
+                            self.contadores.largados.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -565,6 +605,7 @@ mod win {
     }
 
     /// Arranca a captura do alvo escolhido numa thread própria.
+    #[allow(clippy::too_many_arguments)]
     pub fn arrancar(
         alvo: super::Alvo,
         qualidade: super::Qualidade,
@@ -573,6 +614,7 @@ mod win {
         entrega: Entrega,
         queixa: super::Queixa,
         aviso: super::Aviso,
+        ritmo: super::Ritmo,
     ) -> Result<(u32, u32)> {
         // A QUEIXA PÁRA TUDO O QUE ESTA FUNÇÃO LANÇOU (#40).
         //
@@ -651,7 +693,7 @@ mod win {
                 move |b| {
                     let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
                 },
-                move |m| avisa_som(m),
+                move |m| avisa_som("som", m),
             );
             Some(crate::som::Formato {
                 ritmo,
@@ -674,13 +716,16 @@ mod win {
                 move |b| {
                     let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
                 },
-                move |m| avisa_som(m),
+                move |m| avisa_som("som", m),
             );
             match ouve.recv_timeout(std::time::Duration::from_secs(6)) {
                 Ok(Some(f)) => Some(f),
                 Ok(None) => {
                     eprintln!("[som] sem dispositivo de saída; a partilha vai muda");
-                    aviso("não há dispositivo de som — a partilha vai sem som".into());
+                    aviso(
+                        "som",
+                        "não há dispositivo de som — a partilha vai sem som".into(),
+                    );
                     None
                 }
                 Err(_) => {
@@ -688,7 +733,10 @@ mod win {
                     // A thread do som pára por um sinal SEU: o `parar` é o do vídeo, e a
                     // partilha continua.
                     so_o_som.store(true, Ordering::Relaxed);
-                    aviso("o som do sistema não respondeu — a partilha vai sem som".into());
+                    aviso(
+                        "som",
+                        "o som do sistema não respondeu — a partilha vai sem som".into(),
+                    );
                     None
                 }
             }
@@ -789,6 +837,11 @@ mod win {
                                 crate::fmp4::AMOSTRAS.load(Ordering::Relaxed)
                             );
                         }
+                        // `BRUMA_CODIFICADOR_LENTO_MS=N`: um codificador que demora N ms por
+                        // frame, para se ver a fila encher e o vigia queixar-se (#41).
+                        if let Some(ms) = crate::bandeiras::codificador_lento_ms() {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
                         let r = c.frame(&v);
                         ultimo = Some(v);
                         r
@@ -835,6 +888,8 @@ mod win {
         });
 
         let vigia = parar.clone();
+        let contadores = Arc::new(Contadores::default());
+        let contadores_vigia = contadores.clone();
         std::thread::spawn(move || {
             // O item de captura constrói-se AQUI dentro: os tipos do capturador guardam
             // ponteiros COM que não atravessam threads; o Alvo é só números e atravessa.
@@ -845,6 +900,7 @@ mod win {
                 alt,
                 parar,
                 fps,
+                contadores,
             };
             // Função e não closure: os dois ramos passam tipos diferentes (Monitor e
             // Window) e uma closure fixa-se no primeiro que vê.
@@ -928,9 +984,89 @@ mod win {
                     return;
                 }
             };
-            // Fica-se aqui a vigiar o sinal, e não a dormir à espera de um frame.
+            // Fica-se aqui a vigiar o sinal, e não a dormir à espera de um frame — e, de
+            // segundo a segundo, olha-se para os contadores (#41, #113).
+            //
+            // # O que se avisa, e o que NÃO se avisa
+            //
+            // (a) Nenhum frame nos primeiros 3 s: «ainda não chegou imagem nenhuma» — a
+            // janela pode estar minimizada, protegida, ou a não desenhar. Retira-se quando
+            // o primeiro chegar. (b) O codificador engasgado: a fila presa em 4 e os
+            // largados a subir durante três segundos seguidos. NÃO se avisa «há N s sem
+            // frame»: o Windows entrega frames quando o ecrã MUDA, e um documento quieto dá
+            // zero frames com uma imagem parada CORRECTA do lado de quem vê. Só se avisa
+            // nas transições, nunca a cada volta — senão o botão piscava.
+            //
+            // (c) O ritmo: frames ENVIADOS por segundo nos últimos 5 s (o que quem vê
+            // recebe; os recebidos incluem os largados), por evento próprio.
+            let comeco = std::time::Instant::now();
+            let mut voltas = 0u32;
+            let mut avisou_imagem = false;
+            let mut avisou_codificador = false;
+            let mut cresceu: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
+            let mut largados_antes = 0u64;
+            let mut historico: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
             while !vigia.load(Ordering::Relaxed) && !controlo.is_finished() {
                 std::thread::sleep(std::time::Duration::from_millis(120));
+                voltas += 1;
+                if !voltas.is_multiple_of(8) {
+                    continue;
+                }
+                let s = comeco.elapsed().as_secs();
+                let recebidos = contadores_vigia.recebidos.load(Ordering::Relaxed);
+                let enviados = contadores_vigia.enviados.load(Ordering::Relaxed);
+                let largados = contadores_vigia.largados.load(Ordering::Relaxed);
+
+                if recebidos == 0 && s >= 3 && !avisou_imagem {
+                    avisou_imagem = true;
+                    eprintln!("[ecrã] aviso imagem: ainda não chegou imagem nenhuma ({s} s)");
+                    aviso(
+                        "imagem",
+                        "ainda não chegou imagem nenhuma — a janela pode estar minimizada ou a não desenhar"
+                            .into(),
+                    );
+                } else if recebidos > 0 && avisou_imagem {
+                    avisou_imagem = false;
+                    eprintln!("[ecrã] aviso imagem: retirado, chegou imagem ({s} s)");
+                    aviso("imagem", String::new());
+                }
+
+                // O engasgo do codificador: os largados a subir em dois dos ultimos tres
+                // segundos. Nao se olha para a fila num instante -- ela oscila entre 3 e 4
+                // e o vigia, a amostrar uma vez por segundo, via-a cheia so as vezes: com
+                // BRUMA_CODIFICADOR_LENTO_MS=2000 houve 7 largados em 20 s e aviso nenhum.
+                let engasgado = largados > largados_antes;
+                largados_antes = largados;
+                cresceu.push_back(engasgado);
+                while cresceu.len() > 3 {
+                    cresceu.pop_front();
+                }
+                let vezes = cresceu.iter().filter(|c| **c).count();
+                if vezes >= 2 && !avisou_codificador {
+                    avisou_codificador = true;
+                    eprintln!(
+                        "[ecrã] aviso codificador: não acompanha ({largados} largados aos {s} s)"
+                    );
+                    aviso(
+                        "codificador",
+                        "o codificador não acompanha o ecrã — a imagem vai aos solavancos; experimenta menos resolução ou menos ips"
+                            .into(),
+                    );
+                } else if vezes == 0 && avisou_codificador {
+                    avisou_codificador = false;
+                    eprintln!("[ecrã] aviso codificador: retirado ({s} s)");
+                    aviso("codificador", String::new());
+                }
+
+                historico.push_back(enviados);
+                while historico.len() > 6 {
+                    historico.pop_front();
+                }
+                if historico.len() >= 2 {
+                    let janela = (historico.len() - 1) as f64;
+                    let ips = (enviados - historico[0]) as f64 / janela;
+                    ritmo(ips, largados, s);
+                }
             }
             // AS DUAS SAÍDAS DESTE LAÇO NÃO SÃO A MESMA COISA (#39).
             //
@@ -979,6 +1115,7 @@ mod win {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn arrancar(
         _alvo: super::Alvo,
         _q: super::Qualidade,
@@ -987,6 +1124,7 @@ mod win {
         _entrega: Entrega,
         _queixa: super::Queixa,
         _aviso: super::Aviso,
+        _ritmo: super::Ritmo,
     ) -> Result<(u32, u32)> {
         Err(anyhow!(
             "a captura nativa por enquanto só existe no Windows"
@@ -1016,6 +1154,7 @@ pub fn comecar(
     entrega: Entrega,
     queixa: Queixa,
     aviso: Aviso,
+    ritmo: Ritmo,
 ) -> Result<(u32, u32)> {
     if estado.a_partilhar() {
         return Err(anyhow!("já estás a partilhar"));
@@ -1031,6 +1170,7 @@ pub fn comecar(
         entrega,
         queixa,
         aviso,
+        ritmo,
     )?;
     estado.parar = Some(parar);
     Ok(tamanho)

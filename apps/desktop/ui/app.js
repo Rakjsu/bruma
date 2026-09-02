@@ -3763,6 +3763,9 @@ const voz = {
    *  meio via a barra a anunciar números que ninguém estava a usar. Mudar a qualidade só
    *  vale para transmissões novas, e a barra tem de contar a mesma história. */
   qualidadeEmUso: null,
+  /** O ritmo MEDIDO da captura (#113): `{ips, largados, s}`, vindo do vigia de segundo a
+   *  segundo. É o que o selo mostra em vez do número do menu. */
+  ritmoMedido: null,
   // Quem, do outro lado, percebe o que esta versão envia. Ver PROTOCOLO.
   entendeCamara: new Set(),
   entendeSom: new Set(),
@@ -4044,7 +4047,7 @@ async function sairDeVoz(anunciar = true) {
   voz.entendeSom.clear();
   voz.jaFalou.clear();
   voz.aVer = null;
-  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.qualidadeEmUso = null;
+  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
   voz.canal = null;
   // O CONTEXTO DE SAÍDA FECHA-SE E ESQUECE-SE (#38).
   //
@@ -4762,7 +4765,7 @@ async function alternarEcra() {
     await invoke('parar_de_partilhar').catch(() => {});
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
-    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
+    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
     voz.aSerVistoPor.clear();   // parar de transmitir acaba com os pedidos de assistir
     anunciarEstado();
     desenharVoz();
@@ -4786,7 +4789,7 @@ function separarErroDePartilha(e) {
 function partilhaMorreu(razao) {
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
+  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null;
   voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
@@ -4799,7 +4802,7 @@ function partilhaMorreu(razao) {
 async function iniciarPartilha(fonte, humano = false) {
   if (voz.ecra || !voz.canal || !voz.servidor) return;
   partilhaFalhou = null;
-  partilhaAviso = null;
+  partilhaAvisos.clear();
 
   // O canal fica aberto desde já, mas o Rust só manda por ele quando estivermos mesmo
   // a olhar (ver_meu_ecra). Criar o <video> agora e deixá-lo a apanhar pedaços às
@@ -4873,6 +4876,10 @@ const fluxosRecebidos = new Map();
     const corpo = bytes.subarray(1 + n);
     let fluxo = fluxosRecebidos.get(chave);
     if (!fluxo) {
+      // Um fluxo NASCE com o codec (#43): um pedaco de media que chegue antes dele e o
+      // resto de uma transmissao anterior (uma religacao, uma reconstrucao) e nao faz
+      // nascer nada -- senao ficava um <video> vazio a dizer «a espera da imagem».
+      if (corpo[0] !== ETIQUETA_CODEC) return;
       // Com som: é o ecrã de outra pessoa, e o que ela partilhou inclui o que se ouvia.
       fluxo = fluxoDePedacos(true, texto => fluxoAvariou(chave, texto));
       fluxosRecebidos.set(chave, fluxo);
@@ -5145,10 +5152,11 @@ function palcoDeTransmissao(quem, canal, outros) {
   const qual = qualidadeDe(quem);
   if (qual) {
     const selo = elemento('span', 'palco__selo', qual);
+    selo.dataset.qualidade = '1';   // o evento do ritmo encontra-o por aqui (#113)
     // A explicação vive AQUI e não numa nota à parte: é neste número que a pessoa repara
     // quando ele não é o que ela escolheu, e é aqui que a pergunta nasce.
     const porque = souEu ? porqueEstaResolucao() : null;
-    selo.title = porque || 'a resolução e o ritmo desta transmissão';
+    selo.title = porque || (souEu ? explicacaoDoRitmo() : 'a resolução e o ritmo desta transmissão');
     if (porque && voz.qualidadeEmUso && voz.ecraTamanho
         && voz.qualidadeEmUso.altura && voz.ecraTamanho.altura < voz.qualidadeEmUso.altura) {
       selo.classList.add('palco__selo--nota');
@@ -5634,14 +5642,42 @@ listen('erro-dados', ev => {
   faixa.textContent = '⚠ ' + texto;
 });
 
-listen('partilha-aviso', ev => {
-  partilhaAviso = String(ev.payload || '');
-  console.warn('aviso da partilha:', partilhaAviso);
-  desenharRodape();
-});
+/** Os avisos sobre a partilha em curso, que não a impedem — UM por chave (#41).
+ *
+ *  Era uma string única, e o aviso seguinte apagava o anterior: o da imagem que não chega
+ *  apagava o do eco, que é o que faz a pessoa desligar o som da partilha. Um texto vazio
+ *  retira o aviso dessa chave. */
+const partilhaAvisos = new Map();
 
-/** Um aviso sobre a partilha em curso, que não a impede. */
-let partilhaAviso = null;
+function receberAvisoDaPartilha(payload) {
+  const objecto = payload && typeof payload === 'object';
+  const chave = objecto ? String(payload.chave || 'geral') : 'geral';
+  const texto = objecto ? String(payload.texto || '') : String(payload || '');
+  if (texto) partilhaAvisos.set(chave, texto); else partilhaAvisos.delete(chave);
+  console.warn('aviso da partilha:', chave, texto || '(retirado)');
+  desenharRodape();
+}
+
+function textoDosAvisos() {
+  return [...partilhaAvisos.values()].join(' · ') || null;
+}
+
+listen('partilha-aviso', ev => receberAvisoDaPartilha(ev.payload));
+
+/** O ritmo medido da captura (#113): frames por segundo que saem MESMO, não os pedidos. */
+let ritmosRegistados = null;   // o autoteste liga isto para os guardar
+listen('partilha-ritmo', ev => {
+  const r = ev.payload && typeof ev.payload === 'object' ? ev.payload : null;
+  if (!r) return;
+  voz.ritmoMedido = { ips: Number(r.ips) || 0, largados: Number(r.largados) || 0, s: Number(r.s) || 0 };
+  if (ritmosRegistados) ritmosRegistados.push(voz.ritmoMedido.ips);
+  // O selo da qualidade muda NO SÍTIO, sem redesenhar o palco.
+  const selo = document.querySelector('.palco__selo[data-qualidade]');
+  if (selo && voz.aVer === voz.eu) {
+    selo.textContent = rotuloDaQualidade();
+    selo.title = porqueEstaResolucao() || explicacaoDoRitmo();
+  }
+});
 
 listen('partilha-falhou', ev => {
   const razao = String(ev.payload || 'a captura parou');
@@ -5847,9 +5883,9 @@ async function desenharRodape() {
     $('#btn-partilhar').classList.toggle('is-on', !!voz.ecra);
     $('#btn-partilhar').classList.toggle('is-cortado', !!partilhaFalhou);
     $('#btn-partilhar').title = partilhaFalhou
-      || partilhaAviso
+      || textoDosAvisos()
       || (voz.ecra ? 'Parar de partilhar' : 'Partilhar ecrã');
-    $('#btn-partilhar').classList.toggle('is-avisado', !partilhaFalhou && !!partilhaAviso);
+    $('#btn-partilhar').classList.toggle('is-avisado', !partilhaFalhou && !!textoDosAvisos());
     $('#btn-camara').disabled = false;
     $('#btn-camara').classList.toggle('is-on', !!voz.camara);
     $('#btn-camara').classList.toggle('is-cortado', !!camaraFalhou);
@@ -6140,15 +6176,28 @@ addEventListener('resize', () => { if (voz.canal) desenharVoz(); });
  */
 const PROTOCOLO = 2;
 
-/** "1440p 60FPS" — como o Discord o escreve, e a partir dos números que valem mesmo.
+/** "1440p · 12 ips" — a partir dos números que valem mesmo.
  *
  *  Mostra-se sempre o MEDIDO e não o pedido, porque é o medido que a outra pessoa recebe.
- *  Com "Nativa" o pedido é zero, e mesmo com um número o Rust arredonda para blocos pares.
+ *  A altura já vinha do Rust; o ritmo era o número do MENU, e o projecto já tinha provado
+ *  por escrito que os dois não são a mesma coisa («pedidos 15 ips, entregues 2,1/s»). O
+ *  ritmo passa a ser o do vigia (#113); até à primeira medida mostra-se o pedido, com o
+ *  «FPS» de antes, para se distinguir.
  */
 function rotuloDaQualidade() {
   const q = voz.qualidadeEmUso || qualidadeEfetiva();
   const alt = (voz.ecraTamanho && voz.ecraTamanho.altura) || q.altura;
-  return `${alt ? alt + 'p' : 'Nativa'} ${q.fps}FPS`;
+  const nome = alt ? alt + 'p' : 'Nativa';
+  const r = voz.ritmoMedido;
+  if (!r) return `${nome} ${q.fps}FPS`;
+  const ips = r.ips < 10 ? r.ips.toFixed(1) : String(Math.round(r.ips));
+  return `${nome} · ${ips} ips`;
+}
+
+/** Porque é que o ritmo não é o que se pediu — quase nunca é. */
+function explicacaoDoRitmo() {
+  const q = voz.qualidadeEmUso || qualidadeEfetiva();
+  return `pediste ${q.fps} ips; o Windows só entrega imagem quando o ecrã muda, e este é o ritmo a que ela saiu mesmo`;
 }
 
 /** Porque é que o número não é o que a pessoa escolheu, quando não é.
@@ -6511,6 +6560,7 @@ function pararDeAssistir() {
   if (!window.__TAURI__) return;
   const segundos = await invoke('autoteste_pedido').catch(() => 0);
   if (!segundos) return;
+  ritmosRegistados = [];
 
   const diz = linha => invoke('capacidades', { linha }).catch(() => {});
   const fluxo = fluxoDePedacos();
@@ -6562,6 +6612,17 @@ function pararDeAssistir() {
   }
   await espera(Math.max(0, segundos * 1000 - (performance.now() - t0)));
   diz(`autoteste: ${entradas} espectadores entraram a meio`);
+  {
+    // O ritmo que a interface recebeu (#113) tem de bater com os `enviados` da linha
+    // `[ecrã] Ns:` do Rust — dois contadores independentes da mesma fonte. E os avisos
+    // com chave (#41) dizem o que ficou de pé no fim.
+    const rs = ritmosRegistados || [];
+    ritmosRegistados = null;
+    const media = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : 0;
+    diz(`autoteste ritmo: amostras=${rs.length} media=${media.toFixed(2)} ips`
+      + ` ultimo=${rs.length ? rs[rs.length - 1].toFixed(2) : '?'}`
+      + ` rotulo="${rotuloDaQualidade()}" avisos=${JSON.stringify([...partilhaAvisos])}`);
+  }
   await invoke('parar_de_partilhar').catch(() => {});
 
   const v = fluxo.el;
@@ -6950,7 +7011,7 @@ function pararDeAssistir() {
       const cams = [...camarasRecebidas.entries()]
         .map(([k, c]) => `${k.slice(0, 6)} ${c.frames} frames`).join(' | ');
       // Um aviso sobre a partilha tem de CHEGAR a interface, e nao ficar num eprintln.
-      if (partilhaAviso) diz(`par AVISO na interface: "${partilhaAviso.slice(0, 72)}"`);
+      { const av = textoDosAvisos(); if (av) diz(`par AVISO na interface: "${av.slice(0, 72)}"`); }
       diz(`par ${volta}/6: ${gente.length} presente(s) ${resumo || '(sem ligações)'}`
         // A RELIGACAO (#50, #51, #56). Numa sala de duas pessoas o maximo de ligados tem de
         // ser 1: acima disso e o contador a somar eventos que nao se anulam.
@@ -8137,6 +8198,33 @@ function pararDeAssistir() {
     desenharVoz();
   } catch (e) {
     diz(`ui fluxo: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- OS AVISOS COM CHAVE E O RITMO MEDIDO (#41, #113) ----
+  try {
+    partilhaAvisos.clear();
+    receberAvisoDaPartilha({ chave: 'som', texto: 'o som vai com eco' });
+    receberAvisoDaPartilha({ chave: 'imagem', texto: 'ainda não chegou imagem nenhuma' });
+    const dois = textoDosAvisos();
+    receberAvisoDaPartilha({ chave: 'imagem', texto: '' });
+    const um = textoDosAvisos();
+    receberAvisoDaPartilha('à antiga');
+    const antigo = partilhaAvisos.get('geral');
+    partilhaAvisos.clear();
+    const qAntes = voz.qualidadeEmUso, tAntes = voz.ecraTamanho, rAntes = voz.ritmoMedido;
+    voz.qualidadeEmUso = { altura: 1440, fps: 60, debito: 0, som: true };
+    voz.ecraTamanho = { largura: 2560, altura: 1440 };
+    voz.ritmoMedido = null;
+    const semMedida = rotuloDaQualidade();
+    voz.ritmoMedido = { ips: 12.4, largados: 0, s: 5 };
+    const comMedida = rotuloDaQualidade();
+    voz.ritmoMedido = { ips: 2.34, largados: 0, s: 5 };
+    const lento = rotuloDaQualidade();
+    voz.qualidadeEmUso = qAntes; voz.ecraTamanho = tAntes; voz.ritmoMedido = rAntes;
+    diz(`ui avisos com chave: dois="${dois}" um="${um}" antigo="${antigo}"`
+      + ` | rotulo sem-medida="${semMedida}" com-medida="${comMedida}" lento="${lento}"`);
+  } catch (e) {
+    diz(`ui avisos: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----

@@ -559,6 +559,15 @@ impl Codificador {
             atributos.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
             // Diz ao codificador para não juntar frames à espera de comprimir melhor.
             atributos.SetUINT32(&MF_LOW_LATENCY, 1)?;
+            // SEM O TRAVAO DO SINK WRITER (#41, medido no lote 6). Por omissao o `WriteSample`
+            // BLOQUEIA quando um fluxo vai muito a frente do outro. Num ecra parado o video nao
+            // entrega nada e o som continua: ao fim de uns segundos o som estava a frente, o
+            // `WriteSample` do som bloqueava a thread do codificador, os frames de video que
+            // entretanto chegavam enchiam a fila e eram LARGADOS -- 12 em 16, medido com
+            // `BRUMA_SEM_FRAMES_ATE_S=5` -- e o vigia acusava «o codificador nao acompanha»
+            // por uma coisa que nao era o codificador. Numa transmissao ao vivo o video que
+            // nao existe nao e atraso: e ausencia, e o som tem de seguir sem esperar por ele.
+            atributos.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
 
             let escritor = MFCreateSinkWriterFromMediaSink(&sink, &atributos)?;
 
