@@ -3942,8 +3942,19 @@ async function desenharDiagnostico() {
         + ` (${c.total} nesta chamada,`
         + ` ${c.saltado.toFixed(1)} s saltados) · folga ${Math.round(c.folga * 1000)} ms`
       : '';
+    // O CAMINHO (#115): o que está mesmo a sair e o que o controlo de congestão deixa em
+    // voo. É uma estimativa grosseira e diz-se assim; o que não se faz é decidir por ela.
+    const rede = typeof e.txKbps === 'number'
+      ? ` · a enviar ${Math.round(e.txKbps)} kbit/s`
+        + (typeof e.cwnd === 'number' ? ` (janela ${Math.round(e.cwnd / 1024)} KiB)` : '')
+        + (typeof e.perdidosS === 'number' && e.perdidosS > 0
+          ? ` · ${e.perdidosS.toFixed(1)} pacotes perdidos/s` : '')
+      : '';
+    // OS ITENS SALTADOS NO CANAL (#166): uma cota superior, dita com esse nome.
+    const saltados = e.perdidosNoCanal > 0
+      ? ` · ${e.perdidosNoCanal} itens saltados no canal de difusão` : '';
     const d = elemento('span', (mudoDesdeSempre || calouSeAgora) ? 'diag__mudo' : null,
-      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}${cortes}${escrita}${cortado}`);
+      `${caminho}${ms} · ${voz_}${perda}${recusado}${desde}${cortes}${escrita}${cortado}${rede}${saltados}`);
     linha.append(d);
     alvo.append(linha);
   }
@@ -5642,6 +5653,68 @@ listen('erro-dados', ev => {
   faixa.textContent = '⚠ ' + texto;
 });
 
+/** A decisão do aviso de rede (#133), pura. `historico` são as últimas fotografias
+ *  `{env, cortados}` de um espectador, uma por tique de 3 s do rodapé; `avisado` é o que
+ *  está de pé. Avisa quando, nas DUAS últimas janelas, se cortou 20 % ou mais com pelo
+ *  menos 5 fragmentos em jogo; retira quando as duas últimas ficaram abaixo de 5 %. Entre
+ *  os dois limiares fica como estava — é a histerese que evita o botão a piscar.
+ *
+ *  «Cortados» são os fragmentos que o escritor deitou fora por a escrita para aquele par
+ *  estar atrasada (#114). É a metade barata do #133: dizer, com um número, o que antes só o
+ *  registo sabia. Baixar o débito sozinho é a metade cara, e fica para quando houver um
+ *  caminho EUA-Brasil para a medir. */
+function decidirAvisoDaRede(historico, avisado) {
+  if (historico.length < 3) return avisado;
+  const pct = i => {
+    const a = historico[i - 1];
+    const b = historico[i];
+    const env = b.env - a.env;
+    const cort = b.cortados - a.cortados;
+    return env + cort >= 5 ? cort / (env + cort) : null;
+  };
+  const n = historico.length;
+  const p1 = pct(n - 1);
+  const p2 = pct(n - 2);
+  if (p1 != null && p2 != null && p1 >= 0.2 && p2 >= 0.2) {
+    return { pct: Math.round(Math.max(p1, p2) * 100) };
+  }
+  if ((p1 == null || p1 < 0.05) && (p2 == null || p2 < 0.05)) return null;
+  return avisado;
+}
+
+const historicoDaRede = new Map();   // peer -> [{env, cortados}]
+let avisoDaRede = null;              // {peer, pct} enquanto está de pé
+
+/** Corre no tique do rodapé, com o `qualidade` acabado de ler. Mexe em `partilhaAvisos`
+ *  directamente — o rodapé está a ser desenhado neste preciso momento. */
+function vigiarARede(estado) {
+  if (!voz.ecra) {
+    if (avisoDaRede) { avisoDaRede = null; partilhaAvisos.delete('rede'); }
+    historicoDaRede.clear();
+    return;
+  }
+  let pior = null;
+  for (const e of estado) {
+    if (e.morta || !voz.aSerVistoPor.has(e.peer)) continue;
+    const h = historicoDaRede.get(e.peer) || [];
+    h.push({ env: e.ecraEnviado || 0, cortados: e.videoCortado || 0 });
+    while (h.length > 4) h.shift();
+    historicoDaRede.set(e.peer, h);
+    const antes = avisoDaRede && avisoDaRede.peer === e.peer ? { pct: avisoDaRede.pct } : null;
+    const decisao = decidirAvisoDaRede(h, antes);
+    if (decisao && (!pior || decisao.pct > pior.pct)) pior = { peer: e.peer, pct: decisao.pct };
+  }
+  if (pior && (!avisoDaRede || avisoDaRede.peer !== pior.peer || avisoDaRede.pct !== pior.pct)) {
+    avisoDaRede = pior;
+    partilhaAvisos.set('rede', `a ligação a ${nomeDoPeer(pior.peer)} está a perder`
+      + ` ${pior.pct}% dos fragmentos de imagem — experimenta 1080p ou 6 Mbps`);
+    console.warn('aviso da partilha: rede', partilhaAvisos.get('rede'));
+  } else if (!pior && avisoDaRede) {
+    avisoDaRede = null;
+    partilhaAvisos.delete('rede');
+  }
+}
+
 /** Os avisos sobre a partilha em curso, que não a impedem — UM por chave (#41).
  *
  *  Era uma string única, e o aviso seguinte apagava o anterior: o da imagem que não chega
@@ -5834,6 +5907,7 @@ async function qualidadeDaLigacao() {
   const estado = await invoke('qualidade', { peers: gente }).catch(() => null);
   if (!estado || !estado.length) return { ok: false, texto: 'A ligar…' };
   ultimoEstadoDaVoz = estado;
+  vigiarARede(estado);
 
   // 1. O TRANSPORTE RECUSA A MINHA VOZ? É a avaria mais grave e a mais calada: o
   //    `send_datagram` falha, ninguém conta, e a app diz que está tudo bem.
@@ -6998,6 +7072,10 @@ function pararDeAssistir() {
         // mais abrir. Com a medida a caducar, os dois voltam a andar juntos.
         + ` escrita=${e.escritaUltimaMs}ms/${e.escritaPiorMs}ms cortados=${e.videoCortado}`
         + ` ecra-env=${e.ecraEnviado}`
+        // A camara a parte, os saltados no canal e o caminho (#133, #166, #115).
+        + ` camara-env=${e.camaraEnviado} perdidos-canal=${e.perdidosNoCanal}`
+        + ` tx=${typeof e.txKbps === 'number' ? Math.round(e.txKbps) + 'kbps' : '?'}`
+        + ` cwnd=${typeof e.cwnd === 'number' ? e.cwnd : '?'}`
         // Os cortes tambem saem no --par (#65): sem isto, a unica forma de saber que a voz
         // picou era alguem estar a ouvi-la no momento.
         + (() => {
@@ -8225,6 +8303,28 @@ function pararDeAssistir() {
       + ` | rotulo sem-medida="${semMedida}" com-medida="${comMedida}" lento="${lento}"`);
   } catch (e) {
     diz(`ui avisos: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O AVISO DE REDE, DECIDIDO SEM REDE (#133) ----
+  try {
+    const foto = (env, cortados) => ({ env, cortados });
+    // 30 % cortado em duas janelas seguidas: avisa.
+    const mau = [foto(0, 0), foto(10, 4), foto(20, 8), foto(30, 12)];
+    const a1 = decidirAvisoDaRede(mau, null);
+    // Abaixo de 5 % nas duas ultimas, com o aviso de pe: retira.
+    const bom = [foto(0, 0), foto(10, 0), foto(20, 0), foto(30, 0)];
+    const a2 = decidirAvisoDaRede(bom, { pct: 30 });
+    // No meio (10 %): fica como estava, nas duas direccoes.
+    const meio = [foto(0, 0), foto(9, 1), foto(18, 2), foto(27, 3)];
+    const a3 = decidirAvisoDaRede(meio, { pct: 30 });
+    const a4 = decidirAvisoDaRede(meio, null);
+    // Poucos fragmentos em jogo (<5): nao se conclui nada.
+    const poucos = [foto(0, 0), foto(1, 1), foto(2, 2), foto(3, 3)];
+    const a5 = decidirAvisoDaRede(poucos, null);
+    diz(`ui aviso de rede: mau=${JSON.stringify(a1)} bom-retira=${a2 === null}`
+      + ` meio-mantem=${JSON.stringify(a3)}/${a4 === null} poucos=${a5 === null}`);
+  } catch (e) {
+    diz(`ui aviso de rede: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----

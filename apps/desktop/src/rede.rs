@@ -312,9 +312,43 @@ pub struct Contagem {
     /// de onde ela pode vir: o receptor, sozinho, não tem como distinguir «ele calou-se» de
     /// «perdi trinta pacotes».
     pub disse_ter_enviado: u64,
+    /// Itens do canal de difusão que ESTA sessão saltou por se ter atrasado (#166): texto,
+    /// presença, `Vozes`, `Sinal`, `Video` de todos os pares — e não «fragmentos de imagem
+    /// deste par». O texto volta pelo `SyncPara`; a imagem não. Acumula desde que a app
+    /// abriu. Ficava num `eprintln!` que ninguém abre durante uma chamada.
+    pub perdidos_no_canal: u64,
+    /// Frames de câmara enviados, à parte do ecrã (#133). O `ecra_env` contava os dois, e
+    /// «sem espectadores não sai um byte de ecrã» (#71) não se conseguia medir com a câmara
+    /// ligada.
+    pub camara_env: u64,
+    /// A fotografia da ligação de há um segundo, para os ritmos do caminho (#115): quando,
+    /// bytes UDP enviados, pacotes perdidos.
+    amostra_do_caminho: Option<(std::time::Instant, u64, u64)>,
+    /// O que o caminho fez no último segundo medido (#115): kbit/s enviados e pacotes
+    /// perdidos por segundo. `None` até haver duas fotografias — ausência de medida não é
+    /// zero (#171).
+    pub tx_kbps: Option<f64>,
+    pub perdidos_s: Option<f64>,
 }
 
 impl Contagem {
+    /// Actualiza os ritmos do caminho a partir das estatísticas da ligação (#115), se já
+    /// passou um segundo desde a última fotografia. Recebe os números e não o tipo das
+    /// `stats`: só se lê deles, nunca se constrói nenhum.
+    pub fn recalcular_caminho(&mut self, agora: std::time::Instant, tx_bytes: u64, perdidos: u64) {
+        match self.amostra_do_caminho {
+            Some((quando, tx0, p0)) => {
+                let dt = agora.duration_since(quando).as_secs_f64();
+                if dt >= 1.0 {
+                    self.tx_kbps = Some(tx_bytes.saturating_sub(tx0) as f64 * 8.0 / dt / 1000.0);
+                    self.perdidos_s = Some(perdidos.saturating_sub(p0) as f64 / dt);
+                    self.amostra_do_caminho = Some((agora, tx_bytes, perdidos));
+                }
+            }
+            None => self.amostra_do_caminho = Some((agora, tx_bytes, perdidos)),
+        }
+    }
+
     /// Actualiza o ritmo, se já passou tempo suficiente desde a última vez.
     ///
     /// Corre quando a interface pergunta (uma vez por segundo), e não a cada datagrama: a cada
@@ -2441,7 +2475,14 @@ async fn sessao(
                                 None
                             } else {
                             if let Ok(mut n) = rede.contagem.lock() {
-                                n.entry(peer.clone()).or_default().ecra_env += 1;
+                                // O ecrã e a câmara contam-se à parte (#133): passam pelo
+                                // mesmo braço, e o `ecra_env` somava os dois.
+                                let e = n.entry(peer.clone()).or_default();
+                                if tipo == "ecra" {
+                                    e.ecra_env += 1;
+                                } else {
+                                    e.camara_env += 1;
+                                }
                             }
                             let q = Quadro::Video {
                                 tipo: tipo.to_string(),
@@ -2523,6 +2564,11 @@ async fn sessao(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // O NÚMERO CHEGA À INTERFACE (#166), em vez de ficar só no registo: é a
+                    // única prova de que a imagem partida daquele momento tem explicação.
+                    if let Ok(mut mapa) = rede.contagem.lock() {
+                        mapa.entry(peer.clone()).or_default().perdidos_no_canal += n;
+                    }
                     // POR AQUI NÃO PASSA SÓ IMAGEM: PASSA TEXTO (#53).
                     //
                     // O comentário que aqui estava dizia que os frames de ecrã e de câmara

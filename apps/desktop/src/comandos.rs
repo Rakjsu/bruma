@@ -1617,10 +1617,18 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                     "haQuantoRec": null, "vozFalhados": 0, "perda": null,
                     "disseTerEnviado": 0, "filaLivre": 0,
                     "ecraEnviado": 0, "ecraRecebido": 0,
+                    "camaraEnviado": 0, "perdidosNoCanal": 0,
+                    "txKbps": null, "perdidosS": null, "cwnd": null,
                 }));
             }
             let caminhos = c.paths();
             let escolhido = caminhos.iter().find(|x| x.is_selected());
+            // A janela de congestão do caminho escolhido (#115): o que o controlo deixa em
+            // voo. Uma estimativa grosseira do que o caminho aguenta, dita como tal.
+            let cwnd = escolhido
+                .as_ref()
+                .and_then(|x| c.congestion_state(x.id()))
+                .map(|k| k.window());
             // ZERO NÃO É «ZERO MILISSEGUNDOS», É «NINGUÉM MEDIU» (#171).
             //
             // O rodapé fazia `pior = max(0, ...ms)` e, se desse zero, escrevia «Voz
@@ -1645,13 +1653,19 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 None => ("desconhecido", None),
             };
             let agora = std::time::Instant::now();
+            // O QUE A LIGAÇÃO SABE (#115): só se lê. `cwnd` é o que o controlo de congestão
+            // deixa em voo — uma estimativa grosseira do que o caminho aguenta, e é dita
+            // como tal; os bytes UDP enviados dão o débito REAL que está a sair, que é o
+            // número a comparar com o débito que se escolheu para a partilha.
+            let st = c.stats();
             let n = rede
                 .contagem
                 .lock()
                 .ok()
-                .map(|mut c| {
-                    let e = c.entry(p.clone()).or_default();
+                .map(|mut m| {
+                    let e = m.entry(p.clone()).or_default();
                     e.recalcular_ritmo(agora);
+                    e.recalcular_caminho(agora, st.udp_tx.bytes, st.lost_packets);
                     (*e, e.ha_quanto_rec(agora))
                 })
                 .unwrap_or_default();
@@ -1680,6 +1694,10 @@ pub fn qualidade(peers: Vec<String>, rede: State<Arc<Rede>>) -> Vec<serde_json::
                 "perda": n.perda_por_cento(),
                 "disseTerEnviado": n.disse_ter_enviado,
                 "ecraEnviado": n.ecra_env, "ecraRecebido": n.ecra_rec,
+                // A CÂMARA À PARTE e os itens saltados no canal (#133, #166).
+                "camaraEnviado": n.camara_env, "perdidosNoCanal": n.perdidos_no_canal,
+                // O CAMINHO (#115): `null` até haver duas fotografias.
+                "txKbps": n.tx_kbps, "perdidosS": n.perdidos_s, "cwnd": cwnd,
             }))
         })
         .collect()
