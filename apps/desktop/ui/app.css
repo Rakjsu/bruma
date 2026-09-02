@@ -1282,6 +1282,9 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .ico2.is-on { background: var(--mist-lo); color: var(--mist); }
 
 .ico.is-cortado { color: var(--rose); }
+/* O `#btn-partilhar` e o `#btn-camara` sao `.ico2`, e so havia `.ico.is-cortado`: a razao da
+   avaria ia para o `title` e o botao nunca mudava de cor (#44). */
+.ico2.is-cortado { color: var(--rose); }
 /* O âmbar do aviso: nem tudo o que está mal está CORTADO. Um microfone que não capta, ou
    uma supressão de ruído que o dispositivo recusou mudar, são avisos — pintá-los de
    vermelho dizia «desligado», que é outra coisa. */
@@ -1470,3 +1473,14 @@ body.ghost .app { transition: filter .8s var(--ease); }
 /* O sinal «ainda a medir» (#171): nem verde nem fraco. Zero milissegundos e «ninguém mediu»
    davam a mesma cor, e uma delas é uma promessa que não se pode fazer. */
 .is-neutro { opacity: .55; filter: grayscale(1); }
+
+/* A nota do seletor (#44): porque e que a ultima escolha nao deu. */
+.fontes__nota { margin: 8px 0 0; color: var(--amber); font-size: 13px; }
+
+/* O cartao de uma fonte sem miniatura (#45): tem o tamanho de uma, para a grelha nao
+   saltar, e diz porque. */
+.fonte--sem-imagem .fonte__sem-imagem {
+  display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 16 / 9; width: 100%; background: var(--raise);
+  color: var(--dim); font-size: 12px; border-radius: 6px;
+}

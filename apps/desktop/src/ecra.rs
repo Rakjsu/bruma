@@ -23,24 +23,61 @@ use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// O que se vai capturar: um monitor pelo índice, ou uma janela pelo handle.
+/// Como se identifica um ecrã (#168).
+///
+/// O seletor emitia `ecra:{i+1}` pela ORDEM do `Monitor::enumerate()`, e o arranque fazia
+/// `from_index(i)` — que é literalmente `enumerate().get(i-1)`. Entre o seletor abrir e a
+/// pessoa carregar, ligar ou desligar um monitor muda a ordem, e partilhava-se o ecrã
+/// errado sem ninguém dar por isso. O nome do dispositivo (`\\.\DISPLAY2`) não muda com
+/// a ordem: é ele que vai no id, e resolve-se por ele.
+///
+/// O índice continua a aceitar-se — `--fonte=ecra:1` está no README e no autoteste — mas
+/// deixa de ser o que o seletor produz.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QualEcra {
+    Indice(usize),
+    Nome(String),
+}
+
+/// O que se vai capturar: um monitor, ou uma janela pelo handle.
 ///
 /// O handle é só um número — reconstrói-se o `Window` dentro da thread da captura,
-/// porque os tipos do capturador guardam ponteiros que não atravessam threads.
-#[derive(Clone, Copy)]
+/// porque os tipos do capturador guardam ponteiros que não atravessam threads. O `pid`
+/// vai ao lado (#168): um HWND é reciclado pelo Windows quando a janela fecha, e um handle
+/// sozinho podia apontar para uma janela DIFERENTE da que a pessoa escolheu. Com o pid
+/// confere-se em `tamanho_do_alvo` que ainda é a mesma.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Alvo {
-    Ecra(usize),
-    Janela(isize),
+    Ecra(QualEcra),
+    Janela(isize, Option<u32>),
 }
 
 impl Alvo {
-    /// `ecra:0` ou `janela:123456`, tal como o seletor os anuncia.
+    /// `ecra:\\.\DISPLAY1` (ou `ecra:1`, à antiga) e `janela:<hwnd>:<pid>` (ou
+    /// `janela:<hwnd>`, à antiga), tal como o seletor os anuncia.
     pub fn analisar(texto: &str) -> Result<Self> {
         if let Some(n) = texto.strip_prefix("ecra:") {
-            return Ok(Alvo::Ecra(n.parse()?));
+            return Ok(match n.parse::<usize>() {
+                Ok(i) => Alvo::Ecra(QualEcra::Indice(i)),
+                Err(_) if !n.is_empty() => Alvo::Ecra(QualEcra::Nome(n.to_string())),
+                Err(e) => return Err(anyhow!("fonte inválida: {e}")),
+            });
         }
-        if let Some(n) = texto.strip_prefix("janela:") {
-            return Ok(Alvo::Janela(n.parse()?));
+        if let Some(resto) = texto.strip_prefix("janela:") {
+            let mut partes = resto.splitn(2, ':');
+            let hwnd: isize = partes
+                .next()
+                .unwrap_or("")
+                .parse()
+                .map_err(|e| anyhow!("fonte inválida: {e}"))?;
+            let pid = match partes.next() {
+                Some(p) => Some(
+                    p.parse::<u32>()
+                        .map_err(|e| anyhow!("fonte inválida: {e}"))?,
+                ),
+                None => None,
+            };
+            return Ok(Alvo::Janela(hwnd, pid));
         }
         Err(anyhow!("fonte desconhecida: {texto}"))
     }
@@ -379,20 +416,52 @@ mod win {
         (bruto as u32).clamp(2_500_000, 20_000_000)
     }
 
-    fn tamanho_do_alvo(alvo: super::Alvo) -> Result<(u32, u32)> {
+    /// Encontra o monitor pelo que o id diz — pelo NOME quando o há (#168).
+    pub(super) fn monitor_de(qual: &super::QualEcra) -> Result<Monitor> {
+        match qual {
+            super::QualEcra::Indice(i) => {
+                Monitor::from_index(*i).map_err(|e| anyhow!("sem esse ecrã: {e:?}"))
+            }
+            super::QualEcra::Nome(nome) => Monitor::enumerate()
+                .map_err(|e| anyhow!("sem esse ecrã: {e:?}"))?
+                .into_iter()
+                .find(|m| m.device_name().map(|n| &n == nome).unwrap_or(false))
+                .ok_or_else(|| anyhow!("esse ecrã já não está ligado: {nome}")),
+        }
+    }
+
+    /// Reconstrói a janela e confere que AINDA é a mesma (#168).
+    pub(super) fn janela_de(h: isize, pid: Option<u32>) -> Result<Window> {
+        let j = Window::from_raw_hwnd(h as *mut std::ffi::c_void);
+        if !j.is_valid() {
+            return Err(anyhow!("essa janela já fechou"));
+        }
+        if let Some(esperado) = pid {
+            let mut agora = 0u32;
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    windows::Win32::Foundation::HWND(h as *mut std::ffi::c_void),
+                    Some(&mut agora),
+                );
+            }
+            if agora != esperado {
+                return Err(anyhow!("essa janela já não é a mesma"));
+            }
+        }
+        Ok(j)
+    }
+
+    fn tamanho_do_alvo(alvo: &super::Alvo) -> Result<(u32, u32)> {
         match alvo {
-            super::Alvo::Ecra(i) => {
-                let m = Monitor::from_index(i).map_err(|e| anyhow!("sem esse ecrã: {e:?}"))?;
+            super::Alvo::Ecra(qual) => {
+                let m = monitor_de(qual)?;
                 Ok((
                     m.width().map_err(|e| anyhow!("{e:?}"))?,
                     m.height().map_err(|e| anyhow!("{e:?}"))?,
                 ))
             }
-            super::Alvo::Janela(h) => {
-                let j = Window::from_raw_hwnd(h as *mut std::ffi::c_void);
-                if !j.is_valid() {
-                    return Err(anyhow!("essa janela já fechou"));
-                }
+            super::Alvo::Janela(h, pid) => {
+                let j = janela_de(*h, *pid)?;
                 Ok((
                     j.width().map_err(|e| anyhow!("{e:?}"))? as u32,
                     j.height().map_err(|e| anyhow!("{e:?}"))? as u32,
@@ -519,7 +588,7 @@ mod win {
             })
         };
 
-        let (lar, alt) = tamanho_do_alvo(alvo)?;
+        let (lar, alt) = tamanho_do_alvo(&alvo)?;
         let (ls, aa) = caber(lar, alt, qualidade.max_altura);
         let fps = qualidade.fps.clamp(15, 60);
         let bitrate = if qualidade.debito > 0 {
@@ -706,19 +775,24 @@ mod win {
             // Isto só passou a ser seguro hoje: enquanto o codificador vivia dentro da
             // `Sessao`, ela guardava ponteiros COM e precisava de um `unsafe impl Send` com
             // a promessa de nunca atravessar threads. Agora guarda um canal e números.
-            let controlo = match alvo {
-                super::Alvo::Ecra(i) => match Monitor::from_index(i) {
+            let controlo = match &alvo {
+                super::Alvo::Ecra(qual) => match monitor_de(qual) {
                     Ok(m) => Sessao::start_free_threaded(definicoes(m, flags)),
                     Err(e) => {
                         eprintln!("[ecrã] o ecrã desapareceu: {e:?}");
-                        queixa(format!("esse ecrã já não existe: {e:?}"));
+                        queixa(format!("esse ecrã já não existe: {e}"));
                         return;
                     }
                 },
-                super::Alvo::Janela(h) => Sessao::start_free_threaded(definicoes(
-                    Window::from_raw_hwnd(h as *mut std::ffi::c_void),
-                    flags,
-                )),
+                // A segunda resolução confere OUTRA vez: entre o `tamanho_do_alvo` e este
+                // ponto passaram uns milissegundos, e é o suficiente para uma janela fechar.
+                super::Alvo::Janela(h, pid) => match janela_de(*h, *pid) {
+                    Ok(j) => Sessao::start_free_threaded(definicoes(j, flags)),
+                    Err(e) => {
+                        queixa(e.to_string());
+                        return;
+                    }
+                },
             };
             // `BRUMA_FALHA_CAPTURA=1` finge uma captura que morre DEPOIS de o comando já
             // ter respondido `Ok`. É o único caminho de falha que não se consegue provocar

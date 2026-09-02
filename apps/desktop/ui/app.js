@@ -4331,11 +4331,18 @@ function desenharFontes() {
       const img = document.createElement('img');
       img.src = f.miniatura;
       cartao.append(img);
+    } else {
+      // SEM MINIATURA, MAS COM CARTÃO (#45). A pré-visualização é por GDI e a partilha
+      // é por Windows Graphics Capture: falhar a primeira não diz nada sobre a segunda.
+      const caixa = elemento('div', 'fonte__sem-imagem', 'sem pré-visualização');
+      caixa.title = f.porque || 'não consegui pré-visualizar esta janela';
+      cartao.append(caixa);
+      cartao.classList.add('fonte--sem-imagem');
     }
     const nome = elemento('span', null, f.titulo);
     nome.title = f.titulo;
     cartao.append(nome);
-    cartao.onclick = () => { fechar('veu-fontes'); iniciarPartilha(f.id); };
+    cartao.onclick = () => { fechar('veu-fontes'); iniciarPartilha(f.id, true); };
     lista.append(cartao);
   }
 }
@@ -4370,6 +4377,7 @@ function desenharAvisoDeVersao() {
 }
 
 async function escolherFonte() {
+  { const nota = document.querySelector('#nota-fontes'); if (nota) nota.hidden = true; }
   abrir('veu-fontes');
   desenharAvisoDeVersao();
   const lista = $('#lista-fontes');
@@ -4526,7 +4534,30 @@ async function alternarEcra() {
   escolherFonte();
 }
 
-async function iniciarPartilha(fonte) {
+/** Separa `codigo|texto` do Rust (#44). Sem `|`, o código é «outra» e o texto é tudo. */
+function separarErroDePartilha(e) {
+  const t = String(e && e.message ? e.message : e);
+  const i = t.indexOf('|');
+  return i > 0 ? [t.slice(0, i), t.slice(i + 1)] : ['outra', t];
+}
+
+/** A partilha acabou por avaria — venha o aviso do Rust (assíncrono) ou do `invoke`
+ *  (síncrono, #44). Um sítio só para os dois: eram dois caminhos com limpezas diferentes,
+ *  e o síncrono não fazia nenhuma. */
+function partilhaMorreu(razao) {
+  if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
+  if (voz.aVer === voz.eu) voz.aVer = null;
+  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
+  voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
+  partilhaFalhou = razao;
+  invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
+  invoke('parar_de_partilhar').catch(() => {});
+  anunciarEstado();
+  desenharVoz();
+  desenharRodape();
+}
+
+async function iniciarPartilha(fonte, humano = false) {
   if (voz.ecra || !voz.canal || !voz.servidor) return;
   partilhaFalhou = null;
   partilhaAviso = null;
@@ -4554,7 +4585,19 @@ async function iniciarPartilha(fonte) {
       saida: canal,
     });
   } catch (e) {
-    console.warn('não consegui começar a partilhar:', e);
+    // O ERRO QUE SE VÊ (#44). Isto era um `console.warn` e um `return`: a pessoa escolhia
+    // a janela no seletor, o seletor fechava, e não acontecia absolutamente nada —
+    // «essa janela já fechou», «sem esse ecrã», «já estás a partilhar», tudo engolido.
+    const [codigo, texto] = separarErroDePartilha(e);
+    partilhaMorreu(texto);
+    // Reabrir o seletor só faz sentido quando tentar outra vez pode dar — a janela que
+    // fechou entre o clique e o arranque — e só quando foi uma pessoa a carregar: num
+    // arranque automático reabrir em ciclo era pior do que o silêncio.
+    if (codigo === 'janela-fechou' && humano) {
+      await escolherFonte();
+      const nota = document.querySelector('#nota-fontes');
+      if (nota) { nota.textContent = `${texto} — escolhe outra.`; nota.hidden = false; }
+    }
     return;
   }
   // O tamanho REAL com que a captura ficou. Com "Nativa" é a única forma de dizer a quem
@@ -5345,16 +5388,7 @@ let partilhaAviso = null;
 listen('partilha-falhou', ev => {
   const razao = String(ev.payload || 'a captura parou');
   console.warn('a partilha falhou:', razao);
-  if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
-  if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null;
-  voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
-  partilhaFalhou = razao;
-  invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
-  invoke('parar_de_partilhar').catch(() => {});
-  anunciarEstado();
-  desenharVoz();
-  desenharRodape();
+  partilhaMorreu(razao);
 });
 
 /** A última razão por que a partilha morreu, para o botão a poder mostrar. */
@@ -7649,6 +7683,85 @@ function pararDeAssistir() {
       + ` partida-diz="${partida ? partida.rotulo : ''}" sem-camara-sem-marca=${semCamaraSemMarca}`);
   } catch (e) {
     diz(`ui camara: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- COMECAR A PARTILHAR: o erro que se ve, e a fonte com identidade (#44, #168, #45) ----
+  //
+  // O `catch` de `iniciarPartilha` era um `console.warn` e um `return`: a pessoa escolhia a
+  // janela, o seletor fechava, e nao acontecia nada. Mede-se contra o comando de producao
+  // com fontes que o Rust recusa de forma sincrona -- sem thread, sem codificador.
+  try {
+    const antes = { canal: voz.canal, eu: voz.eu, servidor: voz.servidor, srv: servidorAtual,
+      cnl: canalAtual, ecra: voz.ecra, falhou: partilhaFalhou };
+    let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+    if (!srv) {
+      const id = await invoke('criar_servidor', { nome: 'medicao' });
+      await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+      await desenharTudo();
+      srv = vista.servidores.find(x => x.id === id);
+    }
+    const cv = srv.canais.find(c => c.tipo === 'voz');
+    servidorAtual = srv.id; canalAtual = cv.id;
+    voz.eu = 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id; voz.ecra = null;
+    await desenharRodape();
+    const corNormal = getComputedStyle($('#btn-partilhar')).color;
+
+    // 1. Uma janela que ja nao existe (hwnd 1), escolhida por um humano: o erro tem de se
+    //    ver, o botao tem de mudar de cor, e o seletor tem de REABRIR -- so neste caso.
+    partilhaFalhou = null;
+    fechar('veu-fontes');
+    await iniciarPartilha('janela:1:1', true);
+    await desenharRodape();
+    const r1 = {
+      razao: partilhaFalhou,
+      cortado: $('#btn-partilhar').classList.contains('is-cortado'),
+      cor: getComputedStyle($('#btn-partilhar')).color !== corNormal,
+      reabriu: !$('#veu-fontes').hidden,
+      nota: (document.querySelector('#nota-fontes') || {}).textContent || '',
+    };
+    fechar('veu-fontes');
+
+    // 2. Um ecra que nao existe: o erro ve-se, mas o seletor NAO reabre -- tentar outra vez
+    //    nao ia dar.
+    partilhaFalhou = null;
+    await iniciarPartilha('ecra:99', true);
+    await desenharRodape();
+    const r2 = { razao: partilhaFalhou, reabriu: !$('#veu-fontes').hidden };
+    fechar('veu-fontes');
+
+    // 3. A IDENTIDADE (#168): uma janela real com o pid ERRADO tem de ser recusada como
+    //    «ja nao e a mesma» -- e uma janela real com o pid certo passa na verificacao
+    //    sincrona (nao se arranca a captura aqui: bastava chegar ao `tamanho_do_alvo`).
+    const fontes = await invoke('fontes_de_partilha').catch(() => []);
+    const janela = fontes.find(f => /^janela:-?\d+:\d+$/.test(f.id));
+    let r3 = { havia: !!janela };
+    if (janela) {
+      const [, hwnd] = janela.id.split(':');
+      partilhaFalhou = null;
+      await iniciarPartilha(`janela:${hwnd}:1`, false);
+      r3.pidErrado = partilhaFalhou;
+      r3.recusou = /já não é a mesma/.test(partilhaFalhou || '');
+    }
+    const ecras = fontes.filter(f => f.tipo === 'ecra').map(f => f.id);
+    r3.ecrasComNome = ecras.length > 0 && ecras.every(id => /^ecra:\\\\\.\\DISPLAY\d+$/.test(id));
+    r3.ecras = ecras.join(',');
+
+    // 4. O seletor lista as janelas SEM miniatura (#45), com a razao.
+    const semMini = fontes.filter(f => f.tipo === 'janela' && !f.miniatura);
+    const comMini = fontes.filter(f => f.tipo === 'janela' && f.miniatura).length;
+    const r4 = { semMini: semMini.length, comMini, dizPorque: semMini.every(f => !!f.porque) };
+
+    voz.canal = antes.canal; voz.eu = antes.eu; voz.servidor = antes.servidor; voz.ecra = antes.ecra;
+    servidorAtual = antes.srv; canalAtual = antes.cnl; partilhaFalhou = antes.falhou;
+    await desenharRodape();
+    diz(`ui partilha falhou: janela-fechada razao="${r1.razao}" cortado=${r1.cortado}`
+      + ` cor-mudou=${r1.cor} reabriu=${r1.reabriu} nota="${r1.nota.slice(0, 40)}"`
+      + ` | ecra-99 razao="${r2.razao}" reabriu=${r2.reabriu}`);
+    diz(`ui fonte com identidade: havia-janela=${r3.havia} pid-errado="${r3.pidErrado || ''}"`
+      + ` recusou=${r3.recusou} ecras-com-nome=${r3.ecrasComNome} ecras=${r3.ecras}`
+      + ` | sem-miniatura=${r4.semMini} com-miniatura=${r4.comMini} diz-porque=${r4.dizPorque}`);
+  } catch (e) {
+    diz(`ui partilha falhou: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----

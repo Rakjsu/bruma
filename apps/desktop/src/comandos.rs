@@ -996,6 +996,22 @@ pub fn comecar_a_partilhar(
 ) -> R<serde_json::Value> {
     let ecra = ecra.inner().clone();
     let rede = rede.inner().clone();
+    // VERIFICAR PRIMEIRO, MUDAR DEPOIS (#44). Isto mudava `propria`, `onde` e limpava o
+    // `cabecalho` ANTES de olhar para a fonte ou para o estado — e um `Err` a seguir
+    // deixava a pré-visualização sem canal e o cabeçalho de uma partilha VIVA a ser
+    // reenchido com os dois fragmentos seguintes de media. Um erro que devia ser inócuo
+    // partia a partilha que já estava a correr.
+    //
+    // E o erro leva um CÓDIGO à frente, separado por `|`: a interface decide o que fazer
+    // pelo código, nunca pelo texto — o dia em que alguém acentuar a frase, o seletor
+    // deixava de reabrir em silêncio.
+    let alvo = crate::ecra::Alvo::analisar(&fonte).map_err(|e| erro_de_partilha("fonte", e))?;
+    if ecra.estado.lock().map_err(erro)?.a_partilhar() {
+        return Err(erro_de_partilha(
+            "ja-a-partilhar",
+            anyhow::anyhow!("já estás a partilhar"),
+        ));
+    }
     *ecra.propria.lock().unwrap() = Some((saida, false));
     *ecra.onde.lock().unwrap() = Some((servidor.clone(), canal_voz.clone()));
 
@@ -1042,7 +1058,6 @@ pub fn comecar_a_partilhar(
         }
     });
 
-    let alvo = crate::ecra::Alvo::analisar(&fonte).map_err(erro)?;
     let qualidade = crate::ecra::Qualidade {
         max_altura: altura,
         fps,
@@ -1067,9 +1082,36 @@ pub fn comecar_a_partilhar(
     };
     let (largura, altura) = {
         let mut e = ecra.estado.lock().map_err(erro)?;
-        crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa, aviso).map_err(erro)?
+        match crate::ecra::comecar(&mut e, alvo, qualidade, entrega, queixa, aviso) {
+            Ok(t) => t,
+            Err(e) => {
+                // O que se mudou em cima desfaz-se: um `Err` aqui não pode deixar o estado
+                // a dizer que há partilha.
+                *ecra.propria.lock().unwrap() = None;
+                *ecra.onde.lock().unwrap() = None;
+                let codigo = {
+                    let t = e.to_string();
+                    if t.contains("já fechou") || t.contains("já não é a mesma") {
+                        "janela-fechou"
+                    } else if t.contains("sem esse ecrã") || t.contains("já não está ligado") {
+                        "sem-ecra"
+                    } else if t.contains("só existe no Windows") {
+                        "so-windows"
+                    } else {
+                        "outra"
+                    }
+                };
+                return Err(erro_de_partilha(codigo, e));
+            }
+        }
     };
     Ok(serde_json::json!({ "largura": largura, "altura": altura }))
+}
+
+/// Um erro de partilha com um CÓDIGO estável à frente (#44): `janela-fechou|essa janela já
+/// fechou`. A interface separa no primeiro `|` e decide pelo código.
+fn erro_de_partilha(codigo: &str, e: anyhow::Error) -> String {
+    format!("{codigo}|{e}")
 }
 
 #[tauri::command]
