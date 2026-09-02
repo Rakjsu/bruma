@@ -75,6 +75,11 @@ const ANDAIMES: &[&str] = &[
     "BRUMA_SOM_MORRE",
     "BRUMA_SO_NOS",
     "BRUMA_ECO_ANTIGO",
+    "BRUMA_SONDAGEM_RITMO",
+    "BRUMA_SEM_CHAVE_A_PEDIDO",
+    "BRUMA_SOM_NAO_VOLTA",
+    "BRUMA_MOOF_CRU",
+    "BRUMA_SOM_DEMORA_MS",
     // Comandos que so servem para medir.
     "convites_de_teste",
     "escapou_alguma_coisa",

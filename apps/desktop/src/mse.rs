@@ -186,6 +186,11 @@ pub fn codec_do_moov(moov: &[u8]) -> Option<String> {
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Tempos {
     faixas: Vec<(u32, u64)>,
+    /// Medição (#111): amostras da faixa 1 — o vídeo — neste fragmento, e quantas delas
+    /// eram frames completos (sem o bit `sample_is_non_sync`). Viajam com as durações
+    /// porque seguem o mesmo caminho: só contam quando o segmento sai.
+    pub amostras_de_video: u64,
+    pub chaves_de_video: u64,
 }
 
 impl Tempos {
@@ -208,6 +213,8 @@ impl Tempos {
         for (f, t) in &outros.faixas {
             self.somar(*f, *t);
         }
+        self.amostras_de_video += outros.amostras_de_video;
+        self.chaves_de_video += outros.chaves_de_video;
     }
 
     /// A soma de dois relógios, sem mexer em nenhum — para traduzir sem ainda commitar.
@@ -275,7 +282,13 @@ pub fn corrigir_moof(moof: &[u8], posicao: u64, tempos: &Tempos) -> Option<(Vec<
         anterior = traf_fim;
 
         let (tfhd_i, tfhd_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"tfhd")?;
-        let (trun_i, trun_tam) = filha(moof, traf_i + CABECALHO, traf_fim, b"trun")?;
+        // UM `traf` SEM `trun` É VÁLIDO (#43). O `Finalize` pode escrever um com zero
+        // amostras para a faixa que não tinha nada pendente, e a meio um ecrã parado com
+        // som a tocar pode dar o mesmo. Recusar o `moof` inteiro mandava-o cru para o MSE,
+        // que o recusa pelo `base_data_offset`, e o espectador via um erro sem saber
+        // porquê. Sem `trun` a duração é zero e não há `data_offset` a corrigir; o `tfhd`
+        // e o `tfdt` tratam-se como nos outros.
+        let trun = filha(moof, traf_i + CABECALHO, traf_fim, b"trun");
 
         let flags_tfhd = u32_em(moof, tfhd_i + CABECALHO)? & 0x00FF_FFFF;
         if flags_tfhd & TFHD_BASE_DATA_OFFSET == 0 {
@@ -295,7 +308,15 @@ pub fn corrigir_moof(moof: &[u8], posicao: u64, tempos: &Tempos) -> Option<(Vec<
         // O `tfdt` diz onde este fragmento COMEÇA: o tempo desta faixa antes de lhe somar
         // a duração que ele traz.
         let tfdt = caixa_tfdt(tempos.de(faixa) + duracoes.de(faixa));
-        duracoes.somar(faixa, duracao_do_trun(moof, trun_i, trun_tam)?);
+        if let Some((trun_i, trun_tam)) = trun {
+            duracoes.somar(faixa, duracao_do_trun(moof, trun_i, trun_tam)?);
+            if faixa == 1 {
+                let por_omissao = flags_por_omissao_do_tfhd(moof, tfhd_i, tfhd_tam, flags_tfhd);
+                let (amostras, chaves) = amostras_do_trun(moof, trun_i, trun_tam, por_omissao)?;
+                duracoes.amostras_de_video += amostras;
+                duracoes.chaves_de_video += chaves;
+            }
+        }
 
         let novo_traf_tam = traf_tam - 8 + tfdt.len();
         corpo.extend_from_slice(&(novo_traf_tam as u32).to_be_bytes());
@@ -316,7 +337,7 @@ pub fn corrigir_moof(moof: &[u8], posicao: u64, tempos: &Tempos) -> Option<(Vec<
             if tam < CABECALHO || k + tam > traf_fim {
                 return None;
             }
-            if k == trun_i {
+            if let Some((trun_i, trun_tam)) = trun.filter(|(i, _)| *i == k) {
                 corpo.extend_from_slice(&corrigir_trun(
                     &moof[trun_i..trun_i + trun_tam],
                     base,
@@ -347,6 +368,123 @@ fn caixa_tfdt(tempo: u64) -> Vec<u8> {
     v.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // versão 1, sem flags
     v.extend_from_slice(&tempo.to_be_bytes());
     v
+}
+
+/// O bit que diz que a amostra NÃO é um frame completo (`sample_is_non_sync_sample`).
+const AMOSTRA_NAO_E_CHAVE: u32 = 0x0001_0000;
+/// O `tfhd` traz `default_sample_flags`.
+const TFHD_DEFAULT_SAMPLE_FLAGS: u32 = 0x00_0020;
+
+/// Os `default_sample_flags` do `tfhd`, se ele os trouxer. É o que vale para as amostras
+/// que o `trun` não descreve uma a uma.
+fn flags_por_omissao_do_tfhd(
+    d: &[u8],
+    tfhd_i: usize,
+    tfhd_tam: usize,
+    flags_tfhd: u32,
+) -> Option<u32> {
+    if flags_tfhd & TFHD_DEFAULT_SAMPLE_FLAGS == 0 {
+        return None;
+    }
+    // [cabeçalho 8][versão+flags 4][track_ID 4] e depois os campos opcionais, por ordem.
+    let mut i = tfhd_i + CABECALHO + 8;
+    if flags_tfhd & TFHD_BASE_DATA_OFFSET != 0 {
+        i += 8;
+    }
+    if flags_tfhd & 0x00_0002 != 0 {
+        i += 4; // sample_description_index
+    }
+    if flags_tfhd & 0x00_0008 != 0 {
+        i += 4; // default_sample_duration
+    }
+    if flags_tfhd & 0x00_0010 != 0 {
+        i += 4; // default_sample_size
+    }
+    if i + 4 > tfhd_i + tfhd_tam {
+        return None;
+    }
+    u32_em(d, i)
+}
+
+/// Quantas amostras este `trun` traz, e quantas são frames completos (#111).
+///
+/// A flag de cada amostra vem de três sítios, por esta ordem: a própria (`sample_flags`
+/// presente), a primeira (`first_sample_flags`), ou a omissão do `tfhd`. Sem nenhum, não
+/// se adivinha: conta-se a amostra e não a chave.
+fn amostras_do_trun(
+    d: &[u8],
+    trun_i: usize,
+    trun_tam: usize,
+    por_omissao: Option<u32>,
+) -> Option<(u64, u64)> {
+    let flags = u32_em(d, trun_i + CABECALHO)? & 0x00FF_FFFF;
+    let n = u32_em(d, trun_i + CABECALHO + 4)? as usize;
+    let mut i = trun_i + CABECALHO + 8;
+    if flags & TRUN_DATA_OFFSET != 0 {
+        i += 4;
+    }
+    let primeira = if flags & TRUN_FIRST_SAMPLE_FLAGS != 0 {
+        let f = u32_em(d, i)?;
+        i += 4;
+        Some(f)
+    } else {
+        None
+    };
+    let por_amostra = 4
+        * ((flags & TRUN_SAMPLE_DURATION != 0) as usize
+            + (flags & TRUN_SAMPLE_SIZE != 0) as usize
+            + (flags & TRUN_SAMPLE_FLAGS != 0) as usize
+            + (flags & TRUN_SAMPLE_CTS != 0) as usize);
+    let desvio_das_flags = 4
+        * ((flags & TRUN_SAMPLE_DURATION != 0) as usize + (flags & TRUN_SAMPLE_SIZE != 0) as usize);
+    let mut chaves = 0u64;
+    for k in 0..n {
+        let f = if flags & TRUN_SAMPLE_FLAGS != 0 {
+            let j = i + k * por_amostra + desvio_das_flags;
+            if j + 4 > trun_i + trun_tam {
+                return None;
+            }
+            Some(u32_em(d, j)?)
+        } else if k == 0 && primeira.is_some() {
+            primeira
+        } else {
+            por_omissao
+        };
+        if matches!(f, Some(f) if f & AMOSTRA_NAO_E_CHAVE == 0) {
+            chaves += 1;
+        }
+    }
+    Some((n as u64, chaves))
+}
+
+/// Se o primeiro `traf` JÁ vem sem `base_data_offset` — o dialecto que o MSE aceita (#43).
+/// Serve para distinguir, num `moof` que não se traduziu, «já estava certo» de «forma que
+/// não se conhece»: só o segundo é um fragmento que o espectador vai recusar.
+pub fn moof_ja_no_dialecto(moof: &[u8]) -> bool {
+    let fim = moof.len();
+    let mut i = CABECALHO;
+    while i + CABECALHO <= fim {
+        let Some(tam) = u32_em(moof, i).map(|t| t as usize) else {
+            return false;
+        };
+        if tam < CABECALHO || i + tam > fim {
+            return false;
+        }
+        let Some(tipo) = tipo_em(moof, i) else {
+            return false;
+        };
+        if tipo == b"traf" {
+            let Some((tfhd_i, _)) = filha(moof, i + CABECALHO, i + tam, b"tfhd") else {
+                return false;
+            };
+            let Some(flags) = u32_em(moof, tfhd_i + CABECALHO) else {
+                return false;
+            };
+            return flags & 0x00FF_FFFF & TFHD_BASE_DATA_OFFSET == 0;
+        }
+        i += tam;
+    }
+    false
 }
 
 /// Quanto tempo dura este fragmento, somando as amostras.
@@ -646,6 +784,70 @@ mod testes {
     fn moov_sem_video_nao_inventa_codec() {
         let moov = caixa(b"moov", &caixa(b"mvhd", &[0; 100]));
         assert!(codec_do_moov(&moov).is_none());
+    }
+
+    /// Um `traf` só com `tfhd` (#43): é o que o `Finalize` escreve para a faixa sem nada
+    /// pendente, e recusava o `moof` inteiro — que seguia cru e o MSE deitava fora.
+    #[test]
+    fn traf_sem_trun_traduz_se_na_mesma() {
+        let mut so_tfhd = Vec::new();
+        so_tfhd.extend_from_slice(&TFHD_BASE_DATA_OFFSET.to_be_bytes());
+        so_tfhd.extend_from_slice(&1u32.to_be_bytes());
+        so_tfhd.extend_from_slice(&5000u64.to_be_bytes());
+        let traf_a = caixa(b"traf", &caixa(b"tfhd", &so_tfhd));
+
+        let mut tfhd_b = Vec::new();
+        tfhd_b.extend_from_slice(&TFHD_BASE_DATA_OFFSET.to_be_bytes());
+        tfhd_b.extend_from_slice(&2u32.to_be_bytes());
+        tfhd_b.extend_from_slice(&9000u64.to_be_bytes());
+        let mut trun_b = Vec::new();
+        trun_b.extend_from_slice(&(TRUN_DATA_OFFSET | TRUN_SAMPLE_DURATION).to_be_bytes());
+        trun_b.extend_from_slice(&2u32.to_be_bytes());
+        trun_b.extend_from_slice(&400i32.to_be_bytes());
+        trun_b.extend_from_slice(&1024u32.to_be_bytes());
+        trun_b.extend_from_slice(&1024u32.to_be_bytes());
+        let mut traf_b = caixa(b"tfhd", &tfhd_b);
+        traf_b.extend_from_slice(&caixa(b"trun", &trun_b));
+        let traf_b = caixa(b"traf", &traf_b);
+
+        let mut corpo = caixa(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 9]);
+        corpo.extend_from_slice(&traf_a);
+        corpo.extend_from_slice(&traf_b);
+        let moof = caixa(b"moof", &corpo);
+        let antes = moof.len();
+
+        let (novo, duracoes) =
+            corrigir_moof(&moof, 4000, &Tempos::default()).expect("um traf sem trun traduz-se");
+        // Cada traf ganha um tfdt (+20) e perde o base_data_offset (-8).
+        assert_eq!(novo.len(), antes + 2 * (20 - 8));
+        assert_eq!(duracoes.de(1), 0, "sem trun não há duração");
+        assert_eq!(duracoes.de(2), 2 * 1024);
+
+        // Os dois tfhd vêm com default-base-is-moof e sem base_data_offset; há dois tfdt.
+        let mut tfhds = 0;
+        let mut tfdts = 0;
+        let mut i = CABECALHO;
+        while i + CABECALHO <= novo.len() {
+            let tam = u32_em(&novo, i).unwrap() as usize;
+            if tipo_em(&novo, i).unwrap() == b"traf" {
+                let mut k = i + CABECALHO;
+                while k + CABECALHO <= i + tam {
+                    let t = u32_em(&novo, k).unwrap() as usize;
+                    if tipo_em(&novo, k).unwrap() == b"tfhd" {
+                        tfhds += 1;
+                        assert_eq!(
+                            u32_em(&novo, k + CABECALHO).unwrap() & 0x00FF_FFFF,
+                            TFHD_DEFAULT_BASE_IS_MOOF
+                        );
+                    } else if tipo_em(&novo, k).unwrap() == b"tfdt" {
+                        tfdts += 1;
+                    }
+                    k += t;
+                }
+            }
+            i += tam;
+        }
+        assert_eq!((tfhds, tfdts), (2, 2));
     }
 
     #[test]

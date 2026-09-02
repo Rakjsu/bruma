@@ -260,3 +260,64 @@ pub fn so_nos() -> bool {
 pub fn so_nos() -> bool {
     false
 }
+
+/// O codificador nasce com este ritmo INVENTADO, sem esperar pelo que a captura anuncia
+/// (#108): é o defeito antigo, a pedido. É a única forma de ver, numa máquina cuja mistura
+/// já está a 48 kHz, o que acontecia a quem a tinha a 44,1.
+#[cfg(debug_assertions)]
+pub fn sondagem_ritmo() -> Option<u32> {
+    std::env::var("BRUMA_SONDAGEM_RITMO").ok()?.parse().ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn sondagem_ritmo() -> Option<u32> {
+    None
+}
+
+/// Quem entra não pede a chave nem faz sair o último frame (#111): é o comportamento
+/// antigo, para se medir. Medido nesta máquina: sem diferença — ver `ecra.rs`.
+#[cfg(debug_assertions)]
+pub fn sem_chave_a_pedido() -> bool {
+    std::env::var("BRUMA_SEM_CHAVE_A_PEDIDO").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn sem_chave_a_pedido() -> bool {
+    false
+}
+
+/// Quantas reaberturas do som são recusadas de propósito (#109), depois de uma morte
+/// pedida com `BRUMA_SOM_MORRE`. Sem a bandeira, TODAS — é o que faz «vai sem som» sair,
+/// como antes. Com `0`, a primeira tentativa já volta; com `2`, a terceira.
+#[cfg(debug_assertions)]
+pub fn som_nao_volta() -> u64 {
+    std::env::var("BRUMA_SOM_NAO_VOLTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+#[cfg(not(debug_assertions))]
+pub fn som_nao_volta() -> u64 {
+    u64::MAX
+}
+
+/// O `moof` segue CRU, sem a tradução para o dialecto do MSE (#43): é o que acontecia a
+/// um fragmento que o tradutor recusava, e serve para provar que o espectador se
+/// reconstrói quando o buffer recusa um segmento.
+#[cfg(debug_assertions)]
+pub fn moof_cru() -> bool {
+    std::env::var("BRUMA_MOOF_CRU").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn moof_cru() -> bool {
+    false
+}
+
+/// A captura do som demora estes milissegundos a anunciar o formato (#108). Com mais de
+/// seis segundos, o codificador tem de nascer mudo e a thread do som tem de parar sozinha.
+#[cfg(debug_assertions)]
+pub fn som_demora_ms() -> Option<u64> {
+    std::env::var("BRUMA_SOM_DEMORA_MS").ok()?.parse().ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn som_demora_ms() -> Option<u64> {
+    None
+}

@@ -114,6 +114,9 @@ pub struct Estado {
     parar: Option<Arc<AtomicBool>>,
     /// Chaves dos peers que carregaram em "Assistir".
     pub espectadores: Mutex<Vec<String>>,
+    /// Alguém entrou e precisa de um frame completo (#111). O laço do codificador lê-o e
+    /// apaga-o ao pedir a chave; é um `Arc` porque a partilha vive noutra thread.
+    pede_chave: Arc<AtomicBool>,
 }
 
 impl Estado {
@@ -125,6 +128,21 @@ impl Estado {
     /// ao valor e não à existência.
     pub fn a_partilhar(&self) -> bool {
         matches!(&self.parar, Some(p) if !p.load(Ordering::Relaxed))
+    }
+
+    /// Um espectador novo: o próximo frame vai completo (#111).
+    pub fn pedir_chave(&self) {
+        self.pede_chave.store(true, Ordering::Relaxed);
+        // O relogio da medicao arranca AQUI, na entrada, e nao no frame em que o laco
+        // do codificador ve o pedido: num ecra parado esse frame pode demorar um segundo
+        // a chegar, e era precisamente essa espera que ficava de fora da conta.
+        #[cfg(windows)]
+        {
+            let mut em = crate::fmp4::CHAVE_PEDIDA_EM.lock().unwrap();
+            if em.is_none() {
+                *em = Some(std::time::Instant::now());
+            }
+        }
     }
 }
 
@@ -551,6 +569,7 @@ mod win {
         alvo: super::Alvo,
         qualidade: super::Qualidade,
         parar: Arc<AtomicBool>,
+        pede_chave: Arc<AtomicBool>,
         entrega: Entrega,
         queixa: super::Queixa,
         aviso: super::Aviso,
@@ -597,21 +616,6 @@ mod win {
             debito(ls, aa, fps)
         };
 
-        // O formato do som LÊ-SE antes de o codificador nascer, porque ele precisa do ritmo
-        // e dos canais para declarar a faixa. Sem dispositivo, a partilha segue muda — e
-        // di-lo, em vez de morrer.
-        let formato_som = if qualidade.com_som {
-            match crate::som::formato() {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!("[som] sem dispositivo de saída; a partilha vai muda: {e:?}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // O canal não tem fundo, mas o VÍDEO tem: `na_fila` conta os frames à espera e o
         // tratador larga-os acima de quatro. Assim o atraso de imagem continua limitado a
         // quatro frames, e o som — que é pequeno e cuja perda não se recupera — passa
@@ -619,6 +623,76 @@ mod win {
         let (envia, recebe) = std::sync::mpsc::channel::<Trabalho>();
         let na_fila = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let origem = std::time::Instant::now();
+
+        // O SOM ARRANCA PRIMEIRO, E O CODIFICADOR NASCE COM O FORMATO QUE ELE ANUNCIA (#108).
+        //
+        // Era ao contrário: uma sondagem adivinhava o formato da mistura do dispositivo, o
+        // codificador declarava-o no `moov`, e só depois a captura abria — a 48 kHz,
+        // sempre, porque o loopback de processo pede o ritmo que quer em vez de perguntar.
+        // Numa máquina com a mistura a 44,1 kHz a faixa ficava declarada a 44100 e
+        // alimentada a 48000: 8,8 % mais amostras do que tempo, e o som a adiantar-se à
+        // imagem um segundo por cada onze. Nesta máquina a mistura já é 48 kHz e o defeito
+        // não se via; com `BRUMA_SONDAGEM_RITMO=44100` a fingir a outra, «som declarado»
+        // dava x1,09 do tempo de parede e o `mdhd` da faixa 2 dizia 44100.
+        //
+        // Agora a captura é quem diz o formato, e o codificador espera por ele. Se em seis
+        // segundos não disser nada (a activação tem cinco de prazo), a partilha nasce MUDA
+        // e a pessoa fica a saber — em vez de nascer com uma faixa declarada às cegas.
+        let formato_som = if !qualidade.com_som {
+            None
+        } else if let Some(ritmo) = crate::bandeiras::sondagem_ritmo() {
+            // O DEFEITO ANTIGO, A PEDIDO: um formato inventado, sem esperar pelo anúncio.
+            let envia_som = envia.clone();
+            let avisa_som = aviso.clone();
+            crate::som::arrancar(
+                parar.clone(),
+                origem,
+                |_| {},
+                move |b| {
+                    let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
+                },
+                move |m| avisa_som(m),
+            );
+            Some(crate::som::Formato {
+                ritmo,
+                canais: 2,
+                bits: 16,
+                sem_eco: false,
+            })
+        } else {
+            let (diz, ouve) = std::sync::mpsc::sync_channel::<Option<crate::som::Formato>>(1);
+            let envia_som = envia.clone();
+            let avisa_som = aviso.clone();
+            // `send` e não `try_send`: um bocado de som perdido é um buraco que fica, e os
+            // buracos somam-se. O vídeo tem um teto próprio — ver `na_fila`.
+            let so_o_som = crate::som::arrancar(
+                parar.clone(),
+                origem,
+                move |f| {
+                    let _ = diz.send(f);
+                },
+                move |b| {
+                    let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
+                },
+                move |m| avisa_som(m),
+            );
+            match ouve.recv_timeout(std::time::Duration::from_secs(6)) {
+                Ok(Some(f)) => Some(f),
+                Ok(None) => {
+                    eprintln!("[som] sem dispositivo de saída; a partilha vai muda");
+                    aviso("não há dispositivo de som — a partilha vai sem som".into());
+                    None
+                }
+                Err(_) => {
+                    eprintln!("[som] o som não anunciou o formato em 6 s; a partilha vai muda");
+                    // A thread do som pára por um sinal SEU: o `parar` é o do vídeo, e a
+                    // partilha continua.
+                    so_o_som.store(true, Ordering::Relaxed);
+                    aviso("o som do sistema não respondeu — a partilha vai sem som".into());
+                    None
+                }
+            }
+        };
 
         // A thread do codificador. É a ÚNICA que fala com o Media Foundation: o vídeo e o
         // som chegam-lhe pelo canal, e assim nunca há dois lados a escrever no mesmo sink —
@@ -650,7 +724,53 @@ mod win {
             // outras bandeiras: um ramo que nunca corre é um ramo por verificar.
             let morre_ao: u64 = crate::bandeiras::codificador_morre_ao().unwrap_or(0);
             let mut feitos = 0u64;
-            while let Ok(t) = recebe.recv() {
+            // O ÚLTIMO FRAME FICA GUARDADO (#111). A chave a pedido só sai COM um frame, e
+            // a captura do Windows só entrega frames quando o ecrã muda: sem frame novo em
+            // 200 ms e com um pedido pendente, empurra-se o antigo outra vez, para a chave
+            // não ficar à espera do próximo frame real.
+            //
+            // # O que se mediu — e o que NÃO se ganhou
+            //
+            // O Media Foundation ENCHE o fluxo até ao ritmo declarado: num autoteste com o
+            // ecrã quase parado a captura entregou 22 frames em 20 s e o contentor saiu com
+            // 604 amostras. A chave natural vem a cada 30 amostras — um segundo a 30 ips,
+            // faça o ecrã o que fizer — e a emissão nunca pára. Medido da ENTRADA do
+            // espectador até sair um segmento com chave, cinco entradas a meio: 585-966 ms
+            // com a chave a pedido, 26-789 ms sem ela. Nesta máquina não compra nada: o
+            // que domina é o atraso do próprio pipeline (codificador e sink, 0,6-0,9 s), e
+            // a chave natural já está sempre a menos de um segundo. A chave forçada existe
+            // no fluxo — aparece 2 a 7 amostras depois do pedido, fora da grelha das
+            // naturais — e fica, por ser barata e por haver codificadores que honram GOPs
+            // longos. Mas a promessa «de até dois segundos para um frame» era falsa aqui,
+            // e fica escrito para ninguém a repetir.
+            //
+            // `BRUMA_SEM_CHAVE_A_PEDIDO` desliga as duas metades: é a medição de antes.
+            let mut ultimo: Option<Vec<u8>> = None;
+            // Frames de vídeo dados ao codificador: é o índice da amostra que ele vai produzir.
+            let mut videos = 0u64;
+            loop {
+                let t = match recebe.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(t) => t,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if pede_chave.load(Ordering::Relaxed)
+                            && !crate::bandeiras::sem_chave_a_pedido()
+                        {
+                            if let Some(v) = ultimo.clone() {
+                                pede_chave.store(false, Ordering::Relaxed);
+                                c.forcar_chave();
+                                if let Err(e) = c.frame(&v) {
+                                    eprintln!("[ecrã] o codificador queixou-se: {e:?}");
+                                    queixa_codificador(format!(
+                                        "o codificador de vídeo parou a meio: {e}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 feitos += 1;
                 if morre_ao > 0 && feitos >= morre_ao {
                     queixa_codificador(
@@ -661,7 +781,17 @@ mod win {
                 let r = match t {
                     Trabalho::Video(v) => {
                         na_fila_codificador.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        c.frame(&v)
+                        videos += 1;
+                        if pede_chave.swap(false, Ordering::Relaxed) {
+                            let aceitou = c.forcar_chave();
+                            eprintln!(
+                                "[ecrã] chave pedida ao {videos}.º frame real, com {} amostras já saídas (aceitou {aceitou})",
+                                crate::fmp4::AMOSTRAS.load(Ordering::Relaxed)
+                            );
+                        }
+                        let r = c.frame(&v);
+                        ultimo = Some(v);
+                        r
                     }
                     Trabalho::Som(pcm, i, d) => {
                         sons += 1;
@@ -685,39 +815,24 @@ mod win {
                 }
             }
             let media = c.relogio_media();
+            let som_declarado = c.relogio_som_declarado();
             let s = origem.elapsed().as_secs_f64().max(0.001);
-            eprintln!(
-                "[ecrã] fim: média {media:.1}s para {s:.1}s de parede (x{:.2}), \
-                 {sons} bocados de som",
-                media / s
-            );
             if let Err(e) = c.terminar() {
                 eprintln!("[ecrã] ao fechar: {e:?}");
             }
-        });
-
-        // E o som, se houver. Vai pelo mesmo canal, ancorado ao mesmo relógio.
-        if let Some(f) = formato_som {
-            // O aviso do eco NÃO se decide aqui. O `formato_som` vem de uma sondagem que
-            // devolve `sem_eco: false` fixo — serve para o codificador saber o ritmo antes
-            // de a captura existir, e mais nada. Decidir por ele fazia a app avisar
-            // SEMPRE que o som ia com eco, mesmo quando não ia, e mandar desligar o som da
-            // partilha sem razão nenhuma. Quem sabe a verdade é a captura, e é ela que
-            // avisa agora.
-            let envia_som = envia.clone();
-            // `send` e não `try_send`: um bocado de som perdido é um buraco que fica, e os
-            // buracos somam-se. O vídeo tem um teto próprio — ver `na_fila`.
-            let avisa_som = aviso.clone();
-            crate::som::arrancar(
-                parar.clone(),
-                origem,
-                f,
-                move |b| {
-                    let _ = envia_som.send(Trabalho::Som(b.pcm, b.instante, b.duracao));
-                },
-                move |m| avisa_som(m),
+            // Os contadores lêem-se DEPOIS do fecho: o `moof` do `Finalize` é o que traz o
+            // `traf` sem `trun` (#43), e lê-los antes deixava-o de fora.
+            let amostras = crate::fmp4::AMOSTRAS.load(Ordering::Relaxed);
+            let chaves = crate::fmp4::CHAVES.load(Ordering::Relaxed);
+            let crus = crate::fmp4::MOOF_POR_TRADUZIR.load(Ordering::Relaxed);
+            let chave_ms = crate::fmp4::CHAVE_DEMOROU_MS.load(Ordering::Relaxed);
+            eprintln!(
+                "[ecrã] fim: média {media:.1}s para {s:.1}s de parede (x{:.2}), {sons} bocados de som, som declarado {som_declarado:.1}s (x{:.2}) | {chaves} chaves em {amostras} amostras, última chave pedida {chave_ms} ms | {crus} moof por traduzir | codificador: {}",
+                media / s,
+                som_declarado / s,
+                crate::fmp4::codificador_em_uso()
             );
-        }
+        });
 
         let vigia = parar.clone();
         std::thread::spawn(move || {
@@ -868,6 +983,7 @@ mod win {
         _alvo: super::Alvo,
         _q: super::Qualidade,
         _parar: Arc<AtomicBool>,
+        _pede_chave: Arc<AtomicBool>,
         _entrega: Entrega,
         _queixa: super::Queixa,
         _aviso: super::Aviso,
@@ -905,7 +1021,17 @@ pub fn comecar(
         return Err(anyhow!("já estás a partilhar"));
     }
     let parar = Arc::new(AtomicBool::new(false));
-    let tamanho = win::arrancar(alvo, qualidade, parar.clone(), entrega, queixa, aviso)?;
+    // Um pedido de chave de uma partilha anterior não vale para esta.
+    estado.pede_chave.store(false, Ordering::Relaxed);
+    let tamanho = win::arrancar(
+        alvo,
+        qualidade,
+        parar.clone(),
+        estado.pede_chave.clone(),
+        entrega,
+        queixa,
+        aviso,
+    )?;
     estado.parar = Some(parar);
     Ok(tamanho)
 }

@@ -1176,6 +1176,10 @@ pub fn definir_espectadores(chaves: Vec<String>, ecra: State<Arc<Ecra>>, rede: S
     if novos.is_empty() {
         return;
     }
+    // Quem chega leva o cabeçalho (abaixo) e, logo a seguir, um frame COMPLETO (#111).
+    // Sem isto ficava «à espera da imagem…» até ao próximo frame completo natural — que
+    // num ecrã parado podia estar a quinze segundos.
+    e.pedir_chave();
     let Some((servidor, canal)) = ecra.onde.lock().unwrap().clone() else {
         return;
     };

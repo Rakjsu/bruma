@@ -34,11 +34,12 @@
 //! não tinha sido entregue: um `Seek` para trás não faz reenviar nada.
 
 use anyhow::{anyhow, Result};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::core::{implement, Ref, BOOL};
+use windows::core::{implement, Interface, Ref, BOOL};
 use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 
 /// Cada pedaço leva à frente o que é.
 ///
@@ -50,6 +51,26 @@ pub const ETIQUETA_CODEC: u8 = 1;
 
 /// Quem recebe os pedaços à medida que saem.
 pub type Escoadouro = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Medição (#111, #43): amostras de vídeo que SAÍRAM, quantas eram chave, e `moof` que
+/// seguiram por traduzir. Estáticos porque quem os lê — a linha `[ecrã] fim` — vive na
+/// thread do codificador e não tem o byte stream à mão. Contam-se à saída do segmento e
+/// não à tradução: um `moof` cujo `mdat` ainda não chegou é traduzido outra vez na
+/// escrita seguinte, e contá-lo aí dava o dobro.
+pub static AMOSTRAS: AtomicU64 = AtomicU64::new(0);
+pub static CHAVES: AtomicU64 = AtomicU64::new(0);
+pub static MOOF_POR_TRADUZIR: AtomicU64 = AtomicU64::new(0);
+/// Quando a chave a pedido foi pedida (#111), para medir quanto demorou a sair — e quanto
+/// demorou a última.
+pub static CHAVE_PEDIDA_EM: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+pub static CHAVE_DEMOROU_MS: AtomicU64 = AtomicU64::new(0);
+/// O codificador que ficou a trabalhar (#110): o nome e se é de hardware. Para o registo
+/// e para quem perguntar.
+pub static CODIFICADOR: Mutex<String> = Mutex::new(String::new());
+
+pub fn codificador_em_uso() -> String {
+    CODIFICADOR.lock().map(|c| c.clone()).unwrap_or_default()
+}
 
 /// Quanto do passado se guarda. O sink recua para corrigir tamanhos de caixas, e não
 /// pode recuar para além do que ainda temos — mas o recuo é sempre dentro do fragmento em
@@ -138,6 +159,7 @@ impl FluxoDeSaida {
         // recuar por ele recuava a mais.
         let mut inicio_na_origem = e.entregue;
         let mut pendente = crate::mse::Tempos::default();
+        let mut crus_pendentes = 0u64;
         while let Some(tam) = {
             let desde = (e.entregue - e.base) as usize;
             crate::mse::tamanho_da_caixa(&e.dados, desde)
@@ -162,7 +184,8 @@ impl FluxoDeSaida {
                     saida.push(aviso);
                 }
             }
-            let traduzida = if crate::mse::e_moof(&e.dados, i) {
+            let e_moof = crate::mse::e_moof(&e.dados, i);
+            let traduzida = if e_moof && !crate::bandeiras::moof_cru() {
                 crate::mse::corrigir_moof(caixa, absoluta, &e.tempo.mais(&pendente))
             } else {
                 None
@@ -176,7 +199,15 @@ impl FluxoDeSaida {
                     // cada vez mais tardios e o vídeo ficava cheio de buracos.
                     pendente.juntar(&duracoes);
                 }
-                None => segmento.extend_from_slice(caixa),
+                None => {
+                    // Um `moof` que segue cru sem já estar no dialecto certo é um
+                    // fragmento que o MSE vai recusar (#43). Conta-se — à saída, como o
+                    // resto — para a linha `[ecrã] fim` dizer quantos foram.
+                    if e_moof && !crate::mse::moof_ja_no_dialecto(caixa) {
+                        crus_pendentes += 1;
+                    }
+                    segmento.extend_from_slice(caixa)
+                }
             }
 
             // O `moov` fecha o segmento de inicializacao e o `mdat` fecha um de media.
@@ -187,6 +218,22 @@ impl FluxoDeSaida {
                 com_etiqueta.append(&mut segmento);
                 saida.push(com_etiqueta);
                 e.tempo.juntar(&pendente);
+                AMOSTRAS.fetch_add(pendente.amostras_de_video, Ordering::Relaxed);
+                CHAVES.fetch_add(pendente.chaves_de_video, Ordering::Relaxed);
+                MOOF_POR_TRADUZIR.fetch_add(crus_pendentes, Ordering::Relaxed);
+                crus_pendentes = 0;
+                if pendente.chaves_de_video > 0 {
+                    // A chave que alguém pediu saiu neste segmento (#111): diz-se quanto
+                    // demorou desde o pedido.
+                    if let Some(em) = CHAVE_PEDIDA_EM.lock().unwrap().take() {
+                        let ms = em.elapsed().as_millis() as u64;
+                        CHAVE_DEMOROU_MS.store(ms, Ordering::Relaxed);
+                        eprintln!(
+                            "[ecrã] a chave pedida saiu ao fim de {ms} ms, no segmento com {} amostras ({} chaves), {} amostras saídas",
+                            pendente.amostras_de_video, pendente.chaves_de_video, AMOSTRAS.load(Ordering::Relaxed)
+                        );
+                    }
+                }
                 pendente = Default::default();
                 inicio_na_origem = e.entregue;
             }
@@ -382,6 +429,14 @@ pub struct Codificador {
     tamanho_entrada: u32,
     /// O fluxo do som, quando existe. `None` quando a partilha vai muda.
     fluxo_som: Option<u32>,
+    /// Bytes de PCM que o som entregou, e o ritmo com que a faixa foi DECLARADA (#108).
+    /// A divisão de um pelo outro é o tempo que a faixa julga ter — e tem de bater com o
+    /// tempo de parede. Não bate quando a sondagem que declarou o ritmo se enganou.
+    bytes_som: u64,
+    ritmo_declarado: u32,
+    /// A porta para pedir um frame completo ao codificador (#111). `None` quando ele não
+    /// a dá — ou quando `BRUMA_SEM_CHAVE_A_PEDIDO` a fecha, para se medir o de antes.
+    chave: Option<ICodecAPI>,
 }
 
 impl Codificador {
@@ -403,6 +458,12 @@ impl Codificador {
         para: Escoadouro,
     ) -> Result<Self> {
         arrancar_media_foundation()?;
+        // Os contadores da medição são de UMA partilha: recomeçam com o codificador.
+        AMOSTRAS.store(0, Ordering::Relaxed);
+        CHAVES.store(0, Ordering::Relaxed);
+        MOOF_POR_TRADUZIR.store(0, Ordering::Relaxed);
+        CHAVE_DEMOROU_MS.store(0, Ordering::Relaxed);
+        *CHAVE_PEDIDA_EM.lock().unwrap() = None;
         if crate::mse::VER_CAIXAS.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = std::fs::remove_file(std::env::temp_dir().join("bruma-mse.mp4"));
         }
@@ -419,23 +480,25 @@ impl Codificador {
             juntar64(&saida, &MF_MT_FRAME_SIZE, lar_saida, alt_saida)?;
             juntar64(&saida, &MF_MT_FRAME_RATE, fps, 1)?;
             juntar64(&saida, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
-            // Um frame COMPLETO de dois em dois segundos.
+            // Um frame COMPLETO pelo menos a cada `2×fps` amostras — em teoria. Medido com o
+            // codificador da NVIDIA: 20 chaves em 586 amostras, uma a cada 30, com isto a
+            // pedir 60. Ele ignora o pedido e fica no seu GOP de 30; fica-se a pedir na
+            // mesma, para os codificadores que o honram. E «amostras» não são frames
+            // capturados: o Media Foundation repete o último frame até ao ritmo declarado
+            // (28 frames capturados em 20 s deram 600 amostras), por isso 30 amostras são
+            // um segundo de parede a 30 ips, esteja o ecrã parado ou não.
             //
             // # Porque é que isto tem de ser dito
             //
             // Os frames normais só descrevem o que mudou desde o anterior. Quem carrega em
             // "Assistir" a meio recebe o cabeçalho guardado — mas o cabeçalho é o `ftyp` e
             // o `moov`, que dizem QUE codec é, não o que está no ecrã. Até chegar um frame
-            // completo, o que ele tem são diferenças em relação a imagens que nunca viu:
-            // ecrã preto, ou macroblocos.
+            // completo, o que ele tem são diferenças em relação a imagens que nunca viu —
+            // e o MSE deita-as fora: «à espera da imagem…».
             //
-            // E o espaçamento nunca era pedido, portanto ficava ao critério do driver — com
-            // `MF_LOW_LATENCY` ligado, pode ser longo. O tempo até a imagem aparecer
-            // dependia da placa gráfica de quem partilha, e não havia como o saber.
-            //
-            // A câmara, codificada em JS, já forçava um a cada dois segundos. O ecrã não
-            // tinha equivalente: é a diferença entre aparecer em dois segundos e aparecer
-            // quando calhar.
+            // O espaçamento é o TECTO, para o caso de ninguém pedir nada. O que faz quem
+            // entra a meio ver a imagem no frame seguinte é a chave a pedido (#111): ver
+            // `forcar_chave`, chamada pelo laço do codificador quando entra um espectador.
             saida.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.max(1) * 2)?;
 
             // MP4 fragmentado: cabeçalho uma vez, e a seguir fragmentos independentes.
@@ -542,6 +605,30 @@ impl Codificador {
 
             escritor.BeginWriting()?;
 
+            // O CODIFICADOR QUE FICOU A TRABALHAR (#110). O pedido de transformadores de
+            // hardware lá em cima é um pedido, não uma garantia: sem placa, ou com um
+            // driver que não fala H.264, o sink writer põe o codificador de software e não
+            // diz nada. A diferença é um núcleo inteiro por partilha, e ninguém a via.
+            let (nome, hardware) = quem_codifica(&escritor, fluxo_video);
+            let descricao = format!(
+                "{nome} ({})",
+                match hardware {
+                    Some(true) => "hardware",
+                    Some(false) => "software",
+                    None => "não se sabe se é hardware",
+                }
+            );
+            eprintln!("[ecrã] codificador: {descricao}");
+            *CODIFICADOR.lock().unwrap() = descricao;
+            // A chave a pedido (#111): quem entra a meio recebe um frame completo no
+            // frame seguinte, e não quando o espaçamento calhar.
+            let chave = if crate::bandeiras::sem_chave_a_pedido() {
+                eprintln!("[ecrã] chave a pedido desligada, a pedido (BRUMA_SEM_CHAVE_A_PEDIDO)");
+                None
+            } else {
+                codec_api(&escritor, fluxo_video)
+            };
+
             Ok(Self {
                 escritor,
                 fluxo: fluxo_video,
@@ -549,6 +636,9 @@ impl Codificador {
                 ultimo: 0,
                 fluxo_som,
                 tamanho_entrada: largura * 4 * altura,
+                bytes_som: 0,
+                ritmo_declarado: som.map(|f| f.ritmo).unwrap_or(0),
+                chave,
             })
         }
     }
@@ -603,6 +693,7 @@ impl Codificador {
         if pcm.is_empty() {
             return Ok(());
         }
+        self.bytes_som += pcm.len() as u64;
         unsafe {
             let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(pcm.len() as u32)?;
             let mut destino: *mut u8 = std::ptr::null_mut();
@@ -626,9 +717,124 @@ impl Codificador {
         self.ultimo as f64 / 10_000_000.0
     }
 
+    /// Quanto tempo a faixa de som JULGA ter, pelo ritmo com que foi declarada (#108):
+    /// bytes de PCM a dividir por (ritmo × 2 canais × 2 bytes). Zero se a partilha é muda.
+    /// A comparar com o tempo de parede: x1,00 é o certo; x1,09 é uma faixa declarada a
+    /// 44,1 kHz e alimentada a 48.
+    pub fn relogio_som_declarado(&self) -> f64 {
+        if self.ritmo_declarado == 0 {
+            return 0.0;
+        }
+        self.bytes_som as f64 / (self.ritmo_declarado as f64 * 4.0)
+    }
+
+    /// Pede um frame completo no PRÓXIMO frame (#111). `true` se o codificador aceitou.
+    ///
+    /// # O que isto compra, medido
+    ///
+    /// Menos do que se esperava. A chave natural vem a cada 30 amostras — o codificador da
+    /// NVIDIA ignora o `MF_MT_MAX_KEYFRAME_SPACING` e fica nos 30 — e, como o Media
+    /// Foundation enche o fluxo até ao ritmo declarado, isso é um segundo de parede a
+    /// 30 ips, faça o ecrã o que fizer. A chave forçada aparece no fluxo 2 a 7 amostras
+    /// depois do pedido (visto no `bruma-mse.mp4`, fora da grelha das naturais), mas o
+    /// tempo desde a entrada do espectador até lhe sair um segmento com chave não desceu:
+    /// 585-966 ms com ela, 26-789 ms sem ela, cinco entradas cada. O atraso do pipeline
+    /// manda. Fica porque é barata e porque há codificadores que honram GOPs longos; ver o
+    /// laço em `ecra.rs` para a outra metade e para os números.
+    pub fn forcar_chave(&self) -> bool {
+        let Some(api) = &self.chave else {
+            return false;
+        };
+        unsafe {
+            // Um VARIANT de `VT_UI4` a 1, montado à mão como o PROPVARIANT do som: não há
+            // construtor para isto no crate.
+            let um = std::mem::ManuallyDrop::new(VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_UI4,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: VARIANT_0_0_0 { ulVal: 1 },
+                    }),
+                },
+            });
+            match api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &*um) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[ecrã] o codificador não aceitou a chave a pedido: {e:?}");
+                    false
+                }
+            }
+        }
+    }
+
     pub fn terminar(self) -> Result<()> {
         unsafe { self.escritor.Finalize()? };
         Ok(())
+    }
+}
+
+/// Quem está mesmo a codificar (#110): percorre a cadeia de transformadores que o sink
+/// writer montou para o fluxo de vídeo e procura o da categoria «codificador de vídeo». O
+/// nome e a marca de hardware vêm dos atributos do próprio transformador — um MFT de
+/// hardware é obrigado a expor `MFT_ENUM_HARDWARE_URL_Attribute` lá.
+unsafe fn quem_codifica(escritor: &IMFSinkWriter, fluxo: u32) -> (String, Option<bool>) {
+    let Ok(ex) = escritor.cast::<IMFSinkWriterEx>() else {
+        return ("sem IMFSinkWriterEx".into(), None);
+    };
+    for i in 0..8u32 {
+        let mut categoria = windows::core::GUID::zeroed();
+        let mut transformador: Option<IMFTransform> = None;
+        if ex
+            .GetTransformForStream(fluxo, i, Some(&mut categoria), &mut transformador)
+            .is_err()
+        {
+            break;
+        }
+        let Some(t) = transformador else {
+            break;
+        };
+        if categoria != MFT_CATEGORY_VIDEO_ENCODER {
+            continue;
+        }
+        let Ok(atributos) = t.GetAttributes() else {
+            return ("codificador sem atributos".into(), Some(false));
+        };
+        let nome = texto_do_atributo(&atributos, &MFT_FRIENDLY_NAME_Attribute)
+            .unwrap_or_else(|| "codificador sem nome".into());
+        let hardware = texto_do_atributo(&atributos, &MFT_ENUM_HARDWARE_URL_Attribute).is_some()
+            || atributos.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) == 1;
+        return (nome, Some(hardware));
+    }
+    ("codificador não encontrado na cadeia".into(), None)
+}
+
+unsafe fn texto_do_atributo(a: &IMFAttributes, chave: &windows::core::GUID) -> Option<String> {
+    let mut p = windows::core::PWSTR::null();
+    let mut n = 0u32;
+    a.GetAllocatedString(chave, &mut p, &mut n).ok()?;
+    let texto = p.to_string().ok();
+    windows::Win32::System::Com::CoTaskMemFree(Some(p.as_ptr() as *const _));
+    texto
+}
+
+/// A porta do codificador para pedidos fora do tipo de média (#111). `GUID_NULL` como
+/// serviço é a forma documentada de chegar ao `ICodecAPI` do codificador de um fluxo.
+unsafe fn codec_api(escritor: &IMFSinkWriter, fluxo: u32) -> Option<ICodecAPI> {
+    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+    match escritor.GetServiceForStream(
+        fluxo,
+        &windows::core::GUID::zeroed(),
+        &ICodecAPI::IID,
+        &mut p,
+    ) {
+        Ok(()) if !p.is_null() => Some(ICodecAPI::from_raw(p)),
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("[ecrã] o codificador não dá ICodecAPI; sem chave a pedido: {e:?}");
+            None
+        }
     }
 }
 

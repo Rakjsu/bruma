@@ -6284,7 +6284,24 @@ function pararDeAssistir() {
     return diz(`autoteste FALHOU a arrancar: ${e}`);
   }
 
-  await new Promise(r => setTimeout(r, segundos * 1000));
+  // ESPECTADORES A ENTRAR A MEIO (#111): de 2 em 2 segundos, a partir dos 4 s, entra um
+  // espectador novo (uma chave inventada; a rede ignora quem nao conhece). Cada entrada
+  // pede um frame completo, e o Rust diz quanto ele demorou a sair -- e a linha
+  // `[ecra] fim` conta as chaves: com 5 pedidos tem de haver ~5 chaves a mais do que
+  // sem eles. Com BRUMA_SEM_CHAVE_A_PEDIDO o pedido nao faz nada e a espera e a natural.
+  // Os intervalos sao IRREGULARES de proposito: as chaves naturais saem numa grelha de
+  // ~1 s (30 frames a 30 fps), e entradas de 2 em 2 s cairiam sempre na mesma fase
+  // dessa grelha -- a espera natural parecia constante e a prova nao distinguia nada.
+  const espera = ms => new Promise(r => setTimeout(r, ms));
+  const t0 = performance.now();
+  const entradas = segundos >= 18 ? 5 : 0;
+  await espera(Math.min(4, segundos) * 1000);
+  for (let i = 1; i <= entradas; i++) {
+    await invoke('definir_espectadores', { chaves: ['medicao-chave-' + i] }).catch(() => {});
+    await espera(1500 + i * 430);
+  }
+  await espera(Math.max(0, segundos * 1000 - (performance.now() - t0)));
+  diz(`autoteste: ${entradas} espectadores entraram a meio`);
   await invoke('parar_de_partilhar').catch(() => {});
 
   const v = fluxo.el;
