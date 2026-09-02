@@ -4143,7 +4143,7 @@ const ETIQUETA_CODEC = 1;
  *  `appendBuffer` atira exceção se lho fizerem. Por isso há fila: os pedaços chegam ao
  *  ritmo do codificador, não ao ritmo a que o navegador os quer.
  */
-function fluxoDePedacos(comSom = false) {
+function fluxoDePedacos(comSom = false, aoAvariar = null) {
   const media = new MediaSource();
   const el = document.createElement('video');
   el.autoplay = true;
@@ -4177,6 +4177,60 @@ function fluxoDePedacos(comSom = false) {
   // máquinas reais, e ia parecer um problema de ligação.
   let recusa = null;
 
+  // O QUE O FLUXO SABE DE SI (#42, #47, #69, #70): a ponta do buffer e quando mexeu, os
+  // saltos do perseguidor e o que custaram, as secas, os aparados — num sítio só, lido
+  // pelo selo do palco, pela linha `par imagem:` e, mais tarde, por quem partilha (#112).
+  // Expô-lo de quatro maneiras era a receita para os quatro divergirem.
+  const nasceuEm = performance.now();
+  let ultimaPonta = 0;
+  let pontaMudouEm = null;
+  let ultimoByteEm = null;
+  let saltos = 0;
+  let segundosSaltados = 0;
+  let secas = 0;
+  const saltosEm = [];
+  const aparadosEm = [];
+  const secasEm = [];
+  let fechado = false;
+  let avaria = null;
+  const porMinuto = lista => {
+    const agora = performance.now();
+    while (lista.length && agora - lista[0] > 60000) lista.shift();
+    return lista.length;
+  };
+
+  // A AVARIA QUE SE VÊ (#43). Um erro de descodificação é ASSÍNCRONO: dispara `error` no
+  // SourceBuffer, leva o MediaSource a fechar e o <video> a parar — e nada disso passa pelo
+  // `try` do `appendBuffer`. Sem ouvintes, a imagem congelava para sempre e o único
+  // vestígio era um `console.warn`. Havia um caminho real até aqui: um `moof` que o
+  // tradutor recusava seguia com o endereçamento absoluto que o MSE não aceita.
+  const avariar = texto => {
+    if (fechado || avaria) return;
+    avaria = texto;
+    recusa = `O vídeo parou: ${texto}`;
+    clearInterval(relogioDoVivo);
+    fila.length = 0;
+    if (aoAvariar) aoAvariar(texto);
+    else desenharVoz();
+  };
+  el.addEventListener('error', () => {
+    // O `fechar()` tira o `src` e isso dispara um `error` de SRC_NOT_SUPPORTED: não é avaria.
+    if (fechado) return;
+    const e = el.error;
+    avariar(e && e.message ? e.message : `erro ${e ? e.code : '?'} no vídeo`);
+  });
+  // Uma SECA: o leitor parou por falta de dados, depois de já ter tido alguns. É o sinal
+  // de «a rede não entrega», por oposição a «a máquina não descodifica» (#47).
+  el.addEventListener('waiting', () => {
+    // Os dois `waiting` do arranque (o leitor parte com o buffer quase vazio) nao sao
+    // secas: medido no par, secas=2 logo aos 4 s com tudo bem. Contam-se depois disso.
+    if (pontaMudouEm == null || performance.now() - nasceuEm < 3000) return;
+    secas += 1;
+    secasEm.push(performance.now());
+  });
+  media.addEventListener('sourceclose', () => { if (!fechado) avariar('o MediaSource fechou'); });
+  media.addEventListener('sourceended', () => { if (!fechado) avariar('o MediaSource acabou'); });
+
   /* O codec não se assume, vem escrito no fluxo.
      O `addSourceBuffer` obriga a declará-lo, e o navegador VALIDA o que se lhe declara
      contra o cabeçalho: se não bater certo, recusa tudo com um "stream parsing failed"
@@ -4197,6 +4251,9 @@ function fluxoDePedacos(comSom = false) {
       buffer = media.addSourceBuffer(tipo);
       buffer.mode = 'sequence';
       buffer.addEventListener('updateend', escoar);
+      buffer.addEventListener('error', () => {
+        avariar('o buffer recusou um fragmento (uma forma que o MediaSource não aceita)');
+      });
       escoar();
     } catch (e) {
       console.warn('não consegui abrir o buffer de vídeo:', e);
@@ -4215,7 +4272,10 @@ function fluxoDePedacos(comSom = false) {
       if (e.name === 'QuotaExceededError' && el.buffered.length) {
         try { buffer.remove(0, Math.max(0, el.currentTime - 2)); } catch (_) { /* logo se vê */ }
       } else {
+        // Um `InvalidStateError` aqui é o MediaSource já fechado por um erro anterior:
+        // sem isto, cada pedaço seguinte dava outro `console.warn`, para sempre.
         console.warn('o vídeo recusou o pedaço:', e);
+        avariar(e && e.message ? e.message : String(e));
       }
     }
   };
@@ -4243,11 +4303,26 @@ function fluxoDePedacos(comSom = false) {
   const perseguirOVivo = () => {
     if (!buffer || !el.buffered.length) return;
     const ponta = el.buffered.end(el.buffered.length - 1);
+    // A ponta a mexer é a única prova de que está a chegar imagem (#42): sem fragmentos
+    // novos não há imagem nova, e é este instante que o selo do palco lê.
+    if (ponta > ultimaPonta + 0.001) {
+      ultimaPonta = ponta;
+      pontaMudouEm = performance.now();
+    }
     const atraso = ponta - el.currentTime;
-    if (atraso > LIMITE) {
+    // NÃO se salta com o vídeo em pausa (#47/#70): a pré-visualização própria pausada
+    // acumulava saltos que ninguém viu, e o relógio dela é reposto ao retomar.
+    if (atraso > LIMITE && !el.paused) {
       const destino = Math.max(0, ponta - FOLGA);
       // `fastSeek` não existe em todo o lado e é aproximado; a atribuição direta é exata.
-      try { el.currentTime = destino; } catch (e) { /* o próximo tick tenta */ }
+      try {
+        const de = el.currentTime;
+        el.currentTime = destino;
+        // Cada salto é um pedaço de transmissão que NÃO se viu (#70). Conta-se.
+        saltos += 1;
+        segundosSaltados += Math.max(0, destino - de);
+        saltosEm.push(performance.now());
+      } catch (e) { /* o próximo tick tenta */ }
     }
     // E deita-se fora o passado, que ninguém vai rebobinar. Sem isto a memória do buffer
     // cresce durante toda a chamada, e é o mesmo que a levar a rebentar devagar.
@@ -4276,7 +4351,7 @@ function fluxoDePedacos(comSom = false) {
   return {
     el,
     empurrar(marcado) {
-      if (!marcado.length) return;
+      if (!marcado.length || avaria) return;
       const etiqueta = marcado[0];
       const bytes = marcado.subarray(1);
       if (etiqueta === ETIQUETA_CODEC) {
@@ -4285,6 +4360,11 @@ function fluxoDePedacos(comSom = false) {
         return;
       }
       if (etiqueta !== ETIQUETA_BYTES) return;
+      // Bytes ANTES do codec são um fragmento que ainda vinha a caminho quando este fluxo
+      // nasceu (#43): numa reconstrução, o que sobra da transmissão anterior chega antes
+      // do cabeçalho novo. Meter isso à frente do `moov` era rebentar o fluxo outra vez.
+      if (!codec) return;
+      ultimoByteEm = performance.now();
       fila.push(bytes);
       el.__pedacos += 1;
       if (fila.length > el.__filaMax) el.__filaMax = fila.length;
@@ -4292,13 +4372,34 @@ function fluxoDePedacos(comSom = false) {
       // é o presente, não o passado.
       if (fila.length > 60) {
         el.__aparados += fila.length - 30;
+        aparadosEm.push(performance.now());
         fila.splice(0, fila.length - 30);
       }
       escoar();
     },
     /** A razão de não haver imagem, quando não há. `null` significa "ainda a chegar". */
     porqueNaoDa() { return recusa; },
+    /** O que este fluxo sabe de si — UMA vez, para todos os leitores (#42, #47, #69, #70). */
+    estado() {
+      return {
+        nasceuEm,
+        ultimoFrameEm: pontaMudouEm,
+        ultimoByteEm,
+        saltos,
+        segundosSaltados,
+        secas,
+        saltosPorMinuto: porMinuto(saltosEm),
+        aparadosPorMinuto: porMinuto(aparadosEm),
+        secasPorMinuto: porMinuto(secasEm),
+        aparados: el.__aparados,
+        filaMax: el.__filaMax,
+        pedacos: el.__pedacos,
+        pausado: !!el.__pausaPedida,
+        avaria,
+      };
+    },
     fechar() {
+      fechado = true;
       clearInterval(relogioDoVivo);
       try { el.pause(); } catch (e) { /* já parado */ }
       try { URL.revokeObjectURL(el.src); } catch (e) { /* já libertado */ }
@@ -4307,6 +4408,144 @@ function fluxoDePedacos(comSom = false) {
     },
   };
 }
+
+/** O que o selo do palco deve dizer (#42): «AO VIVO» só enquanto a ponta do buffer
+ *  avançou nos últimos 2 s. `st` é o `estado()` do fluxo, ou `null` se ainda não há fluxo.
+ *
+ *  Antes o selo era acrescentado sem olhar para nada: a app afirmava «ao vivo» sobre um
+ *  frame parado há trinta segundos porque a rede caiu, o codificador morreu ou a janela
+ *  fechou. O palco já tinha o padrão certo ao lado, na caixa da pausa; faltava usá-lo aqui. */
+function seloDoVivo(st, agora) {
+  if (!st) return { texto: 'à espera da imagem', classe: 'palco__selo--parado' };
+  if (st.avaria) return { texto: 'sem imagem', classe: 'palco__selo--sem' };
+  if (st.pausado) return { texto: 'EM PAUSA', classe: 'palco__selo--pausa' };
+  if (st.ultimoFrameEm == null) {
+    return agora - st.nasceuEm > 10000
+      ? { texto: 'sem imagem — a ligação não está a entregar', classe: 'palco__selo--sem' }
+      : { texto: 'à espera da imagem', classe: 'palco__selo--parado' };
+  }
+  const ha = agora - st.ultimoFrameEm;
+  if (ha > 10000) return { texto: `sem imagem há ${Math.round(ha / 1000)} s`, classe: 'palco__selo--sem' };
+  if (ha > 2000) return { texto: `imagem parada há ${Math.round(ha / 1000)} s`, classe: 'palco__selo--parado' };
+  return { texto: 'AO VIVO', classe: '' };
+}
+
+/** A linha discreta do palco quando a imagem dá solavancos (#47). Distingue «a máquina
+ *  não descodifica» (fila a crescer, com aparados) de «a rede não entrega» (buffer a
+ *  secar, ou saltos sem fila): são causas diferentes, com botões em mãos diferentes. */
+function diagnosticoDoFluxo(st) {
+  if (!st) return null;
+  if (st.saltosPorMinuto >= 6 && st.aparadosPorMinuto > 0) {
+    return 'esta máquina não está a acompanhar a imagem — pede a quem partilha uma resolução mais baixa';
+  }
+  if (st.secasPorMinuto >= 6 || (st.saltosPorMinuto >= 6 && st.aparadosPorMinuto === 0)) {
+    return 'a ligação não está a entregar a imagem a tempo';
+  }
+  return null;
+}
+
+/** Se quem assiste tem a janela escondida há tempo suficiente para se parar de receber
+ *  (#46). `visibilityState` e não o foco: perder o foco acontece ao clicar noutra janela
+ *  com o Bruma visível no segundo monitor — que é exactamente o caso do dono. */
+function espectadorEscondido(visibilityState, haQuantoMs) {
+  return visibilityState === 'hidden' && haQuantoMs >= 10000;
+}
+
+/** Pinta o selo do palco com o que `seloDoVivo` decidiu, sem redesenhar o palco. */
+function aplicarSelo(selo, decisao, st) {
+  selo.className = 'palco__selo palco__selo--vivo' + (decisao.classe ? ' ' + decisao.classe : '');
+  selo.replaceChildren();
+  if (!decisao.classe) selo.innerHTML = '<i class="ponto"></i>';
+  selo.append(document.createTextNode(decisao.texto));
+  // Os números que só apareciam no `--par` (#69), agora na app, ao passar o rato.
+  if (st) {
+    selo.title = `${st.pedacos} pedaços · ${st.saltos} saltos (${st.segundosSaltados.toFixed(1)} s perdidos)`
+      + ` · ${st.aparados} aparados · ${st.secas} secas`;
+  }
+}
+
+/** A reconstrução de um fluxo avariado (#43) e a pausa por janela escondida (#46). */
+const recusaDe = new Map();        // chave -> razão, enquanto não há fluxo para a dizer
+const reconstrucoes = new Map();   // chave -> instantes das últimas reconstruções
+let escondidaDesde = null;         // quando a janela passou a 'hidden'
+let pausaPorEscondida = null;      // a chave de quem deixámos de ver por estar escondida
+let modoDeTeste = false;           // o `--par` liga isto para as reconstruções ficarem no registo
+
+function fluxoAvariou(chave, texto) {
+  const agora = performance.now();
+  const lista = (reconstrucoes.get(chave) || []).filter(t => agora - t < 60000);
+  reconstrucoes.set(chave, lista);
+  if (modoDeTeste) invoke('capacidades', { linha: `par RECONSTRUCAO de ${chave.slice(0, 6)} (${lista.length + 1}): ${texto}` }).catch(() => {});
+  if (voz.aVer !== chave || lista.length >= 3) {
+    // Ou não estamos a ver, ou já se tentou três vezes num minuto: a causa é permanente e
+    // pedir outra vez era ficar num ciclo. A razão fica no palco.
+    recusaDe.set(chave, texto);
+    desenharVoz();
+    return;
+  }
+  lista.push(agora);
+  recusaDe.set(chave, `${texto} — a pedir a transmissão outra vez`);
+  // Fecha-se o fluxo e pede-se de novo: quem partilha vê-nos como espectador NOVO, manda
+  // o cabeçalho e um frame completo, e o próximo pedaço faz nascer um fluxo limpo. Os
+  // dois sinais vão pelo mesmo canal de controlo, por ordem.
+  fecharFluxoRecebido(chave);
+  sinalizar(chave, { tipo: 'assistir', ligado: false });
+  sinalizar(chave, { tipo: 'assistir', ligado: true });
+  desenharVoz();
+}
+
+function pausarPorEscondida() {
+  if (!voz.aVer || voz.aVer === voz.eu || pausaPorEscondida) return;
+  pausaPorEscondida = voz.aVer;
+  // Sai-se da lista de espectadores SEM largar o palco: quem partilha deixa de mandar, e
+  // ao voltar pede-se outra vez. Oito megabits por segundo a atravessar o continente para
+  // uma janela minimizada era o desperdício mais caro desta app, invisível dos dois lados.
+  sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+}
+
+function retomarDaEscondida() {
+  const chave = pausaPorEscondida;
+  pausaPorEscondida = null;
+  if (!chave || voz.aVer !== chave) return;
+  // O fluxo velho fecha-se: o cabeçalho vem outra vez e um segundo `moov` num MediaSource
+  // em `sequence` não é coisa que se queira medir em produção.
+  fecharFluxoRecebido(chave);
+  sinalizar(chave, { tipo: 'assistir', ligado: true });
+  desenharVoz();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    escondidaDesde = performance.now();
+  } else {
+    escondidaDesde = null;
+    retomarDaEscondida();
+  }
+});
+
+/** O tique de 1 s do palco: o selo e o diagnóstico mudam NO SÍTIO — redesenhar o palco
+ *  inteiro por relógio matava a reprodução. E é aqui que a pausa por janela escondida se
+ *  decide. */
+function tiqueDoPalco() {
+  const agora = performance.now();
+  if (voz.aVer && voz.aVer !== voz.eu && escondidaDesde != null
+      && espectadorEscondido(document.visibilityState, agora - escondidaDesde)) {
+    pausarPorEscondida();
+  }
+  const selo = document.querySelector('.palco__selo--vivo');
+  if (!selo || !voz.aVer) return;
+  const f = voz.aVer === voz.eu ? voz.vejoMeuEcra : fluxosRecebidos.get(voz.aVer);
+  const st = f && f.estado ? f.estado() : null;
+  if (st && pausaPorEscondida === voz.aVer) st.pausado = true;
+  aplicarSelo(selo, seloDoVivo(st, agora), st);
+  const diag = document.querySelector('.palco__diag');
+  if (diag) {
+    const texto = diagnosticoDoFluxo(st);
+    diag.textContent = texto || '';
+    diag.hidden = !texto;
+  }
+}
+setInterval(tiqueDoPalco, 1000);
 
 /** Abre o seletor: um separador por tipo de fonte, como no Discord —
  *  Janelas num, Ecrãs noutro, cada um só com o seu. */
@@ -4635,8 +4874,9 @@ const fluxosRecebidos = new Map();
     let fluxo = fluxosRecebidos.get(chave);
     if (!fluxo) {
       // Com som: é o ecrã de outra pessoa, e o que ela partilhou inclui o que se ouvia.
-      fluxo = fluxoDePedacos(true);
+      fluxo = fluxoDePedacos(true, texto => fluxoAvariou(chave, texto));
       fluxosRecebidos.set(chave, fluxo);
+      recusaDe.delete(chave);
       // O painel só sabe que há imagem depois do primeiro pedaço.
       desenharVoz();
     }
@@ -4871,7 +5111,10 @@ function palcoDeTransmissao(quem, canal, outros) {
 
   const el = ecraDe(quem);
   const fluxo = quem === voz.eu ? voz.vejoMeuEcra : fluxosRecebidos.get(quem);
-  const recusa = fluxo && fluxo.porqueNaoDa && fluxo.porqueNaoDa();
+  // Sem fluxo (a meio de uma reconstrução, #43) a razão vive em `recusaDe`.
+  const recusa = fluxo && fluxo.porqueNaoDa
+    ? fluxo.porqueNaoDa()
+    : (recusaDe.get(quem) || null);
   if (recusa) {
     // Um rectângulo preto para sempre é indistinguível de "a rede está má". Dizer a razão
     // é a diferença entre a pessoa esperar em vão e saber que não vale a pena.
@@ -4918,10 +5161,18 @@ function palcoDeTransmissao(quem, canal, outros) {
     + ' stroke-width="1.4">' + ICO.olho + '</svg>';
   olhos.append(elemento('span', null, String(espectadoresDe(quem))));
   camadaDir.append(olhos);
+  // O selo diz a verdade (#42): nasce com o estado real do fluxo e o tique de 1 s
+  // mantém-no. A linha de diagnóstico (#47) vive por baixo, escondida até fazer falta.
   const vivo = elemento('span', 'palco__selo palco__selo--vivo');
-  vivo.innerHTML = '<i class="ponto"></i>';
-  vivo.append(document.createTextNode('AO VIVO'));
+  {
+    const st = fluxo && fluxo.estado ? fluxo.estado() : null;
+    if (st && pausaPorEscondida === quem) st.pausado = true;
+    aplicarSelo(vivo, seloDoVivo(st, performance.now()), st);
+  }
   camadaDir.append(vivo);
+  const diag = elemento('div', 'palco__diag');
+  diag.hidden = true;
+  camadaDir.append(diag);
   vidro.append(camadaDir);
 
   // --- baixo à esquerda: convidar alguém a ver
@@ -4981,6 +5232,13 @@ function palcoDeTransmissao(quem, canal, outros) {
     pausa.append(elemento('b', null, 'A tua transmissão continua ligada!'));
     pausa.append(elemento('span', null,
       'Pausámos esta pré-visualização para poupar os teus recursos.'));
+    vidro.append(pausa);
+  } else if (!souEu && pausaPorEscondida === quem) {
+    // A mesma caixa honesta, para quem assiste com a janela escondida (#46).
+    const pausa = elemento('div', 'palco__pausa');
+    pausa.append(elemento('b', null, 'Pausámos a imagem porque a janela estava escondida'));
+    pausa.append(elemento('span', null,
+      'Ao voltar à janela a transmissão é pedida outra vez. O som da partilha também parou entretanto.'));
     vidro.append(pausa);
   }
   if (souEu && el) {
@@ -5938,6 +6196,7 @@ function deixarDeVerOMeu() {
 }
 
 function assistir(peer) {
+  pausaPorEscondida = null;
   if (voz.aVer && voz.aVer !== peer && voz.aVer !== voz.eu) {
     sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
   }
@@ -5958,6 +6217,7 @@ function assistir(peer) {
 }
 
 function pararDeAssistir() {
+  pausaPorEscondida = null;
   if (voz.aVer === voz.eu) deixarDeVerOMeu();
   else if (voz.aVer) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
   voz.aVer = null;
@@ -6419,6 +6679,7 @@ function pararDeAssistir() {
 (async () => {
   if (!window.__TAURI__) return;
   const modo = await invoke('autoteste_par').catch(() => null);
+  if (modo !== null) modoDeTeste = true;
   if (modo === null || modo === undefined) return;
 
   const diz = linha => invoke('capacidades', { linha }).catch(() => {});
@@ -6776,7 +7037,18 @@ function pararDeAssistir() {
           // fica como fica em producao -- e o que estava partido.
           + ` mudo=${el ? el.muted : '-'} audio-bytes=${el ? (el.webkitAudioDecodedByteCount || 0) : '-'}`
           + ` codec=${el && el.__codec ? el.__codec : '?'}`
-          + ` erro=${el && el.error ? el.error.code : 'nenhum'}`);
+          + ` erro=${el && el.error ? el.error.code : 'nenhum'}`
+          // Os frames largados e corrompidos (#69) e os saltos do perseguidor (#70): uma
+          // transmissão com metade dos frames largados dava a mesma linha que uma perfeita.
+          + ` largados=${q ? q.droppedVideoFrames : '?'} corrompidos=${q ? q.corruptedVideoFrames : '?'}`
+          + (() => {
+            const fx = voz.aVer === voz.eu ? voz.vejoMeuEcra : fluxosRecebidos.get(voz.aVer);
+            const st = fx && fx.estado ? fx.estado() : null;
+            return st
+              ? ` saltos=${st.saltos} saltados=${st.segundosSaltados.toFixed(1)}s secas=${st.secas}`
+                + ` selo="${seloDoVivo(st, performance.now()).texto}"`
+              : ' saltos=? selo="?"';
+          })());
       }
     }
   } catch (e) {
@@ -7779,6 +8051,92 @@ function pararDeAssistir() {
       + ` | sem-miniatura=${r4.semMini} com-miniatura=${r4.comMini} diz-porque=${r4.dizPorque}`);
   } catch (e) {
     diz(`ui partilha falhou: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O FLUXO QUE NAO MORRE CALADO, O SELO HONESTO E A JANELA ESCONDIDA (#43, #42, #47, #46) ----
+  try {
+    // #42: o selo, pela funcao pura, nos seis estados.
+    const t = 100000;
+    const s1 = seloDoVivo(null, t).texto;
+    const s2 = seloDoVivo({ nasceuEm: t - 11000, ultimoFrameEm: null, pausado: false, avaria: null }, t).texto;
+    const s3 = seloDoVivo({ nasceuEm: t - 30000, ultimoFrameEm: t - 500, pausado: false, avaria: null }, t).texto;
+    const s4 = seloDoVivo({ nasceuEm: t - 30000, ultimoFrameEm: t - 3000, pausado: false, avaria: null }, t).texto;
+    const s5 = seloDoVivo({ nasceuEm: t - 30000, ultimoFrameEm: t - 15000, pausado: false, avaria: null }, t).texto;
+    const s6 = seloDoVivo({ nasceuEm: t - 30000, ultimoFrameEm: t - 15000, pausado: true, avaria: null }, t).texto;
+    diz(`ui selo: sem-fluxo="${s1}" nunca-chegou="${s2}" vivo="${s3}" parada="${s4}" sem="${s5}" pausa="${s6}"`);
+    // #47: o diagnostico distingue a maquina da rede, e cala-se quando esta tudo bem.
+    const d1 = diagnosticoDoFluxo({ saltosPorMinuto: 8, aparadosPorMinuto: 2, secasPorMinuto: 0 });
+    const d2 = diagnosticoDoFluxo({ saltosPorMinuto: 0, aparadosPorMinuto: 0, secasPorMinuto: 7 });
+    const d3 = diagnosticoDoFluxo({ saltosPorMinuto: 2, aparadosPorMinuto: 0, secasPorMinuto: 1 });
+    diz(`ui diagnostico: maquina=${/máquina/.test(d1 || '')} rede=${/ligação/.test(d2 || '')} calmo=${d3 === null}`);
+    // #46: a decisao pura.
+    diz(`ui escondido: (hidden,11000)=${espectadorEscondido('hidden', 11000)}`
+      + ` (hidden,3000)=${espectadorEscondido('hidden', 3000)}`
+      + ` (visible,60000)=${espectadorEscondido('visible', 60000)}`);
+
+    // #43: um fluxo REAL com um codec valido e lixo a seguir. O ouvinte tem de disparar em
+    // menos de um segundo, o fluxo tem de dizer porque, e o selo tem de dizer «sem imagem».
+    // Com o codigo anterior nada disto acontecia: `porqueNaoDa()` ficava `null` para sempre.
+    let avisou = null;
+    const f = fluxoDePedacos(false, texto => { avisou = texto; });
+    document.body.append(f.el);
+    f.el.style.cssText = 'position:fixed;width:2px;height:2px;opacity:0;pointer-events:none';
+    const codec = new TextEncoder().encode('avc1.42C01F');
+    f.empurrar(new Uint8Array([ETIQUETA_CODEC, ...codec]));
+    await new Promise(r => setTimeout(r, 300));
+    // Lixo que o parser de MP4 REJEITA e nao apenas guarda: uma caixa `moov` de 24 bytes
+    // com um filho impossivel la dentro. Bytes aleatorios pareciam o cabecalho de uma
+    // caixa de 2,4 MB e o parser ficava a espera do resto, sem erro nenhum.
+    const lixo = new Uint8Array([0, 0, 0, 24, 109, 111, 111, 118, 0xff, 0xff, 0xff, 0xff, 122, 122, 122, 122, 1, 2, 3, 4, 5, 6, 7, 8]);
+    const antesDoCodec = f.estado().pedacos;
+    f.empurrar(new Uint8Array([ETIQUETA_BYTES, ...lixo]));
+    const t0 = performance.now();
+    while (!avisou && performance.now() - t0 < 3000) await new Promise(r => setTimeout(r, 50));
+    const demorou = Math.round(performance.now() - t0);
+    const razao = f.porqueNaoDa();
+    const st = f.estado();
+    // E depois da avaria, empurrar mais nao faz nada.
+    f.empurrar(new Uint8Array([ETIQUETA_BYTES, ...lixo]));
+    diz(`ui fluxo avariado: avisou=${!!avisou} em ${demorou} ms razao="${(razao || '').slice(0, 60)}"`
+      + ` estado-avaria=${!!st.avaria} selo="${seloDoVivo(st, performance.now()).texto}"`
+      + ` pedacos-antes=${antesDoCodec} depois=${f.estado().pedacos}`);
+    f.fechar();
+    f.el.remove();
+
+    // #46 no palco fabricado: a decisao forcada tira-nos da lista (o sinal sai) e a caixa
+    // «Pausámos» aparece; ao retomar, a caixa some e o fluxo e pedido de novo.
+    const antes = { canal: voz.canal, eu: voz.eu, servidor: voz.servidor, srv: servidorAtual,
+      cnl: canalAtual, aVer: voz.aVer };
+    let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+    if (!srv) {
+      const id = await invoke('criar_servidor', { nome: 'medicao' });
+      await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+      await desenharTudo();
+      srv = vista.servidores.find(x => x.id === id);
+    }
+    const cv = srv.canais.find(c => c.tipo === 'voz');
+    servidorAtual = srv.id; canalAtual = cv.id;
+    voz.eu = voz.eu || 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id;
+    voz.presentes.set('outro1', cv.id); voz.aPartilhar.add('outro1'); voz.aVer = 'outro1';
+    desenharVoz();
+    const seloAntes = (document.querySelector('.palco__selo--vivo') || {}).textContent;
+    pausarPorEscondida();
+    desenharVoz();
+    const caixa = document.querySelector('.palco__pausa');
+    const seloPausa = (document.querySelector('.palco__selo--vivo') || {}).textContent;
+    const pausou = pausaPorEscondida === 'outro1';
+    retomarDaEscondida();
+    desenharVoz();
+    const caixaDepois = !!document.querySelector('.palco__pausa');
+    diz(`ui escondido no palco: selo-antes="${seloAntes}" pausou=${pausou}`
+      + ` caixa="${caixa ? caixa.textContent.replace(/\s+/g, ' ').trim().slice(0, 40) : ''}"`
+      + ` selo-em-pausa="${seloPausa}" retomou=${pausaPorEscondida === null} caixa-depois=${caixaDepois}`);
+    voz.presentes.delete('outro1'); voz.aPartilhar.delete('outro1'); voz.aVer = antes.aVer;
+    Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor });
+    servidorAtual = antes.srv; canalAtual = antes.cnl;
+    desenharVoz();
+  } catch (e) {
+    diz(`ui fluxo: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----

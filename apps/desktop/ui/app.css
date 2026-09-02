@@ -1484,3 +1484,10 @@ body.ghost .app { transition: filter .8s var(--ease); }
   aspect-ratio: 16 / 9; width: 100%; background: var(--raise);
   color: var(--dim); font-size: 12px; border-radius: 6px;
 }
+
+/* O selo do palco diz a verdade (#42): parado, sem imagem, em pausa. */
+.palco__selo--vivo.palco__selo--parado { background: #7a5a1e; color: #f3dfb5; letter-spacing: 0; }
+.palco__selo--vivo.palco__selo--sem { background: #8e3b3b; color: #f6d5d5; letter-spacing: 0; }
+.palco__selo--vivo.palco__selo--pausa { background: #4a4a52; color: var(--muted); }
+/* A linha de diagnóstico (#47): discreta, por baixo dos selos, só quando faz falta. */
+.palco__diag { font-size: 12px; color: var(--amber); max-width: 42ch; text-align: right; }
