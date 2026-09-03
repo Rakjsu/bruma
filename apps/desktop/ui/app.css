@@ -1525,3 +1525,8 @@ body.ghost .app { transition: filter .8s var(--ease); }
 /* Um identicon sem chave: um quadrado vazio, e não a cara de ninguém. */
 .ident--vazio { background: rgba(255, 255, 255, .05); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14); }
 
+/* --- endereços nas mensagens (#96): um <a> sem href, aberto pelo Rust e só http ---------- */
+.endereco { color: var(--mist); text-decoration: underline; cursor: pointer; overflow-wrap: anywhere; }
+.endereco:hover { color: var(--text); }
+.endereco:focus-visible { outline: 1px solid var(--mist); outline-offset: 1px; border-radius: 3px; }
+

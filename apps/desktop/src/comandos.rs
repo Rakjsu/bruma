@@ -1433,6 +1433,55 @@ pub fn abrir_pasta_de_dados() -> R<()> {
     Ok(())
 }
 
+/// Um endereço que se pode abrir no browser (#96): só `http`/`https`, sem espaços, aspas ou
+/// caracteres de controlo, com o nome do sítio, até 2048 caracteres. É a ÚNICA barreira antes
+/// do `ShellExecute` do Windows — que com `file:` executaria ficheiros locais — e por isso
+/// vive no Rust e tem teste. Devolve o URL tal qual: normalizar é trabalho do browser.
+pub fn ligacao_aceitavel(url: &str) -> Result<&str, String> {
+    if url.is_empty() || url.len() > 2048 {
+        return Err("endereço vazio ou comprido de mais".into());
+    }
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+    {
+        return Err("o endereço tem caracteres que não podem lá estar".into());
+    }
+    let Some((esquema, resto)) = url.split_once(':') else {
+        return Err("não é um endereço http".into());
+    };
+    let esquema = esquema.to_ascii_lowercase();
+    if esquema != "http" && esquema != "https" {
+        return Err(format!(
+            "só se abrem endereços http ou https, não «{esquema}»"
+        ));
+    }
+    let Some(sitio) = resto.strip_prefix("//") else {
+        return Err("falta o // depois do http:".into());
+    };
+    if sitio.is_empty() || sitio.starts_with('/') {
+        return Err("falta o nome do sítio".into());
+    }
+    Ok(url)
+}
+
+/// Abre um endereço no browser da pessoa (#96). `rundll32 url.dll,FileProtocolHandler` do
+/// System32 — não do PATH, ao contrário do `explorer` acima — e nunca `cmd /C start`, que é
+/// uma shell onde `&` e `^` dentro do URL viravam comandos. O `%` não é expandido: não há
+/// shell pelo caminho.
+#[tauri::command]
+pub fn abrir_ligacao(url: String) -> R<()> {
+    let url = ligacao_aceitavel(&url)?;
+    let sistema = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows"));
+    std::process::Command::new(sistema.join("System32").join("rundll32.exe"))
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn()
+        .map_err(erro)?;
+    Ok(())
+}
+
 /// As 24 palavras que recuperam esta identidade.
 ///
 /// Não se guardam em lado nenhum nem se escrevem no registo: são derivadas da semente
@@ -1833,6 +1882,44 @@ pub fn medir_ui_pedido() -> bool {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// O que se abre e o que não se abre (#96): só http/https com sítio; tudo o resto é
+    /// recusado antes de chegar ao `ShellExecute`.
+    #[test]
+    fn so_se_abrem_enderecos_http() {
+        for bom in [
+            "http://a",
+            "https://x.y/z?q=1#f",
+            "HTTPS://X.Y",
+            "http://a/b%20c&d=^e",
+        ] {
+            assert_eq!(ligacao_aceitavel(bom), Ok(bom), "{bom} devia passar");
+        }
+        let comprido = format!("https://x/{}", "a".repeat(2040));
+        let com_nulo = "https://x\u{0}";
+        for mau in [
+            "file:///C:/Windows/notepad.exe",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "ftp://x",
+            "https://a b",
+            "https://a\"b",
+            "http:/x",
+            "https://",
+            "https:///x",
+            "",
+            comprido.as_str(),
+            com_nulo,
+            "javascript:https://x",
+            " https://x",
+            "https://x\n",
+        ] {
+            assert!(
+                ligacao_aceitavel(mau).is_err(),
+                "{mau:?} devia ser recusado"
+            );
+        }
+    }
 
     /// O carimbo da actualização é lido UMA vez, e só avisa quando deve (#121).
     ///

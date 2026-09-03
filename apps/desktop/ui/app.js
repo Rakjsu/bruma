@@ -129,6 +129,60 @@ function chaveCurta(k) {
   return k ? `${k.slice(0, 4)}·${k.slice(4, 8)}·${k.slice(8, 12)}` : '';
 }
 
+/* ENDEREÇOS NAS MENSAGENS (#96).
+   O corpo de uma mensagem é texto de OUTRA máquina: nós de texto e, para cada endereço, um
+   <a> SEM `href`, de propósito — a janela não tem `on_navigation`, e um `<a href>` clicado
+   dentro da app navegava a webview inteira para fora (o IPC morre nesse origin). Sem `href`
+   não há navegação, nem Ctrl+clique, nem arrastar para a barra de endereços: o único caminho
+   é o comando do Rust, que só abre http/https. Nunca `innerHTML` com dados de fora. */
+const ENDERECO = /https?:\/\/[^\s<>"'`]+/gi;
+
+function corpoDaMensagem(texto) {
+  const p = elemento('p');
+  const original = String(texto);
+  let i = 0;
+  let n = 0;
+  for (const m of original.matchAll(ENDERECO)) {
+    if (n >= 20) break;
+    let url = m[0];
+    // Apara a pontuação da frase, e um parêntese final só se ficar desequilibrado.
+    while (url.length && '.,;:!?»"\''.includes(url[url.length - 1])) url = url.slice(0, -1);
+    for (const [abre, fecha] of [['(', ')'], ['[', ']']]) {
+      const abertos = url.split(abre).length - 1;
+      const fechados = url.split(fecha).length - 1;
+      if (url.endsWith(fecha) && fechados > abertos) url = url.slice(0, -1);
+    }
+    if (!url) continue;
+    p.append(document.createTextNode(original.slice(i, m.index)));
+    const a = elemento('a', 'endereco', url);
+    a.setAttribute('role', 'link');
+    a.tabIndex = 0;
+    a.dataset.url = url;
+    a.title = url;
+    p.append(a);
+    i = m.index + url.length;
+    n += 1;
+  }
+  p.append(document.createTextNode(original.slice(i)));
+  return p;
+}
+
+// Uma variável e não uma função, para o `--medir-ui` a poder substituir por um espião sem
+// abrir o browser de quem mede.
+let abrirLigacao = url => invoke('abrir_ligacao', { url });
+
+function tratarEndereco(ev) {
+  const a = ev.target.closest('.endereco');
+  if (!a) return;
+  if (ev.type === 'keydown' && ev.key !== 'Enter') return;
+  ev.preventDefault();
+  abrirLigacao(a.dataset.url).catch(e => {
+    const erro = $('#composer-erro');
+    if (erro && !$('#composer').hidden) erro.textContent = `não consegui abrir o endereço: ${e}`;
+    else alertar(e);
+  });
+}
+
 /* ---------- desenhar ---------- */
 
 /** Quantas mensagens por ler tem um servidor, somando os canais. */
@@ -848,7 +902,7 @@ function umaMensagem(m, anterior, onde) {
     cab.append(elemento('time', null, horaCurta(m.ts_ms)));
     corpo.append(cab);
   }
-  corpo.append(elemento('p', null, m.texto));
+  corpo.append(corpoDaMensagem(m.texto));
   // A marca de entrega (#94), só nas minhas: existe sempre, mostra-se só por confirmar.
   if (m.autor === vista.chave) corpo.append(elemento('span', 'msg__estado', '◌ por confirmar'));
   art.append(corpo);
@@ -2395,6 +2449,13 @@ function recusarAnexoColado(ev) {
 }
 $('#entrada').addEventListener('paste', recusarAnexoColado);
 $('#sala-entrada').addEventListener('paste', recusarAnexoColado);
+
+for (const id of ['#stream', '#sala-fluxo']) {
+  const el = $(id);
+  if (!el) continue;
+  el.addEventListener('click', tratarEndereco);
+  el.addEventListener('keydown', tratarEndereco);
+}
 
 /* ==========================================================================
    A voz, pelo mesmo caminho do ecrã.
@@ -4282,6 +4343,10 @@ document.addEventListener('contextmenu', ev => {
   const membro = ev.target.closest('.member');
   const seleccao = String(getSelection()).trim();
 
+  const endereco = ev.target.closest('.endereco');
+  if (endereco) {
+    itens.push({ rotulo: 'Copiar endereço', accao: () => navigator.clipboard.writeText(endereco.dataset.url) });
+  }
   if (seleccao) {
     itens.push({ rotulo: 'Copiar', accao: () => navigator.clipboard.writeText(seleccao) });
   }
@@ -6262,7 +6327,9 @@ async function desenharChatDaSala() {
     const quem = elemento('span', 'salachat__quem');
     quem.append(rotuloDePessoa(m.autor, m.autor_nome));
     linha.append(quem);
-    linha.append(elemento('span', 'salachat__txt', m.texto));
+    const txt = elemento('span', 'salachat__txt');
+    for (const no of [...corpoDaMensagem(m.texto).childNodes]) txt.append(no);
+    linha.append(txt);
     fluxo.append(linha);
   }
   // Só se salta para o fim se já lá estavas: senão roubava-te a leitura a meio.
@@ -9282,6 +9349,47 @@ async function segundoCanalDeTexto(servidorId) {
       }
     } catch (e) {
       diz(`ui rascunho: REBENTOU ${e && e.message ? e.message : e}`);
+    }
+
+    // ---- ENDERECOS NAS MENSAGENS (#96) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const frase = 'vê https://exemplo.pt/a, e (https://x.y/z) fim.';
+      const p1 = corpoDaMensagem(frase);
+      const as = [...p1.querySelectorAll('a')];
+      const p2 = corpoDaMensagem('<img src=x onerror=alert(1)> https://a.b');
+      diz(`ui ligacoes: n=${as.length} hrefs=${as.filter(a => a.hasAttribute('href')).length}`
+        + ` urls=${JSON.stringify(as.map(a => a.dataset.url))} texto-intacto=${p1.textContent === frase}`);
+      diz(`ui ligacoes xss: img-no-dom=${p2.querySelectorAll('img').length} texto-mostra-img=${p2.textContent.includes('<img')}`);
+      // O clique e a tecla, com um espiao no lugar do comando -- nada se abre.
+      const antesAbrir = abrirLigacao;
+      let pedido = null;
+      abrirLigacao = url => { pedido = url; return Promise.resolve(); };
+      const origem = location.origin;
+      const art = elemento('article', 'msg');
+      art.append(p1);
+      $('#stream').append(art);
+      as[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await pausa(100);
+      const porClique = pedido;
+      pedido = null;
+      as[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      await pausa(50);
+      const porTecla = pedido;
+      // O menu de contexto em cima do endereco oferece «Copiar endereco».
+      as[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 }));
+      const copiar = [...document.querySelectorAll('#menu button')].some(b => b.textContent === 'Copiar endereço');
+      $('#menu').hidden = true;
+      art.remove();
+      abrirLigacao = antesAbrir;
+      diz(`ui ligacao clique: pedido="${porClique}" por-tecla="${porTecla}" origin-mudou=${location.origin !== origem}`
+        + ` menu-copiar-endereco=${copiar}`);
+      // As recusas do Rust pelo caminho real: nada disto abre coisa nenhuma.
+      const tenta = async url => { try { await invoke('abrir_ligacao', { url }); return 'ABRIU'; } catch (e) { return 'recusou'; } };
+      diz(`ui ligacao recusa: file=${await tenta('file:///C:/x')} javascript=${await tenta('javascript:1')}`
+        + ` espaco=${await tenta('https://a b')} ftp=${await tenta('ftp://x')}`);
+    } catch (e) {
+      diz(`ui ligacoes: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------
