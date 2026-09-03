@@ -249,12 +249,19 @@ pub struct Servidor {
     /// pela porta da frente.
     pub convidou: Option<String>,
     pub com: Option<String>,
-    /// Cache de `autores_provados`, refeita a cada `merge`/`escrever`.
+    /// Cache de `autores_provados`, PREGUIÇOSA (#99): nasce vazia e enche-se na primeira
+    /// vez que alguém pergunta — que é quando alguém se liga (`aprender_dos_logs`, o
+    /// porteiro do `aplicar`) — e não no arranque, onde era uma passagem de decifragem
+    /// completa POR servidor antes de a janela pintar.
     ///
-    /// Sem isto, o `aprender_dos_logs` decifrava TODOS os logs — com o lock global preso —
-    /// a cada ligação de qualquer estranho. Era um caminho de negação de serviço aberto por
-    /// mim ao fechar outro.
-    provados: std::collections::BTreeSet<String>,
+    /// Enquanto está por inicializar, `escrever`/`merge_contado` não lhe tocam: a
+    /// inicialização lê o log, que já inclui essas entradas. Depois de inicializada,
+    /// mantêm-na eles. NUNCA `get().unwrap()` — é `autores_provados()` que a garante.
+    ///
+    /// Sem cache nenhuma, o `aprender_dos_logs` decifrava TODOS os logs — com o lock global
+    /// preso — a cada ligação de qualquer estranho. Era um caminho de negação de serviço
+    /// aberto por mim ao fechar outro.
+    provados: std::cell::OnceCell<std::collections::BTreeSet<String>>,
 }
 
 /// Quanto é que o relógio de outra pessoa pode estar adiantado antes de eu deixar de
@@ -415,7 +422,7 @@ impl Servidor {
     ///
     /// A cache `provados` é privada de propósito: se fosse pública, alguém a preencheria à
     /// mão e o «provado» deixava de querer dizer alguma coisa. Aqui ela é sempre derivada do
-    /// log, com uma passagem de decifragem.
+    /// log — e só quando for precisa (#99): construir um servidor não decifra nada.
     pub fn novo(
         id: String,
         chave: [u8; 32],
@@ -424,7 +431,7 @@ impl Servidor {
         convidou: Option<String>,
         com: Option<String>,
     ) -> Self {
-        let mut s = Servidor {
+        Servidor {
             id,
             chave,
             log,
@@ -432,9 +439,7 @@ impl Servidor {
             convidou,
             com,
             provados: Default::default(),
-        };
-        s.recontar_provados();
-        s
+        }
     }
 
     /// Decifra o que conseguir e devolve as entradas prontas a aplicar, pela ordem do log.
@@ -491,7 +496,8 @@ impl Servidor {
     /// É este o conjunto que o porteiro da rede usa. Enquanto era «quem se ligou e disse o id»,
     /// bastava uma mensagem vazia para entrar.
     pub fn autores_provados(&self) -> &std::collections::BTreeSet<String> {
-        &self.provados
+        self.provados
+            .get_or_init(|| self.aplicaveis().0.into_iter().map(|a| a.autor).collect())
     }
 
     /// Quantas mensagens por canal ficaram por ler, e a hora da mais recente.
@@ -594,6 +600,10 @@ impl Servidor {
     /// O que aqui se corrige é ter passado a ser o dobro.
     pub fn estado_e_entradas(&self) -> (EstadoDoServidor, Vec<Aplicavel>) {
         let (aps, _) = self.aplicaveis();
+        // A passagem que já se faz semeia a cache dos provados de graça (#99).
+        let _ = self
+            .provados
+            .get_or_init(|| aps.iter().map(|a| a.autor.clone()).collect());
         let estado = modelo::reconstruir(&aps);
         (estado, aps)
     }
@@ -675,7 +685,10 @@ impl Servidor {
                 CABECA_DESSINCRONIZADA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        self.provados.insert(e.author.clone());
+        // Só se a cache já existe: por inicializar, será lida do log, que já tem isto.
+        if let Some(p) = self.provados.get_mut() {
+            p.insert(e.author.clone());
+        }
         Ok(e)
     }
 
@@ -731,16 +744,13 @@ impl Servidor {
                 decifrar_carga(&self.chave, e).is_some()
             })
             .collect();
-        for e in &boas {
-            self.provados.insert(e.author.clone());
+        if let Some(p) = self.provados.get_mut() {
+            for e in &boas {
+                p.insert(e.author.clone());
+            }
         }
         let recusadas = total - boas.len();
         Ok((self.log.merge(boas)?, recusadas))
-    }
-
-    /// Refaz a cache de quem provou. Só ao abrir a app, e uma vez por servidor.
-    fn recontar_provados(&mut self) {
-        self.provados = self.aplicaveis().0.into_iter().map(|a| a.autor).collect();
     }
 }
 
@@ -828,7 +838,7 @@ impl App {
                     continue;
                 }
             };
-            let mut srv = Servidor {
+            let srv = Servidor {
                 id: s.id.clone(),
                 chave,
                 log,
@@ -837,9 +847,8 @@ impl App {
                 com: s.com.clone(),
                 provados: Default::default(),
             };
-            // Uma passagem por servidor, aqui e só aqui. A partir daqui a cache mantém-se
-            // sozinha no `merge_verificado` e no `escrever`.
-            srv.recontar_provados();
+            // Nenhuma passagem de decifragem aqui (#99): a cache dos provados enche-se
+            // quando alguém se ligar, ou de graça na primeira `estado_e_entradas`.
             servidores.insert(s.id.clone(), srv);
         }
 
@@ -1184,8 +1193,9 @@ impl App {
         )?;
 
         let log = blog::Log::load(caminho_do_log(&id))?;
-        self.servidores.lock().unwrap().insert(id.clone(), {
-            let mut srv = Servidor {
+        self.servidores.lock().unwrap().insert(
+            id.clone(),
+            Servidor {
                 id: id.clone(),
                 chave,
                 log,
@@ -1195,10 +1205,8 @@ impl App {
                 convidou: None,
                 com: Some(peer.to_string()),
                 provados: Default::default(),
-            };
-            srv.recontar_provados();
-            srv
-        });
+            },
+        );
         self.gravar_indice()?;
         Ok(id)
     }
@@ -2404,6 +2412,94 @@ mod testes {
     /// ser corrigido tem o carimbo cru ATRÁS da marca e o instante à frente — com o carimbo
     /// cru ficava escondida. E o veneno (um carimbo dias à frente) continua a não contar sem
     /// calar o que vem depois dele.
+    /// O `provados` é PREGUIÇOSO e certo (#99): construir um servidor não decifra nada; a
+    /// primeira pergunta custa uma passagem e responde com toda a gente; a segunda não
+    /// custa; e o que se escreve ou junta ANTES da primeira pergunta entra na mesma.
+    #[test]
+    fn provados_e_preguicoso_e_certo() {
+        let dir = std::env::temp_dir().join(format!("bruma-provados-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gente: Vec<crypto::Identity> = (1u8..=3)
+            .map(|k| crypto::Identity::from_seed(&[k; 32]))
+            .collect();
+        let chave = [9u8; 32];
+        let hex = |q: &crypto::Identity| HEXLOWER.encode(q.signing.verifying_key().as_bytes());
+        let selada = |texto: &str| {
+            let carga = Carga::Mensagem {
+                canal: "geral".into(),
+                texto: texto.into(),
+            };
+            crypto::seal(&chave, &serde_json::to_vec(&carga).unwrap()).unwrap()
+        };
+        let t = agora_ms();
+        let mut log = blog::Log::load(dir.join("s.json")).unwrap();
+        for (i, quem) in gente.iter().enumerate() {
+            let (nonce, ct) = selada(&format!("olá {i}"));
+            log.append_local(&quem.signing, nonce, ct, t + i as u64)
+                .unwrap();
+        }
+        let dec = || DECIFRAGENS_NA_THREAD.with(|c| c.get());
+
+        let d0 = dec();
+        let mut srv = Servidor::novo("cc".repeat(16), chave, log, vec![], None, None);
+        assert_eq!(dec() - d0, 0, "construir não decifra");
+
+        // Escrever e juntar ANTES da primeira pergunta: não custa, e não se perde.
+        let quarto = crypto::Identity::from_seed(&[4u8; 32]);
+        let mut outro_log = blog::Log::load(dir.join("q.json")).unwrap();
+        let (nonce, ct) = selada("juntada");
+        outro_log
+            .append_local(&quarto.signing, nonce, ct, t + 10)
+            .unwrap();
+        srv.merge_contado(outro_log.ordered()).unwrap();
+        srv.escrever(
+            &gente[0].signing,
+            &Carga::Mensagem {
+                canal: "geral".into(),
+                texto: "antes".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dec() - d0,
+            0,
+            "escrever e juntar antes da primeira pergunta não decifram"
+        );
+
+        let d1 = dec();
+        let provados = srv.autores_provados().clone();
+        assert_eq!(dec() - d1, 1, "a primeira pergunta custa uma passagem");
+        for q in &gente {
+            assert!(provados.contains(&hex(q)), "os três autores do log");
+        }
+        assert!(
+            provados.contains(&hex(&quarto)),
+            "o juntado antes da pergunta também"
+        );
+        let d2 = dec();
+        let _ = srv.autores_provados();
+        assert_eq!(dec() - d2, 0, "a segunda pergunta não custa");
+
+        // Depois de inicializada, é o `escrever`/`merge_contado` que a mantém.
+        let quinto = crypto::Identity::from_seed(&[5u8; 32]);
+        srv.escrever(
+            &quinto.signing,
+            &Carga::Mensagem {
+                canal: "geral".into(),
+                texto: "depois".into(),
+            },
+        )
+        .unwrap();
+        let d3 = dec();
+        assert!(
+            srv.autores_provados().contains(&hex(&quinto)),
+            "quem escreve depois entra"
+        );
+        assert_eq!(dec() - d3, 0, "sem passagem nova");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn o_por_ler_no_relogio_logico() {
         let dir = std::env::temp_dir().join(format!("bruma-instante-{}", std::process::id()));

@@ -842,6 +842,22 @@ pub fn contadores() -> serde_json::Value {
     })
 }
 
+/// Os tempos do arranque (#99), só em debug: quando o processo nasceu (época, ms), quanto
+/// custou o núcleo (`App::arrancar`) e quanto custou a rede (`Rede::arrancar`) — os dois
+/// passos que prendem a thread da interface antes de a janela pintar. O `--medir-ui`
+/// junta-lhes os carimbos do lado do JS.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn tempos_de_arranque() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    serde_json::json!({
+        "inicio_ms": crate::ARRANQUE_INICIO_MS.load(Relaxed),
+        "ate_setup_ms": crate::ARRANQUE_ATE_SETUP_MS.load(Relaxed),
+        "nucleo_ms": crate::ARRANQUE_NUCLEO_MS.load(Relaxed),
+        "rede_ms": crate::ARRANQUE_REDE_MS.load(Relaxed),
+    })
+}
+
 #[tauri::command]
 pub fn mensagens(servidor: String, canal: String, app: State<Arc<App>>) -> R<Vec<MensagemVista>> {
     let servidores = app.servidores.lock().map_err(erro)?;

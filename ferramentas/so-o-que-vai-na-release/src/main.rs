@@ -88,6 +88,7 @@ const ANDAIMES: &[&str] = &[
     "escapou_alguma_coisa",
     "autoteste_pedido",
     "contadores",
+    "tempos_de_arranque",
     "autoteste_par",
     "medir_ui_pedido",
 ];

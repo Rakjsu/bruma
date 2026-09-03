@@ -175,8 +175,9 @@ fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 
         comandos::autoteste_pedido,
         comandos::autoteste_par,
         comandos::medir_ui_pedido,
-        // E os contadores de medição do log (#154, #90).
-        comandos::contadores
+        // E os contadores de medição do log (#154, #90) e os tempos do arranque (#99).
+        comandos::contadores,
+        comandos::tempos_de_arranque
     ]
 }
 
@@ -217,7 +218,26 @@ Os teus dados NÃO foram apagados.          Há mais detalhes em:
     std::process::exit(1);
 }
 
+/// O relógio do arranque (#99): posto na PRIMEIRA linha de `main`, lido no `setup` depois
+/// do núcleo e depois da rede — os dois passos que prendem a thread da interface com a
+/// janela criada mas sem pintar. Vai para o registo como `[arranque] …` e, em debug, para o
+/// comando `tempos_de_arranque` que o `--medir-ui` junta aos carimbos do JS.
+pub static ARRANQUE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+pub static ARRANQUE_INICIO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ARRANQUE_ATE_SETUP_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static ARRANQUE_NUCLEO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ARRANQUE_REDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() {
+    let _ = ARRANQUE.set(std::time::Instant::now());
+    ARRANQUE_INICIO_MS.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // A PRIMEIRA coisa: o `std` guarda o descritor de saída na primeira utilização e não
     // volta a perguntar, portanto isto tem de acontecer antes de alguém escrever seja o
     // que for. Ver `registo.rs`.
@@ -284,10 +304,20 @@ fn main() {
             // janela abrir, piscar e desaparecer. A pior falha silenciosa que este projecto
             // tem. Se o arranque falha, mostra-se uma janela nativa com a razão e o caminho do
             // registo, e sai-se com dignidade.
+            // Até aqui foi o Tauri (o runtime, os plugins, a janela e o WebView2); daqui
+            // para a frente é nosso, e mede-se à parte.
+            let ate_setup_ms = ARRANQUE
+                .get()
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            ARRANQUE_ATE_SETUP_MS.store(ate_setup_ms, std::sync::atomic::Ordering::Relaxed);
+            let relogio = std::time::Instant::now();
             let nucleo = match estado::App::arrancar() {
                 Ok(n) => Arc::new(n),
                 Err(e) => avisar_e_sair(&format!("{e}")),
             };
+            let nucleo_ms = relogio.elapsed().as_millis() as u64;
+            ARRANQUE_NUCLEO_MS.store(nucleo_ms, std::sync::atomic::Ordering::Relaxed);
             let ecra = Arc::new(comandos::Ecra::default());
             let _ = comandos::ECRA.set(ecra.clone());
             app.manage(ecra);
@@ -307,6 +337,17 @@ fn main() {
                 nucleo.clone(),
                 janela.clone(),
             ))?;
+            let rede_ms = (relogio.elapsed().as_millis() as u64).saturating_sub(nucleo_ms);
+            ARRANQUE_REDE_MS.store(rede_ms, std::sync::atomic::Ordering::Relaxed);
+            // O arranque medido antes de o mexer (#99): até aqui a janela existe mas não
+            // pintou. Um número no registo, para se decidir com ele e não com um palpite.
+            eprintln!(
+                "[arranque] até ao setup {} ms · núcleo {} ms ({} servidores) · rede {} ms",
+                ate_setup_ms,
+                nucleo_ms,
+                nucleo.servidores.lock().map(|s| s.len()).unwrap_or(0),
+                rede_ms
+            );
 
             println!("Bruma pronto.");
             println!("  dados      : {}", estado::raiz().display());

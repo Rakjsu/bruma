@@ -996,7 +996,11 @@ async fn vigiar_ligacoes(rede: Arc<Rede>, app: Arc<App>, janela: AppHandle) {
             let minha = app.minha_chave();
             let mut v: Vec<String> = s
                 .values()
-                .filter(|x| x.com.is_none() || x.autores_provados().contains(&minha))
+                // «Já escrevi» lê-se do log SEM decifrar (#99): para a MINHA chave é o
+                // mesmo que «provado» — as minhas entradas verificam e decifram sempre — e
+                // não dispara a passagem preguiçosa em cada conversa logo no arranque. Só
+                // vale para a minha chave; não generalizar a outros pares.
+                .filter(|x| x.com.is_none() || x.log.escreveu(&minha))
                 .flat_map(|x| x.peers.clone())
                 .collect();
             // E quem me convidou. Ele ainda não provou nada — e por isso não passa o

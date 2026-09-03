@@ -1,3 +1,6 @@
+/* O arranque, medido (#99): o primeiro carimbo é a primeira linha deste ficheiro. */
+const arranque = { script: Date.now(), casca: null, escrever: null, contadoresAntes: null };
+
 /* ==========================================================================
    Bruma — interface.
    Nenhuma chave privada passa por aqui: o JavaScript pede ações, o Rust assina e cifra.
@@ -886,8 +889,8 @@ function desenharTopo() {
 }
 
 async function desenharTudo() {
+  desenhosCompletos += 1;
   vista = await invoke('estado');
-  amigos = await invoke('amigos').catch(() => amigos);
   $('#meu-nome').textContent = vista.nome || 'sem nome';
   $('#minha-chave').textContent = chaveCurta(vista.chave);
   pintar($('#meu-avatar'), vista.chave);
@@ -913,6 +916,16 @@ async function desenharTudo() {
   desenharCanais();
   desenharMembros();
   desenharTopo();
+  if (arranque.casca === null) arranque.casca = Date.now();
+  // A casca primeiro (#99): a lista de amigos é barata, mas era mais uma ida ao Rust ANTES
+  // de se pintar fosse o que fosse. Vem depois; se mudou, membros e conversas pintam-se
+  // outra vez com os nomes novos — no arranque é um piscar, e é aceitável.
+  const amigosAntes = JSON.stringify(amigos);
+  amigos = await invoke('amigos').catch(() => amigos);
+  if (JSON.stringify(amigos) !== amigosAntes) {
+    desenharCanais();
+    desenharMembros();
+  }
   await desenharMensagens();
   desenharRodape();
 }
@@ -3545,13 +3558,50 @@ async function talvezAvisar() {
   }
 }
 
-listen('servidor-mudou', async ev => {
-  await desenharTudo();
-  await talvezAvisar();
-  // O chat da sala vive na coluna da direita, fora da vista de canal: se estivermos a
-  // ler um canal de texto, o desenharTudo não lhe toca e as mensagens novas não apareciam.
-  await desenharChatDaSala();
-});
+/* ---------- UMA RAJADA, UM REDESENHO (#157) ----------
+   O `aplicar` do Rust emite um `servidor-mudou` por `Msg::Nova` recebida: trinta mensagens
+   seguidas eram trinta `desenharTudo`, cada um a ir buscar o estado de TODOS os servidores.
+   Agora junta-se o que chega em 120 ms e decide-se uma vez: se o servidor (ou a conversa)
+   À FRENTE mudou, redesenha-se tudo; senão só o rail e as bolhas. O chat da sala de voz vive
+   na coluna da direita, fora da vista de canal — redesenha-se se a sala mudou. Nunca se perde
+   um redesenho: o que chega DURANTE um redesenho fica guardado e dispara outro no fim. */
+const mudancas = { ids: new Set(), timer: null };
+let mudancasRecebidas = 0;    // eventos `servidor-mudou` (e `peer-versao`) recebidos
+let desenhosCompletos = 0;    // `desenharTudo` corridos, por qualquer razão
+let refrescosPorMudanca = 0;  // rajadas resolvidas só com `refrescarBolhas`
+
+function anotarMudanca(id) {
+  mudancasRecebidas += 1;
+  mudancas.ids.add(String(id));
+  if (!mudancas.timer) mudancas.timer = setTimeout(redesenharPorMudanca, 120);
+}
+
+async function redesenharPorMudanca() {
+  const ids = [...mudancas.ids];
+  mudancas.ids.clear();
+  try {
+    const aFrente = modo === 'privado' ? conversaAtual : servidorAtual;
+    // Sem vista ainda, ou sem nada à frente (o primeiro servidor acabou de nascer), é o
+    // `desenharTudo` que escolhe o que mostrar — como sempre foi.
+    if (!vista || !aFrente || ids.includes(String(aFrente))) {
+      await desenharTudo();
+    } else {
+      refrescosPorMudanca += 1;
+      await refrescarBolhas();
+    }
+    // Compara fotografias do por-ler; a `vista` já está fresca nos dois ramos.
+    await talvezAvisar();
+    if (voz.servidor && ids.includes(String(voz.servidor))) await desenharChatDaSala();
+  } catch (e) {
+    console.error('o redesenho por mudança falhou', e);
+  } finally {
+    // O `null` fica num `finally`: um timer perdido numa excepção era nunca mais redesenhar.
+    mudancas.timer = null;
+    if (mudancas.ids.size) mudancas.timer = setTimeout(redesenharPorMudanca, 120);
+  }
+}
+
+listen('servidor-mudou', ev => anotarMudanca(ev.payload));
 /** A versão de cada par, por chave. Vazio até ele dizer.
  *
  *  Existe para a degradação deixar de ser muda (#4): quando chega uma mensagem que esta
@@ -3565,7 +3615,8 @@ listen('peer-versao', ev => {
   if (!chave) return;
   minhaVersao = minha;
   versaoDoPar.set(chave, dele);
-  desenharTudo();
+  // Entra no mesmo coalescedor (#157), como uma mudança do que está à frente.
+  anotarMudanca(modo === 'privado' ? conversaAtual : servidorAtual);
 });
 
 /** A etiqueta de versão de um par, ou null se estiver igual à minha (aí não há que dizer). */
@@ -5908,6 +5959,11 @@ function avisoNaConversa(id, texto) {
 
 /** Os avisos por sala/conversa, à espera de caber no ecrã. */
 const avisosPendentes = new Map();
+/** E os já pintados, por sala/conversa (#157): com o redesenho coalescido o aviso pinta-se
+ *  ANTES do redesenho, e uma reconstrução completa do stream (mudar de canal e voltar, uma
+ *  inserção a meio) levava-o — com a fila já vazia, ninguém o repunha. Agora repõe-se do que
+ *  se mostrou, não só do que está por mostrar. */
+const avisosMostrados = new Map();
 
 function pintarAvisos() {
   const zona = $('#stream');
@@ -5915,15 +5971,19 @@ function pintarAvisos() {
   // Só se mostram os da sala/conversa ABERTA — um aviso sobre outra sala no meio desta
   // conversa seria ruído no sítio errado. Os outros ficam na fila até lá se ir.
   const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
-  const fila = avisosPendentes.get(aberto);
-  if (!fila || !fila.length) return;
+  const fila = avisosPendentes.get(aberto) || [];
+  const mostrados = avisosMostrados.get(aberto) || [];
+  const todos = [...mostrados, ...fila.filter(t => !mostrados.includes(t))];
+  if (!todos.length) return;
   const noFim = noFimDo(zona);
-  for (const texto of fila) {
+  const noEcra = new Set([...zona.querySelectorAll('.aviso-sistema')].map(n => n.textContent));
+  for (const texto of todos) {
     // Não se repete o mesmo aviso: um redesenho a meio podia trazer a fila outra vez.
-    if ([...zona.querySelectorAll('.aviso-sistema')].some(n => n.textContent === texto)) continue;
+    if (noEcra.has(texto)) continue;
     zona.append(elemento('div', 'aviso-sistema', texto));
   }
   avisosPendentes.set(aberto, []);
+  avisosMostrados.set(aberto, todos);
   // Um aviso do sistema não puxa a página das mãos de quem está a ler mais acima (#23).
   if (noFim) zona.scrollTop = zona.scrollHeight;
 }
@@ -6701,8 +6761,20 @@ function pararDeAssistir() {
 
 /* ---------- arranque ---------- */
 
+// O carimbo de «já se pode escrever» (#99), visto do DOM: o atributo `hidden` do composer.
+{
+  const c = $('#composer');
+  if (c && window.MutationObserver) {
+    new MutationObserver(() => {
+      if (arranque.escrever === null && !c.hidden) arranque.escrever = Date.now();
+    }).observe(c, { attributes: true, attributeFilter: ['hidden'] });
+  }
+}
 
 (async () => {
+  // Só existe em debug; em release falha de imediato e fica `null`. É o «antes» da
+  // primeira vista (#99): quantas passagens de decifragem o arranque já custou.
+  arranque.contadoresAntes = await invoke('contadores').catch(() => null);
   voz.eu = await invoke('meu_endereco').catch(() => null);
   await desenharTudo();
   // A fotografia do que JÁ estava por ler, agora e não na primeira mensagem que chegar.
@@ -7411,6 +7483,13 @@ async function segundoCanalDeTexto(servidorId) {
         diz(`par nao lido: antes=${porLerAntes} so-ler-nao-mexeu=${depoisDeSoLer}`
           + ` depois-de-abrir=${porLerDepois}`
           + ` marca-devolveu-anterior=${antesDeMarcar >= 0} bolhas-no-ecra=${bolhasAgora}`);
+      }
+      if (volta === 6) {
+        // Nunca se perde um redesenho (#157): as mensagens «depois do atraso» chegam uma a
+        // uma, 2,5 s à parte, e cada uma tem de redesenhar. A coalescência prova-se no
+        // `--medir-ui`; aqui prova-se que ela não engole nada.
+        diz(`par redesenhos: servidor-mudou=${mudancasRecebidas}`
+          + ` desenharTudo=${desenhosCompletos} refrescos=${refrescosPorMudanca}`);
       }
 
       const gente = [...voz.presentes.keys()];
@@ -9002,6 +9081,102 @@ async function segundoCanalDeTexto(servidorId) {
       + ` titulos=${comTitulo}/${falsas.length} continuacao-depois-de-separador=${contDepoisDeSeparador}`);
   } catch (e) {
     diz(`ui stream: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- UMA RAJADA, UM REDESENHO (#157) ----
+  try {
+    const alvo = (vista.servidores || [])[0];
+    const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+    if (!alvo || !canal) {
+      diz('ui rajada: sem servidor/canal de texto para medir');
+    } else {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      fecharDefinicoes();
+      escolherServidor(alvo.id);
+      escolherCanal(canal.id);
+      await invoke('enviar', {
+        servidor: alvo.id, canal: canal.id, texto: 'para haver o que redesenhar (#157)',
+      }).catch(() => {});
+      await pausa(600);
+      // Os eventos: `emit` do JS (sem efeitos) e, se nao voltar ao `listen` desta webview,
+      // eventos REAIS -- um `enviar` por evento, que o Rust responde com `servidor-mudou`.
+      const emitir = async (id, n) => {
+        const m0 = mudancasRecebidas;
+        for (let i = 0; i < n; i++) window.__TAURI__.event.emit('servidor-mudou', id);
+        await pausa(150);
+        if (mudancasRecebidas - m0 >= n) return 'emit';
+        const pedidos = [];
+        for (let i = 0; i < n; i++) {
+          pedidos.push(invoke('enviar', { servidor: id, canal: canal.id, texto: `rajada ${i}` }).catch(() => {}));
+        }
+        await Promise.all(pedidos);
+        await pausa(150);
+        return 'enviar';
+      };
+      const d0 = desenhosCompletos, r0 = refrescosPorMudanca, m0 = mudancasRecebidas;
+      const via = await emitir(alvo.id, 20);
+      await pausa(700);
+      const chegaram = mudancasRecebidas - m0;
+      const aFrenteDesenhos = desenhosCompletos - d0;
+      const aFrenteRefrescos = refrescosPorMudanca - r0;
+
+      const d1 = desenhosCompletos, r1 = refrescosPorMudanca;
+      await emitir('nao-e-este-servidor', 5);
+      await pausa(700);
+      const outroDesenhos = desenhosCompletos - d1;
+      const outroRefrescos = refrescosPorMudanca - r1;
+
+      // Em modo privado compara-se com a CONVERSA a frente.
+      const modoAntes = modo, convAntes = conversaAtual;
+      modo = 'privado'; conversaAtual = 'conversa-de-teste';
+      const d2 = desenhosCompletos;
+      window.__TAURI__.event.emit('servidor-mudou', 'conversa-de-teste');
+      await pausa(700);
+      const privadoDesenhos = desenhosCompletos - d2;
+      modo = modoAntes; conversaAtual = convAntes;
+      escolherServidor(alvo.id);
+      escolherCanal(canal.id);
+      await pausa(500);
+
+      // O aviso do sistema sobrevive a uma reconstrucao completa do stream.
+      const TEXTO = 'aviso de teste (#157)';
+      avisoNaConversa(alvo.id, TEXTO);
+      await pausa(80);
+      const pintado = [...document.querySelectorAll('.aviso-sistema')].some(n => n.textContent === TEXTO);
+      limparStream($('#stream'));
+      await desenharMensagens();
+      await pausa(100);
+      const sobreviveu = [...document.querySelectorAll('.aviso-sistema')].some(n => n.textContent === TEXTO);
+      avisosMostrados.delete(alvo.id);
+      document.querySelectorAll('.aviso-sistema').forEach(n => n.remove());
+
+      diz(`ui rajada: via=${via} eventos=${chegaram} desenhos-completos=${aFrenteDesenhos}`
+        + ` refrescos=${aFrenteRefrescos}`
+        + ` outro-servidor: desenhos=${outroDesenhos} refrescos=${outroRefrescos}`
+        + ` privado: desenhos=${privadoDesenhos}`
+        + ` aviso-pintado=${pintado} aviso-sobrevive-a-reconstrucao=${sobreviveu}`);
+    }
+  } catch (e) {
+    diz(`ui rajada: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O ARRANQUE, MEDIDO (#99) ----
+  try {
+    const t = await invoke('tempos_de_arranque').catch(() => null);
+    const rel = x => (x === null || !t ? 'n/a' : x - t.inicio_ms);
+    const c0 = arranque.contadoresAntes;
+    // E o que se tirou: construir um servidor ja nao decifra nada (o `provados` e preguicoso).
+    const c1 = await invoke('contadores').catch(() => null);
+    await invoke('criar_servidor', { nome: 'medir provados' }).catch(() => null);
+    const c2 = await invoke('contadores').catch(() => null);
+    diz(`ui arranque: ms-ate-script=${rel(arranque.script)} ms-ate-casca=${rel(arranque.casca)}`
+      + ` ms-ate-poder-escrever=${rel(arranque.escrever)}`
+      + ` ate-setup=${t ? t.ate_setup_ms : 'n/a'} nucleo=${t ? t.nucleo_ms : 'n/a'} rede=${t ? t.rede_ms : 'n/a'}`
+      + ` casca-antes-de-escrever=${arranque.casca !== null && arranque.escrever !== null && arranque.casca <= arranque.escrever}`
+      + ` decifragens-antes-da-primeira-vista=${c0 ? c0.decifragens : 'n/a'}`
+      + ` decifragens-ao-criar-servidor=${c1 && c2 ? c2.decifragens - c1.decifragens : 'n/a'}`);
+  } catch (e) {
+    diz(`ui arranque: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----
