@@ -415,11 +415,12 @@ async function desenharMensagens() {
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
 
-  const msgs = await invoke('mensagens', { servidor: s.id, canal: canal.id }).catch(() => []);
+  // UMA passagem pelo log (#90): as mensagens e as marcas vêm juntas.
+  const aberto = await invoke('abrir_canal', { servidor: s.id, canal: canal.id }).catch(() => null);
   // Se entretanto se navegou para outro sítio, este desenho é de um canal que já ninguém
   // quer ver (#162): nem toca no stream, nem pede para marcar nada como lido.
   if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
-  if (!msgs.length) {
+  if (!aberto || !aberto.mensagens.length) {
     limparStream(stream);
     const v = elemento('div', 'vazio');
     v.append(elemento('h3', null, `#${canal.nome}`));
@@ -428,7 +429,7 @@ async function desenharMensagens() {
     return;
   }
 
-  await escreverMensagens(stream, msgs, s.id, canal.id, minhaVez);
+  await escreverMensagens(stream, aberto, s.id, canal.id, minhaVez);
   // Os avisos do sistema (#196, #131) voltam a seguir ao redesenho que os teria apagado.
   pintarAvisos();
 }
@@ -541,7 +542,11 @@ function actualizarBotaoDoFim() {
   btn.textContent = n > 0 ? `↓ ${n > 99 ? '99+' : n} novas abaixo` : '↓ ir para o fim';
 }
 
-async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = geracaoDaVista) {
+async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez = geracaoDaVista) {
+  // `aberto` é o que `abrir_canal` devolveu — ou uma lista crua, nas medições.
+  const msgs = Array.isArray(aberto) ? aberto : aberto.mensagens;
+  const lidoAntes = Array.isArray(aberto) ? 0 : aberto.lido_antes;
+  const ultima = Array.isArray(aberto) ? 0 : aberto.ultima;
   const onde = `${servidorId}/${canalId}`;
   // «Acabei de abrir este canal» lê-se ANTES de a marca ser reposta: é o que decide se a
   // linha das novas vai ao centro e se o scroll vai ao fim.
@@ -568,12 +573,9 @@ async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = g
   ultimoMarcarPedido = aFrente;
   marcarPedidos.push({ onde, marcar: aFrente });
   if (marcarPedidos.length > 8) marcarPedidos.shift();
-  const antes = await invoke('marcar_lido', {
-    servidor: servidorId, canal: canalId, marcar: aFrente,
-  }).catch(() => null);
-  // Navegou-se durante o `marcar_lido`: o `antes` é de um canal que já não está à frente
-  // e NÃO entra no `marcaDaVista` de quem entretanto chegou (#162).
-  if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
+  // Já não há uma segunda passagem pelo log aqui (#90): a marca de antes veio com as
+  // mensagens, e a de depois vai por `marcar_lido_ate`, sem decifrar nada.
+  const antes = lidoAntes;
 
   // A linha fixa-se na PRIMEIRA vez que se olha para este canal, e fica.
   if (marcaDaVista.antes === null && antes !== null) marcaDaVista.antes = antes;
@@ -625,7 +627,8 @@ async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = g
       anterior = null;
     }
     // A minha própria mensagem nunca puxa a linha: eu sei o que escrevi.
-    if (!linhaPosta && corte > 0 && m.ts_ms > corte && m.autor !== vista.chave) {
+    // No INSTANTE efectivo e não no carimbo cru (#198): é o eixo da marca de leitura.
+    if (!linhaPosta && corte > 0 && m.instante > corte && m.autor !== vista.chave) {
       linha = elemento('div', 'novas-aqui', 'novas mensagens');
       stream.append(linha);
       linhaPosta = true;
@@ -657,7 +660,12 @@ async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = g
   }
   actualizarBotaoDoFim();
 
-  if (aFrente) await esquecerPorLer(servidorId, canalId);
+  if (aFrente) {
+    if (ultima > 0) {
+      invoke('marcar_lido_ate', { servidor: servidorId, canal: canalId, ate: ultima }).catch(() => {});
+    }
+    await esquecerPorLer(servidorId, canalId);
+  }
 }
 
 /** O que se faz quando um canal ficou lido: o contador na barra tem de desaparecer agora,
@@ -755,9 +763,10 @@ async function desenharMensagensPrivadas() {
   // A conversa deixa de ficar em BRANCO durante a chamada ao Rust: limpava-se antes do
   // `await` e a selecção morria a cada mensagem que chegasse. Limpa-se quando há o que
   // escrever — e só se ninguém navegou entretanto (#162).
-  const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
+  const aberto = await invoke('abrir_canal', { servidor: c.id, canal: c.canal }).catch(() => null);
   if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
-  await escreverMensagens(stream, msgs, c.id, c.canal, minhaVez);
+  if (!aberto) return;
+  await escreverMensagens(stream, aberto, c.id, c.canal, minhaVez);
   pintarAvisos();
 }
 
@@ -8915,7 +8924,7 @@ async function segundoCanalDeTexto(servidorId) {
     const recAoTrocar = reconstrucoesDoStream - r1;
     // Uma insercao no MEIO (um merge com uma entrada antiga) tem de reconstruir.
     const r2 = reconstrucoesDoStream;
-    const falsa = { id: 'inserida-no-meio', autor: 'x', autor_nome: 'x', canal: canal.id, ts_ms: msgs[30].ts_ms, texto: 'inserida' };
+    const falsa = { id: 'inserida-no-meio', autor: 'x', autor_nome: 'x', canal: canal.id, ts_ms: msgs[30].ts_ms, instante: msgs[30].instante, texto: 'inserida' };
     janelaComFoco = false;
     await escreverMensagens(stream, [...msgs.slice(0, 30), falsa, ...msgs.slice(30)], alvo.id, canal.id);
     const recMeio = reconstrucoesDoStream - r2;
@@ -8947,7 +8956,7 @@ async function segundoCanalDeTexto(servidorId) {
     msgs = await invoke('mensagens', { servidor: alvo.id, canal: canal.id }).catch(() => []);
     const chaveReal = vista.chave;
     vista.chave = 'ninguem';
-    marcaDaVista = { onde: `${alvo.id}/${canal.id}`, antes: msgs[29].ts_ms };
+    marcaDaVista = { onde: `${alvo.id}/${canal.id}`, antes: msgs[29].instante };
     desenhado.onde = null;
     janelaComFoco = false;
     await desenharMensagens();
@@ -8975,8 +8984,9 @@ async function segundoCanalDeTexto(servidorId) {
     const falsas = [];
     for (let i = 0; i < 60; i++) {
       const dia = i < 20 ? 15 : i < 40 ? 1 : 0;
+      const ts = agora - dia * 86400000 - (60 - i) * 60000;
       falsas.push({ id: `f${i}`, autor: i % 2 ? 'x' : 'y', autor_nome: 'x', canal: 'canal-falso',
-        ts_ms: agora - dia * 86400000 - (60 - i) * 60000, texto: `falsa ${i}` });
+        ts_ms: ts, instante: ts, texto: `falsa ${i}` });
     }
     janelaComFoco = false;
     desenhado.onde = null;

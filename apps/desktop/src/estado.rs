@@ -311,6 +311,18 @@ impl App {
     }
 }
 
+/// Medição: passagens de decifragem pelo log (uma por `aplicaveis`). Abrir um canal devia
+/// custar UMA.
+pub static DECIFRAGENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// O mesmo contador, so desta thread: e o que um teste le, porque os testes correm em
+    /// paralelo e o estatico soma o que as outras threads fazem.
+    pub static DECIFRAGENS_NA_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Medição: quantas vezes a cabeça em cache do log foi apanhada diferente da recalculada.
+pub static CABECA_DESSINCRONIZADA: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 impl Servidor {
     pub(crate) fn para_teste(id: &str) -> Self {
@@ -430,13 +442,15 @@ impl Servidor {
     /// O que não decifrar é **ignorado em silêncio, não rejeitado**: numa app onde a chave
     /// pode rodar, ter entradas que já não se conseguem ler é normal, não é corrupção.
     pub fn aplicaveis(&self) -> (Vec<Aplicavel>, Vec<String>) {
+        DECIFRAGENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DECIFRAGENS_NA_THREAD.with(|c| c.set(c.get() + 1));
         let mut saida = Vec::new();
         let mut ids = Vec::new();
-        for e in self.log.ordered() {
-            let Ok(id) = e.hash_hex() else {
-                continue;
-            };
-            let Some(claro) = decifrar_carga(&self.chave, &e) else {
+        // Por referência e com o instante já calculado (#154, #198): antes clonava-se o log
+        // inteiro e recalculava-se o hash de cada entrada — a partir da chave do mapa onde
+        // ela já estava — a cada redesenho.
+        for (instante, id, e) in self.log.ordered_ref() {
+            let Some(claro) = decifrar_carga(&self.chave, e) else {
                 continue;
             };
             // LEITURA EM DOIS PASSOS (#8, #20).
@@ -459,9 +473,10 @@ impl Servidor {
             saida.push(Aplicavel {
                 autor: e.author.clone(),
                 ts_ms: e.ts_ms,
+                instante,
                 carga,
             });
-            ids.push(id);
+            ids.push(id.to_string());
         }
         (saida, ids)
     }
@@ -532,19 +547,40 @@ impl Servidor {
     /// única mensagem com o ano 9999 marcava o canal como lido para sempre: tudo o que
     /// viesse depois nascia já «lido», em silêncio.
     pub fn ultima_mensagem(&self, canal: &str, eu: &str) -> i64 {
+        Self::ultima_das_entradas(&self.aplicaveis().0, canal, eu)
+    }
+
+    /// A marca até onde um canal fica lido, a partir de entradas JÁ decifradas — para quem
+    /// abre um canal fazer UMA passagem (#90).
+    ///
+    /// O VALOR é o instante efectivo (#198), o mesmo eixo do por-ler; o FILTRO do veneno
+    /// fica no carimbo cru, de propósito: o instante propaga-se (`max(ts, pai + 1)`) e um
+    /// ano 9999 empurraria todos os descendentes para lá do limite — filtrar pelo instante
+    /// calava a contagem de tudo o que viesse depois do veneno, para sempre. Com o filtro no
+    /// cru o veneno não conta, os descendentes contam com instantes enormes, a marca avança
+    /// até eles, e os seguintes (pai + 1) continuam a contar.
+    pub fn ultima_das_entradas(aps: &[Aplicavel], canal: &str, eu: &str) -> i64 {
         let limite = agora_ms() as i64 + DESVIO_TOLERADO_MS;
-        self.aplicaveis()
-            .0
-            .iter()
+        aps.iter()
             .filter_map(|a| match &a.carga {
                 Carga::Mensagem { canal: c, .. } if c == canal && a.autor != eu => {
                     let ts = a.ts_ms.min(i64::MAX as u64) as i64;
-                    (ts <= limite).then_some(ts)
+                    (ts <= limite).then_some(a.instante.min(i64::MAX as u64) as i64)
                 }
                 _ => None,
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// Abrir um canal numa passagem só (#90): as mensagens e a marca até onde ele fica lido.
+    /// Antes eram duas passagens pelo log (`mensagens` + `marcar_lido`) por cada abertura.
+    pub fn abrir_canal(&self, canal: &str, eu: &str) -> (Vec<MensagemVista>, i64) {
+        let (aps, ids) = self.aplicaveis();
+        let estado = modelo::reconstruir(&aps);
+        let mensagens = modelo::mensagens_do_canal(&aps, &ids, canal, &estado);
+        let ultima = Self::ultima_das_entradas(&aps, canal, eu);
+        (mensagens, ultima)
     }
 
     /// O estado e o que falta ler, de UMA passagem pelo log.
@@ -587,10 +623,14 @@ impl Servidor {
                 .get(&App::chave_de_leitura(&self.id, canal))
                 .copied()
                 .unwrap_or(0);
-            if ts > ate {
+            // A comparação é no INSTANTE (#198): uma mensagem escrita depois de um relógio
+            // corrigido tem um carimbo cru menor do que a marca e um instante maior — com o
+            // carimbo cru ficava escondida do por-ler, para sempre.
+            let instante = a.instante.min(i64::MAX as u64) as i64;
+            if instante > ate {
                 let e = fora.entry(canal.clone()).or_insert((0, 0));
                 e.0 += 1;
-                e.1 = e.1.max(ts);
+                e.1 = e.1.max(instante);
             }
         }
         fora
@@ -625,6 +665,16 @@ impl Servidor {
             crypto::seal(&self.chave, &claro)?
         };
         let e = self.log.append_local(signing, nonce, ct, agora_ms())?;
+        // A cabeça em cache confere-se contra a recalculada em cada escrita — só em debug,
+        // que é onde os guiões correm, e sem bandeira: é verificação, não um andaime.
+        #[cfg(debug_assertions)]
+        {
+            let calc = self.log.cabeca_recalculada().map(|(_, h)| h);
+            if calc.as_deref() != Some(self.log.head().as_str()) {
+                eprintln!("[log] CABEÇA EM CACHE ≠ RECALCULADA em {}", self.id);
+                CABECA_DESSINCRONIZADA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.provados.insert(e.author.clone());
         Ok(e)
     }
@@ -2350,6 +2400,95 @@ mod testes {
     /// a partir de quando, e o que não conta. Um teste que precisa de duas instâncias
     /// ligadas mede a orquestração e só de passagem a decisão — e quando falha não diz qual
     /// das duas se partiu.
+    /// O por-ler no relógio lógico (#198): uma mensagem escrita depois de o relógio do outro
+    /// ser corrigido tem o carimbo cru ATRÁS da marca e o instante à frente — com o carimbo
+    /// cru ficava escondida. E o veneno (um carimbo dias à frente) continua a não contar sem
+    /// calar o que vem depois dele.
+    #[test]
+    fn o_por_ler_no_relogio_logico() {
+        let dir = std::env::temp_dir().join(format!("bruma-instante-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eu = crypto::Identity::from_seed(&[1u8; 32]);
+        let outro = crypto::Identity::from_seed(&[2u8; 32]);
+        let minha = HEXLOWER.encode(eu.signing.verifying_key().as_bytes());
+        let log = blog::Log::load(dir.join("s.json")).unwrap();
+        let mut srv = Servidor::novo("bb".repeat(16), [7u8; 32], log, vec![], None, None);
+        let t = agora_ms();
+        fn escreve_em(srv: &mut Servidor, quem: &crypto::Identity, ts: u64, texto: &str) {
+            let carga = Carga::Mensagem {
+                canal: "geral".into(),
+                texto: texto.into(),
+            };
+            let claro = serde_json::to_vec(&carga).unwrap();
+            let (nonce, ct) = crypto::seal(&srv.chave, &claro).unwrap();
+            srv.log.append_local(&quem.signing, nonce, ct, ts).unwrap();
+        }
+        let contaveis: std::collections::BTreeSet<String> =
+            ["geral".to_string()].into_iter().collect();
+
+        // O outro escreve com o relógio 20 s adiantado, e eu leio.
+        escreve_em(&mut srv, &outro, t + 20_000, "adiantado");
+        let marca = srv.ultima_mensagem("geral", &minha);
+        assert_eq!(marca, (t + 20_000) as i64);
+        let mut lido = BTreeMap::new();
+        lido.insert(App::chave_de_leitura(&srv.id, "geral"), marca);
+        assert!(!srv
+            .nao_lidos(&minha, &lido, &contaveis)
+            .contains_key("geral"));
+
+        // O NTP corrige-o e ele escreve outra vez, agora com o relógio certo.
+        escreve_em(&mut srv, &outro, t + 1_000, "corrigido");
+        let c = srv.nao_lidos(&minha, &lido, &contaveis);
+        assert_eq!(
+            c.get("geral").map(|(n, _)| *n),
+            Some(1),
+            "a mensagem escrita depois da correcção do relógio tem de contar"
+        );
+        assert_eq!(
+            srv.ultima_mensagem("geral", &minha),
+            (t + 20_001) as i64,
+            "a marca é o instante, não o carimbo"
+        );
+
+        // O veneno não conta, e a normal a seguir conta — e lida, nada fica por ler.
+        escreve_em(&mut srv, &outro, t + 2 * 86_400_000, "veneno");
+        escreve_em(&mut srv, &outro, t + 2_000, "normal");
+        let c = srv.nao_lidos(&minha, &lido, &contaveis);
+        assert_eq!(
+            c.get("geral").map(|(n, _)| *n),
+            Some(2),
+            "a corrigida e a normal; o veneno não"
+        );
+        let marca2 = srv.ultima_mensagem("geral", &minha);
+        let mut lido2 = BTreeMap::new();
+        lido2.insert(App::chave_de_leitura(&srv.id, "geral"), marca2);
+        assert!(
+            !srv.nao_lidos(&minha, &lido2, &contaveis)
+                .contains_key("geral"),
+            "lida até à marca, nada fica por ler"
+        );
+
+        // E abrir o canal é UMA passagem, sem um único hash recalculado (#90, #154).
+        let dec = DECIFRAGENS_NA_THREAD.with(|c| c.get());
+        let hashes = blog::HASHES_NA_THREAD.with(|c| c.get());
+        let (msgs, ultima) = srv.abrir_canal("geral", &minha);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(ultima, marca2);
+        assert_eq!(
+            DECIFRAGENS_NA_THREAD.with(|c| c.get()) - dec,
+            1,
+            "uma passagem"
+        );
+        assert_eq!(
+            blog::HASHES_NA_THREAD.with(|c| c.get()) - hashes,
+            0,
+            "nenhum hash por leitura"
+        );
+        assert!(msgs.iter().all(|m| m.instante >= m.ts_ms));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn o_que_falta_ler() {
         let dir = std::env::temp_dir().join(format!("bruma-lidos-{}", std::process::id()));

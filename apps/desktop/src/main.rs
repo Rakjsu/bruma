@@ -113,6 +113,8 @@ macro_rules! handler_com {
             comandos::marcar_lido,
             comandos::enviar,
             comandos::mensagens,
+            comandos::abrir_canal,
+            comandos::marcar_lido_ate,
             comandos::presenca_de_voz,
             comandos::enviar_sinal,
             comandos::meu_endereco,
@@ -172,7 +174,9 @@ fn handler_de_comandos() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 
         // simplesmente não arranca. Não é preciso mexer na interface.
         comandos::autoteste_pedido,
         comandos::autoteste_par,
-        comandos::medir_ui_pedido
+        comandos::medir_ui_pedido,
+        // E os contadores de medição do log (#154, #90).
+        comandos::contadores
     ]
 }
 

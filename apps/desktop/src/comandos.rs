@@ -792,6 +792,56 @@ pub fn enviar(
     Ok(())
 }
 
+/// O que abrir um canal devolve: as mensagens, até onde ESTAVA lido (é isso que põe a linha
+/// «novas mensagens» no sítio) e até onde FICA lido se a pessoa estiver mesmo a olhar.
+#[derive(serde::Serialize)]
+pub struct Aberto {
+    pub mensagens: Vec<MensagemVista>,
+    pub lido_antes: i64,
+    pub ultima: i64,
+}
+
+/// Abre um canal numa passagem só pelo log (#90). Não marca nada como lido: quem decide
+/// isso é a interface, DEPOIS de saber que este desenho ainda é o actual (#162), com
+/// `marcar_lido_ate` — que não decifra nada.
+#[tauri::command]
+pub fn abrir_canal(servidor: String, canal: String, app: State<Arc<App>>) -> R<Aberto> {
+    let lido_antes = app.lido_ate(&servidor, &canal);
+    let servidores = app.servidores.lock().map_err(erro)?;
+    let srv = servidores
+        .get(&servidor)
+        .ok_or("esse servidor não existe aqui")?;
+    let (mensagens, ultima) = srv.abrir_canal(&canal, &app.minha_chave());
+    Ok(Aberto {
+        mensagens,
+        lido_antes,
+        ultima,
+    })
+}
+
+/// Marca um canal como lido até um instante que `abrir_canal` já calculou: sem passagem
+/// pelo log. A regra é a de `marcar_lido`: só avança, e só grava se mudou.
+#[tauri::command]
+pub fn marcar_lido_ate(servidor: String, canal: String, ate: i64, app: State<Arc<App>>) -> R<()> {
+    if ate > 0 && app.marcar_lido(&servidor, &canal, ate) {
+        app.gravar_indice().map_err(erro)?;
+    }
+    Ok(())
+}
+
+/// Os contadores de medição (só em debug): passagens de decifragem, hashes calculados, e
+/// quantas vezes a cabeça em cache foi apanhada errada.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn contadores() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    serde_json::json!({
+        "decifragens": crate::estado::DECIFRAGENS.load(Relaxed),
+        "hashes": spike_common::log::HASHES.load(Relaxed),
+        "cabecaDessincronizada": crate::estado::CABECA_DESSINCRONIZADA.load(Relaxed),
+    })
+}
+
 #[tauri::command]
 pub fn mensagens(servidor: String, canal: String, app: State<Arc<App>>) -> R<Vec<MensagemVista>> {
     let servidores = app.servidores.lock().map_err(erro)?;

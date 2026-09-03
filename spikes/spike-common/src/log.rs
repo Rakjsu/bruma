@@ -76,6 +76,8 @@ impl Entry {
     }
 
     pub fn hash(&self) -> Result<[u8; 32]> {
+        HASHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HASHES_NA_THREAD.with(|c| c.set(c.get() + 1));
         Ok(*blake3::hash(&self.canonical()?).as_bytes())
     }
 
@@ -101,6 +103,22 @@ pub struct Log {
     /// byte trocado no meio do ficheiro deixava de custar uma sessão e passava a custar a
     /// sala inteira. Agora salta-se a linha má, conta-se aqui, e as boas à volta sobrevivem.
     ilegiveis: usize,
+    /// A CABEÇA EM CACHE (#90): o (instante efectivo, hash) da entrada máxima. `head()`
+    /// ordenava e clonava o log inteiro a cada mensagem enviada; a cabeça é conhecida por
+    /// construção depois de um `append_local` (a entrada nova é a máxima: o seu instante é
+    /// `max(ts, instante(pai) + 1)` e o pai era o máximo) e esquece-se num `merge` com
+    /// entradas novas — um pai que chega re-cronometra as órfãs, e uma delas pode passar a
+    /// ser a cabeça. Recalcular no `head()` seguinte custa um `instantes()`, sem sort nem
+    /// clones; nunca se actualiza incrementalmente, de propósito.
+    cabeca: Option<(u64, String)>,
+}
+
+/// Medição: quantas vezes se calculou o hash de uma entrada. Um redesenho não devia
+/// calcular nenhum — o hash é a chave do mapa onde a entrada já está.
+pub static HASHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// O mesmo contador, so desta thread -- para os testes, que correm em paralelo.
+    pub static HASHES_NA_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Log {
@@ -130,6 +148,7 @@ impl Log {
                     entries,
                     path,
                     ilegiveis: 0,
+                    cabeca: None,
                 };
                 log.reescrever()?;
                 return Ok(log);
@@ -193,12 +212,14 @@ impl Log {
                 entries,
                 path,
                 ilegiveis,
+                cabeca: None,
             });
         }
         Ok(Log {
             entries,
             path,
             ilegiveis: 0,
+            cabeca: None,
         })
     }
 
@@ -261,36 +282,37 @@ impl Log {
     /// dá exatamente a ordem de parede; com um relógio atrasado, a entrada é empurrada para
     /// depois do pai em vez de saltar para trás. Depende só do grafo e dos carimbos guardados,
     /// portanto todos os peers convergem para a mesma ordem sem falarem uns com os outros.
-    fn instantes(&self) -> BTreeMap<String, u64> {
-        let mut cache: BTreeMap<String, u64> = BTreeMap::new();
+    fn instantes(&self) -> BTreeMap<&str, u64> {
+        let mut cache: BTreeMap<&str, u64> = BTreeMap::new();
         for inicio in self.entries.keys() {
-            if cache.contains_key(inicio) {
+            if cache.contains_key(inicio.as_str()) {
                 continue;
             }
             // Iterativo e não recursivo de propósito: uma conversa longa é uma cadeia longa,
-            // e recursão aqui seria estouro de pilha à espera de acontecer.
-            let mut pilha: Vec<String> = Vec::new();
-            let mut atual = inicio.clone();
+            // e recursão aqui seria estouro de pilha à espera de acontecer. Empréstimos e
+            // não clones (#154): cada passo de pilha clonava uma `String` por entrada.
+            let mut pilha: Vec<&str> = Vec::new();
+            let mut atual: &str = inicio.as_str();
             loop {
-                if cache.contains_key(&atual) {
+                if cache.contains_key(atual) {
                     break;
                 }
-                let Some(e) = self.entries.get(&atual) else {
+                let Some(e) = self.entries.get(atual) else {
                     break;
                 };
-                pilha.push(atual.clone());
+                pilha.push(atual);
                 // Um ciclo exigiria colisão de hash (o `prev` está dentro do hash), mas o
                 // limite custa nada e evita pendurar o processo se alguma vez existir.
                 if !self.entries.contains_key(&e.prev) || pilha.len() > self.entries.len() {
                     break;
                 }
-                atual = e.prev.clone();
+                atual = e.prev.as_str();
             }
             while let Some(h) = pilha.pop() {
-                let e = &self.entries[&h];
+                let e = &self.entries[h];
                 // Pai ausente (ainda não sincronizado): a entrada é uma raiz e vale o seu
                 // próprio relógio. Quando o pai chegar, isto recalcula-se sozinho.
-                let base = cache.get(&e.prev).copied().unwrap_or(0);
+                let base = cache.get(e.prev.as_str()).copied().unwrap_or(0);
                 let v = e.ts_ms.max(base.saturating_add(1));
                 cache.insert(h, v);
             }
@@ -298,16 +320,34 @@ impl Log {
         cache
     }
 
-    /// Ordem determinística e igual em todos os peers: (instante efetivo, hash).
-    pub fn ordered(&self) -> Vec<Entry> {
+    /// Ordem determinística e igual em todos os peers: (instante efetivo, hash) — por
+    /// REFERÊNCIA (#154), com o instante que a ordenação já calculou e o hash que é a chave
+    /// do mapa. Quem lê o log por redesenho não clona nada nem recalcula hash nenhum; e o
+    /// instante é o eixo do por-ler (#198), não o carimbo cru.
+    pub fn ordered_ref(&self) -> Vec<(u64, &str, &Entry)> {
         let inst = self.instantes();
-        let mut v: Vec<(u64, &String, &Entry)> = self
+        let mut v: Vec<(u64, &str, &Entry)> = self
             .entries
             .iter()
-            .map(|(h, e)| (inst.get(h).copied().unwrap_or(e.ts_ms), h, e))
+            .map(|(h, e)| {
+                (
+                    inst.get(h.as_str()).copied().unwrap_or(e.ts_ms),
+                    h.as_str(),
+                    e,
+                )
+            })
             .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
-        v.into_iter().map(|(_, _, e)| e.clone()).collect()
+        v
+    }
+
+    /// A mesma ordem, com as entradas clonadas: para quem as manda pelo fio, onde o clone é
+    /// inevitável. Ninguém a devia usar para desenhar.
+    pub fn ordered(&self) -> Vec<Entry> {
+        self.ordered_ref()
+            .into_iter()
+            .map(|(_, _, e)| e.clone())
+            .collect()
     }
 
     /// Entradas cujo pai ainda não chegou.
@@ -349,10 +389,27 @@ impl Log {
     }
 
     pub fn head(&self) -> String {
-        self.ordered()
-            .last()
-            .and_then(|e| e.hash_hex().ok())
-            .unwrap_or_else(|| HEXLOWER.encode(&ZERO_HASH))
+        self.cabeca_actual().1
+    }
+
+    /// A cabeça em cache, ou recalculada se a cache foi esquecida.
+    fn cabeca_actual(&self) -> (u64, String) {
+        if let Some(c) = &self.cabeca {
+            return c.clone();
+        }
+        self.cabeca_recalculada()
+            .unwrap_or_else(|| (0, HEXLOWER.encode(&ZERO_HASH)))
+    }
+
+    /// A cabeça calculada do zero: a entrada de (instante, hash) máximo — um `instantes()`
+    /// e um `max`, sem ordenar nem clonar. É contra isto que a cache se confere.
+    pub fn cabeca_recalculada(&self) -> Option<(u64, String)> {
+        let inst = self.instantes();
+        self.entries
+            .keys()
+            .map(|h| (inst.get(h.as_str()).copied().unwrap_or(0), h))
+            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)))
+            .map(|(i, h)| (i, h.clone()))
     }
 
     pub fn append_local(
@@ -362,10 +419,11 @@ impl Log {
         ciphertext: Vec<u8>,
         ts_ms: u64,
     ) -> Result<Entry> {
+        let (inst_pai, prev) = self.cabeca_actual();
         let mut e = Entry {
             author: HEXLOWER.encode(signing.verifying_key().as_bytes()),
             ts_ms,
-            prev: self.head(),
+            prev,
             nonce: HEXLOWER.encode(&nonce),
             ciphertext: HEXLOWER.encode(&ciphertext),
             sig: String::new(),
@@ -381,7 +439,11 @@ impl Log {
         // mensagens de ontem desapareceram quando reabri», sem um erro a ligar as duas coisas.
         let hash = e.hash_hex()?;
         self.anexar(std::slice::from_ref(&e))?;
-        self.entries.insert(hash, e.clone());
+        self.entries.insert(hash.clone(), e.clone());
+        // A entrada nova é a cabeça por construção: o seu instante é `max(ts, pai + 1)` e
+        // o pai era o máximo — a regra de `instantes()`, escrita uma vez aqui e conferida
+        // pelo teste `a_cabeca_em_cache_e_a_recalculada`.
+        self.cabeca = Some((ts_ms.max(inst_pai.saturating_add(1)), hash));
         Ok(e)
     }
 
@@ -411,6 +473,11 @@ impl Log {
         self.anexar(&novas)?;
         for e in &novas {
             self.entries.insert(e.hash_hex()?, e.clone());
+        }
+        // Entradas novas podem re-cronometrar órfãs que já cá estavam: a cabeça esquece-se
+        // e recalcula-se quando fizer falta (ver o campo).
+        if !novas.is_empty() {
+            self.cabeca = None;
         }
         Ok(novas.len())
     }
@@ -661,6 +728,54 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+    /// A cabeça em cache (#90) tem de ser sempre a recalculada — depois de cada escrita
+    /// local e de cada `merge`, incluindo um em que o filho chega antes do pai.
+    #[test]
+    fn a_cabeca_em_cache_e_a_recalculada() {
+        let path = tmp("cabeca");
+        let mut log = Log::load(&path).unwrap();
+        fn confere(log: &Log, quando: &str) {
+            let calc = log
+                .cabeca_recalculada()
+                .map(|(_, h)| h)
+                .unwrap_or_else(|| HEXLOWER.encode(&ZERO_HASH));
+            assert_eq!(log.head(), calc, "cabeça em cache ≠ recalculada {quando}");
+        }
+        confere(&log, "vazio");
+        for i in 0..3u64 {
+            log.append_local(&key(1), [i as u8; 24], vec![i as u8], 1_000 + i)
+                .unwrap();
+            confere(&log, "depois de escrever");
+        }
+        // Um segundo log, à parte: as entradas dele chegam fora de ordem, o filho primeiro.
+        let path2 = tmp("cabeca2");
+        let mut outro = Log::load(&path2).unwrap();
+        let pai = outro
+            .append_local(&key(2), [9u8; 24], vec![9], 50_000)
+            .unwrap();
+        let filho = outro
+            .append_local(&key(2), [8u8; 24], vec![8], 50_001)
+            .unwrap();
+        log.merge(vec![filho.clone()]).unwrap();
+        confere(&log, "depois do filho órfão");
+        assert_eq!(log.head(), filho.hash_hex().unwrap(), "o filho é a cabeça");
+        log.merge(vec![pai]).unwrap();
+        confere(&log, "depois de o pai chegar");
+        let nova = log
+            .append_local(&key(1), [7u8; 24], vec![7], 2_000)
+            .unwrap();
+        confere(&log, "depois de escrever em cima");
+        assert_eq!(
+            nova.prev,
+            filho.hash_hex().unwrap(),
+            "a nova aponta para a cabeça verdadeira"
+        );
+        log.merge(vec![]).unwrap();
+        confere(&log, "depois de um merge vazio");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
     #[test]
     fn relogio_atrasado_nao_inverte_a_resposta() {
         // O bug que isto fecha: a pergunta e escrita por quem tem o relogio certo, a resposta

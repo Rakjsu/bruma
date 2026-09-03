@@ -130,6 +130,10 @@ pub struct CargaCrua {
 pub struct Aplicavel {
     pub autor: String,
     pub ts_ms: u64,
+    /// O instante EFECTIVO (#198): `max(ts_ms, instante(pai) + 1)`, o mesmo que ordena o
+    /// log. É o eixo do por-ler; o `ts_ms` cru fica para o que se mostra e para filtrar o
+    /// veneno.
+    pub instante: u64,
     pub carga: Carga,
 }
 
@@ -140,6 +144,8 @@ pub struct MensagemVista {
     pub autor_nome: String,
     pub canal: String,
     pub ts_ms: u64,
+    /// O instante efectivo (#198), a comparar com a marca de leitura.
+    pub instante: u64,
     pub texto: String,
 }
 
@@ -246,6 +252,7 @@ pub fn mensagens_do_canal(
                 autor_nome: nome_de(estado, &e.autor),
                 canal: c.clone(),
                 ts_ms: e.ts_ms,
+                instante: e.instante,
                 texto: texto.clone(),
             }),
             // Uma carga de uma versão mais recente, NESTE canal: mostra-se um marcador com o
@@ -259,6 +266,7 @@ pub fn mensagens_do_canal(
                 autor_nome: nome_de(estado, &e.autor),
                 canal: c.clone(),
                 ts_ms: e.ts_ms,
+                instante: e.instante,
                 texto: "(uma mensagem escrita por uma versão mais recente do Bruma —                         actualiza para a veres)"
                     .into(),
             }),
@@ -318,6 +326,7 @@ mod tests {
         Aplicavel {
             autor: autor.into(),
             ts_ms: ts,
+            instante: ts,
             carga,
         }
     }
