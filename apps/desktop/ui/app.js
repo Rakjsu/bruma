@@ -2168,9 +2168,52 @@ function atualizarConta(el) {
 $('#entrada').addEventListener('input', ev => {
   ajustarEntrada(ev.target);
   atualizarConta(ev.target);
+  // Voltar a escrever apaga o que se disse do envio anterior.
+  $('#composer-erro').textContent = '';
 });
+$('#sala-entrada').addEventListener('input', () => { $('#sala-erro').textContent = ''; });
 
-$('#entrada').addEventListener('keydown', async ev => {
+/** O ENVIO, uma vez para os dois campos (#26, #158). Devolve `true` se saiu.
+ *
+ *  O composer e o chat da sala eram duas cópias que já tinham divergido: o composer repunha
+ *  o texto no erro, a sala apagava-o ANTES de chamar o Rust e não conhecia o tecto; e os
+ *  dois falhavam em silêncio, para a consola. Aqui o campo só se esvazia quando há para
+ *  onde mandar e o texto cabe; um erro repõe o texto — à frente do que entretanto se
+ *  escreveu, se o campo já não estava vazio — e diz-se por baixo do campo, não na consola. */
+async function enviarDoCampo(campo, destino, erro, depois) {
+  const texto = campo.value;
+  if (!texto.trim()) return false;
+  // ANTES de tocar no campo: sem destino (o composer já é visível antes do estado), o
+  // texto ficava perdido em silêncio.
+  if (!destino) {
+    erro.textContent = 'ainda não sei para onde mandar isto';
+    return false;
+  }
+  if (texto.length > MAX_TEXTO) {
+    // O mesmo tecto do Rust, dito aqui: não se corta o texto de ninguém em silêncio.
+    erro.textContent = `tem ${texto.length} caracteres; o limite é ${MAX_TEXTO}`;
+    if (campo.tagName === 'TEXTAREA') atualizarConta(campo);
+    return false;
+  }
+  campo.value = '';
+  erro.textContent = '';
+  if (campo.tagName === 'TEXTAREA') { ajustarEntrada(campo); atualizarConta(campo); }
+  try {
+    await invoke('enviar', { ...destino, texto });
+    if (depois) await depois();
+    return true;
+  } catch (e) {
+    // O texto volta para o campo: perder o que se escreveu por causa de um erro de rede é
+    // pior do que o erro. Se entretanto já se escreveu mais, o perdido vai à frente.
+    campo.value = campo.value ? texto + campo.value : texto;
+    if (campo.tagName === 'TEXTAREA') { ajustarEntrada(campo); atualizarConta(campo); }
+    erro.textContent = String(e);
+    console.error(e);
+    return false;
+  }
+}
+
+$('#entrada').addEventListener('keydown', ev => {
   // SHIFT+ENTER faz uma linha nova; ENTER envia.
   //
   // E nao o contrario, apesar de o campo ser agora multi-linha: numa conversa escreve-se
@@ -2178,29 +2221,50 @@ $('#entrada').addEventListener('keydown', async ev => {
   // frequente pelo raro.
   if (ev.key !== 'Enter' || ev.shiftKey) return;
   ev.preventDefault();
-  const texto = ev.target.value;
-  if (!texto.trim()) return;
-  if (texto.length > MAX_TEXTO) {
-    // Nao se corta o texto de ninguem em silencio: fica no campo, e o contador diz porque.
-    atualizarConta(ev.target);
-    return;
-  }
-  ev.target.value = '';
-  ajustarEntrada(ev.target);
-  atualizarConta(ev.target);
-  const destino = destinoDeEscrita();
-  if (!destino) return;
-  try {
-    await invoke('enviar', { ...destino, texto });
-    await desenharMensagens();
-  } catch (e) {
-    // O texto volta para o campo: perder o que se escreveu por causa de um erro de rede e
-    // pior do que o erro.
-    ev.target.value = texto;
-    ajustarEntrada(ev.target);
-    console.error(e);
-  }
+  enviarDoCampo(ev.target, destinoDeEscrita(), $('#composer-erro'), desenharMensagens);
 });
+
+/* ANEXOS: O QUE A APP NÃO FAZ, DITO (#160).
+   Largar um ficheiro na janela ou colar uma imagem não fazia nada — nem uma palavra. Não é
+   avaria, é decisão: por agora só vai texto. Mas tem de se dizer, no sítio onde a pessoa
+   está a olhar: por baixo do campo que está visível, ou como aviso na conversa. */
+const nomeDoFicheiro = p => String(p).split('/').pop().split(String.fromCharCode(92)).pop();
+
+function anexoRecusado(nomes) {
+  if (!nomes || !nomes.length) return '';
+  const lista = nomes.map(n => `«${n}»`).join(', ');
+  const frase = `Os anexos ainda não existem no Bruma — ${lista} não `
+    + `${nomes.length === 1 ? 'foi enviado' : 'foram enviados'}. Por agora só vai texto.`;
+  const composer = $('#composer');
+  const sala = $('#sala-chat');
+  if (composer && !composer.hidden) {
+    $('#composer-erro').textContent = frase;
+  } else if (sala && !sala.hidden) {
+    $('#sala-erro').textContent = frase;
+  } else {
+    const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
+    if (aberto) avisoNaConversa(aberto, frase);
+  }
+  return frase;
+}
+
+// Com `dragDropEnabled` por omissão, o DOM nunca vê o `drop`: é o Tauri que o entrega.
+listen('tauri://drag-drop', ev => {
+  const caminhos = (ev.payload && ev.payload.paths) || [];
+  anexoRecusado(caminhos.map(nomeDoFicheiro));
+});
+
+function recusarAnexoColado(ev) {
+  const d = ev.clipboardData;
+  if (!d) return;
+  const ficheiros = [...d.files].map(f => f.name || 'a imagem');
+  if (!ficheiros.length) return;
+  // Com texto ao lado (colar do Word) o texto entra na mesma; diz-se do resto.
+  if (!d.types.includes('text/plain')) ev.preventDefault();
+  anexoRecusado(ficheiros);
+}
+$('#entrada').addEventListener('paste', recusarAnexoColado);
+$('#sala-entrada').addEventListener('paste', recusarAnexoColado);
 
 /* ==========================================================================
    A voz, pelo mesmo caminho do ecrã.
@@ -6043,15 +6107,15 @@ async function desenharChatDaSala() {
   if (colado) fluxo.scrollTop = fluxo.scrollHeight;
 }
 
-$('#sala-entrada').addEventListener('keydown', async ev => {
-  if (ev.key !== 'Enter' || !ev.target.value.trim()) return;
-  if (!voz.canal || !voz.servidor) return;
-  const texto = ev.target.value;
-  ev.target.value = '';
-  try {
-    await invoke('enviar', { servidor: voz.servidor, canal: voz.canal, texto });
-    await desenharChatDaSala();
-  } catch (e) { console.error(e); }
+$('#sala-entrada').addEventListener('keydown', ev => {
+  if (ev.key !== 'Enter') return;
+  // O mesmo envio do composer (#158): o tecto, o texto reposto e o erro dito por baixo.
+  enviarDoCampo(
+    ev.target,
+    voz.canal && voz.servidor ? { servidor: voz.servidor, canal: voz.canal } : null,
+    $('#sala-erro'),
+    desenharChatDaSala,
+  );
 });
 
 /** A lista lateral de quem está na chamada, com o anel verde de quem fala. */
@@ -8704,6 +8768,115 @@ async function segundoCanalDeTexto(servidorId) {
           + ` a-frente-pediu=${pediuComJanelaAFrente}`
           + ` decide-pelo-foco=${pediuComJanelaAtras === false && pediuComJanelaAFrente === true}`);
       }
+    }
+
+    // ---- O CAMPO DIZ O QUE SE PASSOU (#26, #158, #160) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual, vs: voz.servidor, vc: voz.canal };
+      const entrada = $('#entrada');
+      const erro = $('#composer-erro');
+      const tecla = el => el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      fecharDefinicoes();
+
+      // (a) Um servidor que nao existe: o texto fica, o erro diz porque, e ve-se.
+      modo = 'servidor'; servidorAtual = 'nao-existe'; canalAtual = 'x';
+      $('#composer').hidden = false;
+      entrada.value = 'isto nao vai sair'; erro.textContent = '';
+      const devolveu = await enviarDoCampo(entrada, destinoDeEscrita(), erro, async () => {});
+      const directo = { devolveu, campo: entrada.value, erro: erro.textContent, visivel: erro.getBoundingClientRect().height > 0 };
+      // Pelo caminho REAL da tecla, para provar a ligacao do handler a funcao.
+      entrada.value = 'pela tecla'; erro.textContent = '';
+      tecla(entrada); await pausa(400);
+      const porTecla = { campo: entrada.value, erro: erro.textContent };
+      // Sem destino: o texto nao se perde (antes apagava-se antes de olhar ao destino).
+      servidorAtual = null; canalAtual = null;
+      entrada.value = 'sem destino'; erro.textContent = '';
+      tecla(entrada); await pausa(200);
+      const semDestino = { campo: entrada.value, erro: erro.textContent };
+      // Escrever durante a espera: o texto perdido vai a FRENTE do novo, nao por cima.
+      servidorAtual = 'nao-existe'; canalAtual = 'x';
+      entrada.value = 'perdido '; erro.textContent = '';
+      const emCurso = enviarDoCampo(entrada, destinoDeEscrita(), erro, async () => {});
+      entrada.value = 'novo';
+      await emCurso;
+      const prepoe = entrada.value;
+      diz(`ui envio falhou: devolveu=${directo.devolveu} campo="${directo.campo}" erro="${directo.erro}" visivel=${directo.visivel}`
+        + ` pela-tecla: campo="${porTecla.campo}" erro="${porTecla.erro}"`
+        + ` sem-destino: campo="${semDestino.campo}" erro="${semDestino.erro}"`
+        + ` prepoe="${prepoe}"`);
+
+      // (b) O chat da sala: o tecto para no JS (o erro do JS tem «;», o do Rust nao), e um
+      // erro repoe o texto -- antes apagava-se ANTES de chamar o Rust.
+      voz.servidor = 'nao-existe'; voz.canal = 'x';
+      $('#sala-chat').hidden = false;
+      const salaIn = $('#sala-entrada');
+      const salaErro = $('#sala-erro');
+      salaIn.value = 'x'.repeat(MAX_TEXTO + 1); salaErro.textContent = '';
+      tecla(salaIn); await pausa(300);
+      const tecto = { repos: salaIn.value.length === MAX_TEXTO + 1, erro: salaErro.textContent };
+      salaIn.value = 'dez letras'; salaErro.textContent = '';
+      tecla(salaIn); await pausa(400);
+      const salaFalhou = { repos: salaIn.value === 'dez letras', erro: salaErro.textContent };
+      salaIn.value = ''; salaErro.textContent = '';
+      $('#sala-chat').hidden = true;
+      diz(`ui chat da sala: tecto: campo-repos=${tecto.repos} erro-diz-limite=${/limite/.test(tecto.erro)} erro-do-js=${/caracteres;/.test(tecto.erro)}`
+        + ` falhou: campo-repos=${salaFalhou.repos} erro="${salaFalhou.erro}"`);
+
+      // (c) A direccao contraria: um envio que DA nao deixa erro nem texto.
+      const alvo = (vista.servidores || [])[0];
+      const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      let deu = null;
+      if (alvo && canal) {
+        servidorAtual = alvo.id; canalAtual = canal.id;
+        entrada.value = 'saiu mesmo (#26)'; erro.textContent = 'erro velho';
+        tecla(entrada); await pausa(700);
+        deu = { campo: entrada.value, erro: erro.textContent };
+      }
+      diz(`ui envio deu: ${deu ? `campo="${deu.campo}" erro="${deu.erro}"` : 'sem servidor para medir'}`);
+
+      // (d) O anexo colado, o largado, e o que se diz quando nao ha campo a vista.
+      let colado = 'nao-simulavel';
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(new File(['x'], 'foto.png', { type: 'image/png' }));
+        entrada.value = 'rascunho'; erro.textContent = '';
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        if (!ev.clipboardData) throw new Error('sem clipboardData');
+        entrada.dispatchEvent(ev);
+        colado = `recusado=${ev.defaultPrevented} diz-nome=${erro.textContent.includes('foto.png')} campo-intacto=${entrada.value === 'rascunho'}`;
+      } catch (e) {
+        colado = `nao-simulavel (${e && e.message ? e.message : e})`;
+      }
+      erro.textContent = '';
+      const frase = anexoRecusado([nomeDoFicheiro('C:' + String.fromCharCode(92) + 'x' + String.fromCharCode(92) + 'jogo.exe')]);
+      const largadoDirecto = erro.textContent.includes('jogo.exe') && /não foi enviado/.test(frase);
+      erro.textContent = '';
+      let viaEvento = 'emit-recusado';
+      try {
+        await window.__TAURI__.event.emit('tauri://drag-drop', { paths: ['C:/x/foto.png'], position: { x: 0, y: 0 } });
+        await pausa(300);
+        viaEvento = String(erro.textContent.includes('foto.png'));
+      } catch (e) {
+        viaEvento = `emit-recusado (${e && e.message ? e.message : e})`;
+      }
+      erro.textContent = '';
+      $('#composer').hidden = true;
+      anexoRecusado(['nota.txt']);
+      await pausa(50);
+      const naConversa = [...document.querySelectorAll('.aviso-sistema')].some(n => n.textContent.includes('nota.txt'));
+      document.querySelectorAll('.aviso-sistema').forEach(n => n.remove());
+      avisosMostrados.delete(servidorAtual);
+      diz(`ui anexo: colado: ${colado} largado-directo=${largadoDirecto} via-evento=${viaEvento}`
+        + ` sem-campo-vai-para-a-conversa=${naConversa}`);
+
+      $('#composer').hidden = false;
+      entrada.value = ''; erro.textContent = '';
+      modo = antes.modo; servidorAtual = antes.srv; canalAtual = antes.cnl; conversaAtual = antes.conv;
+      voz.servidor = antes.vs; voz.canal = antes.vc;
+      await desenharTudo();
+    } catch (e) {
+      diz(`ui envio: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------

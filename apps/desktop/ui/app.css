@@ -415,6 +415,10 @@ html, body {
 .composer__lock { color: var(--mint); opacity: .75; display: grid; place-items: center; }
 .composer__lock svg { fill: currentColor; stroke: currentColor; stroke-width: 1.1; }
 .composer__note { padding: 7px 4px 0; font-size: 11px; color: var(--dim); }
+/* O que se passou com o envio, por baixo do campo (#26, #158, #160). Não é a `.caixa__erro`
+   dos véus: aquela reserva 16 px sempre; aqui só existe quando há o que dizer. */
+.composer__erro { color: var(--rose); font-size: 12px; padding: 4px 4px 0; overflow-wrap: anywhere; }
+.composer__erro:empty { display: none; }
 
 /* --- membros ------------------------------------------------------------- */
 
