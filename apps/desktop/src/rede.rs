@@ -2925,6 +2925,39 @@ fn participa(app: &Arc<App>, servidor: &str, peer: &str) -> bool {
 /// vez merece uma segunda oportunidade — o que não pode é gastar-nos a máquina numa só.
 type Orcamento = std::collections::HashMap<(String, String), usize>;
 
+/// AS PROVAS DE ENTREGA QUE JÁ VÊM NO FIO (#94).
+///
+/// Não há recibos, e não é preciso inventá-los: (1) no aperto de mão e no `SyncPara` o par
+/// manda o log inteiro de cada sala onde me conhece — que contém as MINHAS entradas; (2) cada
+/// entrada que ele escreve traz `prev`, a cabeça que ele via — se é o hash de uma entrada
+/// minha, ele tinha-a. Devolve os hashes das minhas entradas que este lote prova, e a razão
+/// (`sync` se veio uma entrada minha, `prev` se só o pai). Zero blake3 para as entradas dos
+/// outros: um `get` no log por entrada.
+fn provas_de_entrega(
+    entradas: &[blog::Entry],
+    log: &blog::Log,
+    eu: &str,
+) -> (Vec<String>, &'static str) {
+    let mut provas = Vec::new();
+    let mut razao = "nada";
+    for e in entradas {
+        if e.author == eu {
+            if let Ok(h) = e.hash_hex() {
+                provas.push(h);
+                razao = "sync";
+            }
+        } else if let Some(pai) = log.entrada(&e.prev) {
+            if pai.author == eu {
+                provas.push(e.prev.clone());
+                if razao == "nada" {
+                    razao = "prev";
+                }
+            }
+        }
+    }
+    (provas, razao)
+}
+
 fn aplicar(
     app: &Arc<App>,
     janela: &AppHandle,
@@ -3009,7 +3042,7 @@ fn aplicar(
     // dito depois de ele ser largado: emitir um evento com um `lock` na mão é como se
     // constroem os bloqueios que ninguém consegue reproduzir.
     let mut entraram: Vec<String> = Vec::new();
-    let (novas, aprendi) = {
+    let (novas, aprendi, entregue_ate, razao) = {
         let mut s = app.servidores.lock().unwrap();
         let Some(srv) = s.get_mut(servidor) else {
             return; // não temos este servidor: não é erro, é só não ser para nós
@@ -3036,6 +3069,10 @@ fn aplicar(
         // antes de inserir). Engoli-lo com `unwrap_or(0)` era a pior falha que este projecto
         // reconhece: as mensagens apareciam no ecrã e desapareciam ao fechar. Regista-se e
         // avisa-se a interface.
+        // As provas lêem-se ANTES do merge consumir o lote; o instante depois, com as
+        // entradas já no log.
+        let eu = peer_proprio(app);
+        let (provas, razao) = provas_de_entrega(&entradas, &srv.log, &eu);
         let novas = match srv.merge_contado(entradas) {
             Ok((n, recusadas)) => {
                 if recusadas > 0 {
@@ -3090,7 +3127,8 @@ fn aplicar(
             }
             entraram = novos;
         }
-        (novas, aprendi)
+        let entregue_ate = srv.log.maior_instante(&provas);
+        (novas, aprendi, entregue_ate, razao)
     };
     // Gravar SÓ quando se aprendeu um par (#140).
     //
@@ -3112,6 +3150,14 @@ fn aplicar(
     }
     if novas > 0 {
         let _ = janela.emit("servidor-mudou", servidor);
+    }
+    // «Ele tem-na» (#94): só com prova, nunca com a ligação. Sai depois do `servidor-mudou`,
+    // e a interface actualiza as marcas no sítio, sem redesenhar.
+    if let Some(ate) = entregue_ate {
+        let ate = ate.min(i64::MAX as u64) as i64;
+        if app.confirmar_entrega(servidor, peer, ate) {
+            let _ = janela.emit("entrega-confirmada", (servidor, peer, ate, razao));
+        }
     }
 
     // ALGUÉM PASSOU A SER MEMBRO, E ISSO DIZ-SE (#196).
@@ -3513,6 +3559,74 @@ fn interpretar(corpo: &[u8]) -> Result<Quadro> {
         _ => Ok(Quadro::Desconhecido(
             "tipo de quadro que esta versão não conhece",
         )),
+    }
+}
+
+#[cfg(test)]
+mod testes_de_entrega {
+    use super::*;
+    use spike_common::crypto;
+
+    /// Os quatro casos das provas de entrega (#94): uma entrada minha devolvida (`sync`), uma
+    /// dele cujo pai é meu (`prev`), um pai que não conheço (nada), e um lote com as duas.
+    #[test]
+    fn as_provas_de_entrega() {
+        let dir = std::env::temp_dir().join(format!("bruma-provas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eu = crypto::Identity::from_seed(&[11u8; 32]);
+        let ele = crypto::Identity::from_seed(&[12u8; 32]);
+        let minha = data_encoding::HEXLOWER.encode(eu.signing.verifying_key().as_bytes());
+        let chave = [3u8; 32];
+        let selada = |t: &str| crypto::seal(&chave, t.as_bytes()).unwrap();
+
+        // O meu log tem uma entrada minha.
+        let mut meu = blog::Log::load(dir.join("meu.json")).unwrap();
+        let (n, c) = selada("minha");
+        let minha_entrada = meu.append_local(&eu.signing, n, c, 1_000).unwrap();
+        let meu_hash = minha_entrada.hash_hex().unwrap();
+
+        // Ele tem a minha e escreve por cima dela: o `prev` dele é o meu hash.
+        let mut dele = blog::Log::load(dir.join("dele.json")).unwrap();
+        dele.merge(vec![minha_entrada.clone()]).unwrap();
+        let (n, c) = selada("resposta");
+        let resposta = dele.append_local(&ele.signing, n, c, 2_000).unwrap();
+        assert_eq!(
+            resposta.prev, meu_hash,
+            "o pai da resposta é a minha entrada"
+        );
+
+        // Um terceiro que nunca me viu: o pai é desconhecido.
+        let mut estranho = blog::Log::load(dir.join("estranho.json")).unwrap();
+        let (n, c) = selada("a");
+        estranho.append_local(&ele.signing, n, c, 500).unwrap();
+        let (n, c) = selada("b");
+        let orfa = estranho.append_local(&ele.signing, n, c, 600).unwrap();
+
+        let (p, r) = provas_de_entrega(std::slice::from_ref(&minha_entrada), &meu, &minha);
+        assert_eq!(
+            (p.as_slice(), r),
+            ([meu_hash.clone()].as_slice(), "sync"),
+            "a minha devolvida"
+        );
+        let (p, r) = provas_de_entrega(std::slice::from_ref(&resposta), &meu, &minha);
+        assert_eq!(
+            (p.as_slice(), r),
+            ([meu_hash.clone()].as_slice(), "prev"),
+            "o pai é meu"
+        );
+        let (p, r) = provas_de_entrega(std::slice::from_ref(&orfa), &meu, &minha);
+        assert!(p.is_empty() && r == "nada", "pai desconhecido: nada");
+        let (p, r) = provas_de_entrega(&[orfa, resposta, minha_entrada], &meu, &minha);
+        assert_eq!(p.len(), 2);
+        assert_eq!(r, "sync", "com uma minha no lote, a razão é sync");
+        assert_eq!(
+            meu.maior_instante(&p),
+            Some(1_000),
+            "o instante da minha entrada"
+        );
+        assert_eq!(meu.maior_instante(&[]), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -19,6 +19,8 @@ pub struct VistaServidor {
     pub membros: Vec<Membro>,
     /// Por canal: quantas por ler. Só os canais com alguma coisa aparecem aqui.
     pub nao_lidos: std::collections::BTreeMap<String, usize>,
+    /// Até que instante cada par (chave → instante) provou ter as minhas mensagens (#94).
+    pub entregue: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Serialize)]
@@ -34,6 +36,8 @@ pub struct VistaConversa {
     /// Vai daqui para a interface em vez de ser repetido lá: uma constante escrita nos dois
     /// lados é uma constante que um dia deixa de ser a mesma nos dois lados.
     pub canal: String,
+    /// Até que instante o outro provou ter as minhas mensagens (#94).
+    pub entregue_ate: i64,
 }
 
 #[derive(Serialize)]
@@ -104,6 +108,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     // Uma cópia, e o lock largado: o `nao_lidos` de cada servidor consulta este mapa dentro
     // do ciclo, e segurar dois locks durante um ciclo é como se fazem inversões de ordem.
     let lido = app.lido.lock().map_err(erro)?.clone();
+    let entregue = app.entregue.lock().map_err(erro)?.clone();
     let eu = app.minha_chave();
     let mut nomes: std::collections::BTreeMap<String, String> = Default::default();
 
@@ -145,6 +150,13 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                 canais: e.canais,
                 membros: e.membros,
                 nao_lidos: por_ler.into_iter().map(|(c, (n, _))| (c, n)).collect(),
+                entregue: {
+                    let prefixo = format!("{}/", s.id);
+                    entregue
+                        .iter()
+                        .filter_map(|(k, v)| k.strip_prefix(&prefixo).map(|p| (p.to_string(), *v)))
+                        .collect()
+                },
             }),
             Some(com) => conversas.push((
                 s.id.clone(),
@@ -153,6 +165,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                     .get(modelo::CANAL_DA_CONVERSA)
                     .map(|(n, _)| *n)
                     .unwrap_or(0),
+                app.entregue_ate(&s.id, com),
             )),
         }
     }
@@ -161,7 +174,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
     // aberto de onde o tirar, e a pessoa pode ser de uma sala que não é a que está à frente.
     let conversas = conversas
         .into_iter()
-        .map(|(id, com, nao_lidos)| {
+        .map(|(id, com, nao_lidos, entregue_ate)| {
             let nome = nomes
                 .get(&com)
                 .cloned()
@@ -172,6 +185,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                 com,
                 nome,
                 canal: modelo::CANAL_DA_CONVERSA.into(),
+                entregue_ate,
             }
         })
         .collect();
@@ -756,10 +770,10 @@ pub fn enviar(
     app: State<Arc<App>>,
     rede: State<Arc<Rede>>,
     janela: AppHandle,
-) -> R<()> {
+) -> R<usize> {
     let texto = texto.trim().to_string();
     if texto.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     // O TECTO DE UMA MENSAGEM.
     //
@@ -779,17 +793,29 @@ pub fn enviar(
             texto.chars().count()
         ));
     }
-    let entrada = {
+    let (entrada, gente) = {
         let mut servidores = app.servidores.lock().map_err(erro)?;
         let srv = servidores
             .get_mut(&servidor)
             .ok_or("esse servidor não existe aqui")?;
-        srv.escrever(&app.ident.signing, &Carga::Mensagem { canal, texto })
-            .map_err(erro)?
+        let e = srv
+            .escrever(&app.ident.signing, &Carga::Mensagem { canal, texto })
+            .map_err(erro)?;
+        let mut gente = srv.peers.clone();
+        gente.extend(srv.convidou.iter().cloned());
+        (e, gente)
     };
     rede.difundir(&servidor, entrada);
     let _ = janela.emit("servidor-mudou", &servidor);
-    Ok(())
+    // Para quantas ligações VIVAS desta sala é que isto saiu (#94/#130). Os dois locks nunca
+    // ao mesmo tempo: o dos servidores já foi largado. Zero quer dizer «ficou aqui, à
+    // espera» — e a caixa diz-o.
+    let vivas = rede
+        .ligacoes
+        .lock()
+        .map(|l| gente.iter().filter(|p| l.contains_key(p.as_str())).count())
+        .unwrap_or(0);
+    Ok(vivas)
 }
 
 /// O que abrir um canal devolve: as mensagens, até onde ESTAVA lido (é isso que põe a linha

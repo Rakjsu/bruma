@@ -445,6 +445,7 @@ async function desenharMensagens() {
 
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
+  actualizarNotaDaCaixa();
 
   // UMA passagem pelo log (#90): as mensagens e as marcas vêm juntas.
   const aberto = await invoke('abrir_canal', { servidor: s.id, canal: canal.id }).catch(() => null);
@@ -667,7 +668,7 @@ async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez =
       // dela como se fosse continuação de quem falou antes.
       anterior = null;
     }
-    stream.append(umaMensagem(m, anterior));
+    stream.append(umaMensagem(m, anterior, servidorId));
     anterior = m;
     ultimaReal = m;
   }
@@ -751,9 +752,78 @@ async function refrescarBolhas() {
  *  Está à parte porque as duas vistas TÊM de desenhar igual. Duplicar isto era garantir que
  *  um dia divergiam — e a diferença apareceria como "as mensagens privadas estão estranhas",
  *  sem ninguém saber porquê. */
-function umaMensagem(m, anterior) {
+/** ATÉ QUE INSTANTE alguém provou ter as minhas mensagens deste sítio (#94): numa conversa,
+ *  o outro; numa sala, basta UM membro ter provado — a mensagem já vive noutra máquina. O
+ *  `title` diz quem ainda não confirmou. */
+function entregueAte(onde) {
+  if (modo === 'privado') {
+    const c = (vista.conversas || []).find(x => x.id === onde);
+    return c ? c.entregue_ate || 0 : 0;
+  }
+  const s = (vista.servidores || []).find(x => x.id === onde);
+  return s ? Math.max(0, ...Object.values(s.entregue || {})) : 0;
+}
+
+function tituloDaEntrega(onde, instante) {
+  if (modo === 'privado') {
+    const c = (vista.conversas || []).find(x => x.id === onde);
+    const quem = c ? nomeDoPeer(c.com) : 'a outra pessoa';
+    return c && paresLigados.has(c.com)
+      ? `saiu daqui; ${quem} ainda não confirmou que a tem`
+      : `ainda não saiu deste computador — ${quem} não está ligado`;
+  }
+  const s = (vista.servidores || []).find(x => x.id === onde);
+  const outros = s ? s.membros.filter(m => m.chave !== vista.chave) : [];
+  const ligados = outros.filter(m => paresLigados.has(m.chave));
+  if (!ligados.length) return 'ainda não saiu deste computador — ninguém desta sala está ligado';
+  const semProva = outros.filter(m => ((s.entregue || {})[m.chave] || 0) < instante).map(m => nomeDoPeer(m.chave));
+  return `saiu daqui; ${semProva.join(', ') || 'ninguém'} ainda não confirmou que a tem`;
+}
+
+function marcarEntrega(art, m, onde) {
+  if (m.autor !== vista.chave) return;
+  const porConfirmar = m.instante > entregueAte(onde);
+  art.classList.toggle('msg--por-confirmar', porConfirmar);
+  const marca = art.querySelector('.msg__estado');
+  if (marca) marca.title = porConfirmar ? tituloDaEntrega(onde, m.instante) : '';
+}
+
+/** As marcas de entrega de um sítio, in-place (#94): quando chega uma prova ou quando muda
+ *  quem está ligado, sem recriar um nó. */
+function actualizarMarcasDeEntrega(onde) {
+  const stream = $('#stream');
+  if (!stream) return;
+  for (const art of stream.querySelectorAll(`.msg[data-onde="${onde}"][data-autor="${vista.chave}"]`)) {
+    marcarEntrega(art, { autor: vista.chave, instante: Number(art.dataset.instante) }, onde);
+  }
+}
+
+/** A nota por baixo da caixa (#130): quando ninguém do outro lado está ligado, diz-se o que
+ *  acontece ao que se escrever — fica aqui, à espera. */
+const NOTA_DA_CAIXA = 'as mensagens ficam no teu computador — não há servidor onde elas se acumulem';
+function actualizarNotaDaCaixa() {
+  const nota = $('#composer-nota');
+  if (!nota || !vista) return;
+  let texto = NOTA_DA_CAIXA;
+  if (modo === 'privado') {
+    const c = conversa();
+    if (c && !paresLigados.has(c.com)) {
+      texto = `${nomeDoPeer(c.com)} não está ligado — o que escreveres fica aqui até ele abrir o Bruma`;
+    }
+  } else {
+    const s = servidor();
+    if (s && !s.membros.some(m => m.chave !== vista.chave && paresLigados.has(m.chave))) {
+      texto = 'ninguém desta sala está ligado — o que escreveres fica aqui até alguém abrir o Bruma';
+    }
+  }
+  nota.textContent = texto;
+}
+
+function umaMensagem(m, anterior, onde) {
   const seguida = anterior && anterior.autor === m.autor && m.ts_ms - anterior.ts_ms < 5 * 60_000;
   const art = elemento('article', seguida ? 'msg msg--cont' : 'msg');
+  art.dataset.onde = onde || '';
+  art.dataset.instante = m.instante;
   // O id é o que permite acrescentar em vez de reconstruir (#98) e voltar à mesma mensagem
   // depois de reconstruir (#23); a data completa vive no `title` (#30): as continuações
   // não mostram hora nenhuma, e com o `title` toda a mensagem diz de que dia é.
@@ -777,7 +847,11 @@ function umaMensagem(m, anterior) {
     corpo.append(cab);
   }
   corpo.append(elemento('p', null, m.texto));
+  // A marca de entrega (#94), só nas minhas: existe sempre, mostra-se só por confirmar.
+  if (m.autor === vista.chave) corpo.append(elemento('span', 'msg__estado', '◌ por confirmar'));
   art.append(corpo);
+  // Depois de o corpo estar no artigo: a marca procura-se a partir dele.
+  if (m.autor === vista.chave) marcarEntrega(art, m, onde);
   return art;
 }
 
@@ -797,6 +871,7 @@ async function desenharMensagensPrivadas() {
 
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para ${nomeDoPeer(c.com)}`;
+  actualizarNotaDaCaixa();
   // A conversa deixa de ficar em BRANCO durante a chamada ao Rust: limpava-se antes do
   // `await` e a selecção morria a cada mensagem que chegasse. Limpa-se quando há o que
   // escrever — e só se ninguém navegou entretanto (#162).
@@ -2180,6 +2255,7 @@ $('#sala-entrada').addEventListener('input', () => { $('#sala-erro').textContent
  *  dois falhavam em silêncio, para a consola. Aqui o campo só se esvazia quando há para
  *  onde mandar e o texto cabe; um erro repõe o texto — à frente do que entretanto se
  *  escreveu, se o campo já não estava vazio — e diz-se por baixo do campo, não na consola. */
+let ultimoEnvioSaiuPara = null;   // para quantas ligações vivas saiu o último envio (#94)
 async function enviarDoCampo(campo, destino, erro, depois) {
   const texto = campo.value;
   if (!texto.trim()) return false;
@@ -2199,7 +2275,8 @@ async function enviarDoCampo(campo, destino, erro, depois) {
   erro.textContent = '';
   if (campo.tagName === 'TEXTAREA') { ajustarEntrada(campo); atualizarConta(campo); }
   try {
-    await invoke('enviar', { ...destino, texto });
+    const n = await invoke('enviar', { ...destino, texto });
+    ultimoEnvioSaiuPara = typeof n === 'number' ? n : null;
     if (depois) await depois();
     return true;
   } catch (e) {
@@ -3736,6 +3813,24 @@ async function redesenharPorMudanca() {
 }
 
 listen('servidor-mudou', ev => anotarMudanca(ev.payload));
+
+/** «Ele tem-na» (#94): o Rust provou que `peer` tem as minhas mensagens de `servidor` até
+ *  `ate`. A vista actualiza-se e as marcas saem no sítio — sem redesenhar. */
+const ultimaEntregaDe = new Map();   // servidor -> a razão da última prova (para o `--par`)
+function aoConfirmarEntrega(payload) {
+  const [servidor, peer, ate, razao] = payload || [];
+  if (!servidor || !peer || !vista) return;
+  ultimaEntregaDe.set(servidor, razao);
+  const s = (vista.servidores || []).find(x => x.id === servidor);
+  if (s) {
+    s.entregue = s.entregue || {};
+    s.entregue[peer] = Math.max(s.entregue[peer] || 0, ate);
+  }
+  const c = (vista.conversas || []).find(x => x.id === servidor);
+  if (c && c.com === peer) c.entregue_ate = Math.max(c.entregue_ate || 0, ate);
+  actualizarMarcasDeEntrega(servidor);
+}
+listen('entrega-confirmada', ev => aoConfirmarEntrega(ev.payload));
 /** A versão de cada par, por chave. Vazio até ele dizer.
  *
  *  Existe para a degradação deixar de ser muda (#4): quando chega uma mensagem que esta
@@ -3858,6 +3953,11 @@ function aplicarLigados(lista) {
   if (modo === 'privado') desenharCanais();
   offVistoMax = Math.max(offVistoMax, document.querySelectorAll('#lista-membros .member.is-off').length);
   chipsVistos.add($('#rotulo-peers').textContent);
+  // As marcas «por confirmar» mudam de título (não de estado) com quem está ligado (#94), e
+  // a nota da caixa diz se o que se escrever fica à espera (#130).
+  const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
+  if (aberto) actualizarMarcasDeEntrega(aberto);
+  actualizarNotaDaCaixa();
   if (mexeu) {
     // Quem voltou é ESPECTADOR NOVO outra vez (#52): o `definir_espectadores` só manda o
     // cabeçalho a quem não estava na lista, e sem isto quem religasse ficava com o ecrã
@@ -7511,10 +7611,16 @@ async function segundoCanalDeTexto(servidorId) {
       await desenharTudo();
       const texto = vista.servidores.find(x => x.id === servidorId)
         .canais.find(c => c.tipo === 'texto');
+      let saiuPara = null;
       for (let i = 1; i <= 5; i++) {
-        await invoke('enviar', { servidor: servidorId, canal: texto.id, texto: `antes ${i}` });
+        saiuPara = await invoke('enviar', { servidor: servidorId, canal: texto.id, texto: `antes ${i}` });
       }
       diz('par ANFITRIAO escreveu 5 mensagens antes de existir convidado');
+      // As cinco ficaram AQUI, e a interface di-lo (#94): por confirmar, e saiu para ninguem.
+      escolherCanal(texto.id);
+      await esperar(600);
+      diz(`par ANFITRIAO entregas antes do convidado: por-confirmar=${document.querySelectorAll('#stream .msg--por-confirmar').length}`
+        + ` saiu-para=${saiuPara} nota="${($('#composer-nota') || {}).textContent}"`);
 
       // E uma DURANTE o sync, que e a janela onde uma mensagem se perdia: entre a
       // fotografia do log e o momento em que a sessao comecava a ouvir o canal das
@@ -7688,12 +7794,38 @@ async function segundoCanalDeTexto(servidorId) {
 
       // E no fim: os dois lados tem de ver as DUAS mensagens, com nome e nao com
       // "desconhecido" -- se so virem a propria, a sincronizacao da conversa nao anda.
+      // Uma segunda privada SEM resposta, na volta 5: na 6 tem de continuar por confirmar
+      // — confirmar sem prova seria mentira (#94, direccao contraria).
+      if (volta === 5 && conversa && modo === '') {
+        await invoke('enviar', { servidor: conversa.id, canal: conversa.canal, texto: 'segunda privada, sem resposta' }).catch(() => {});
+      }
+      // As entregas na SALA, pelos dados e nao pelo DOM (a vista pode estar na sala de voz):
+      // as minhas mensagens contra o que os outros provaram ter.
+      if (volta === 6 && servidorId) {
+        const st6 = await invoke('estado');
+        const sv = (st6.servidores || []).find(x => x.id === servidorId) || {};
+        const txt = ((sv.canais || []).find(c => c.tipo === 'texto') || {}).id;
+        const todas = txt ? await invoke('mensagens', { servidor: servidorId, canal: txt }).catch(() => []) : [];
+        const minhas = todas.filter(m => m.autor === voz.eu);
+        const ate = Math.max(0, ...Object.values(sv.entregue || {}));
+        diz(`par entregas na sala: minhas=${minhas.length} por-confirmar=${minhas.filter(m => m.instante > ate).length}`
+          + ` entregue-ate=${ate} razao=${ultimaEntregaDe.get(servidorId) || 'nada'}`);
+      }
       if (volta === 6 && conversa) {
         const msgs = await invoke('mensagens', {
           servidor: conversa.id,
           canal: conversa.canal,
         }).catch(e => { diz(`par conversa FALHOU a ler: ${e}`); return []; });
         const st = await invoke('estado');
+        {
+          const stC = await invoke('estado');
+          const cv = (stC.conversas || []).find(x => x.id === conversa.id) || {};
+          const minhas = msgs.filter(m => m.autor === voz.eu);
+          const porConfirmar = minhas.filter(m => m.instante > (cv.entregue_ate || 0)).length;
+          diz(`par conversa entregas: minhas=${minhas.length} por-confirmar=${porConfirmar}`
+            + ` entregue-ate=${cv.entregue_ate || 0}`
+            + ` ultima-razao=${ultimaEntregaDe.get(conversa.id) || 'nada'}`);
+        }
         diz(`par conversa mensagens: ${msgs.length}/2`
           + ` [${msgs.map(m => `${m.autor_nome} (mostrado=${nomeDoPeer(m.autor)}): ${m.texto}`).join(' | ')}]`
           + ` conversas-na-vista=${st.conversas.length}`
@@ -7794,6 +7926,7 @@ async function segundoCanalDeTexto(servidorId) {
         + ` off-na-lista=${document.querySelectorAll('#lista-membros .member.is-off').length}`
         + ` chip="${$('#rotulo-peers').textContent}" off-max=${offVistoMax}`
         + ` chips=${JSON.stringify([...chipsVistos])}`
+        + ` | entregas: confirmadas-por=${ultimaEntregaDe.get(servidorId) || 'nada'}`
         + [...relogioDaQueda.entries()]
           .filter(([, q]) => q.caiuEm)
           .map(([k, q]) => ` religou ${k.slice(0, 6)}: presenca=${q.voltouEm || '?'}ms`
@@ -8877,6 +9010,77 @@ async function segundoCanalDeTexto(servidorId) {
       await desenharTudo();
     } catch (e) {
       diz(`ui envio: REBENTOU ${e && e.message ? e.message : e}`);
+    }
+
+    // ---- «AINDA NAO SAIU DAQUI» CONTRA «ELE TEM-NA» (#94, #130) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual, ligados: [...paresLigados] };
+      const alvo = (vista.servidores || [])[0];
+      const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      if (!alvo || !canal) {
+        diz('ui entregas: sem servidor/canal para medir');
+      } else {
+        fecharDefinicoes();
+        escolherServidor(alvo.id);
+        escolherCanal(canal.id);
+        await pausa(500);
+        paresLigados.clear();
+        aplicarLigados([]);
+        // Um envio a serio, para o vazio: saiu para zero ligacoes, e a mensagem fica marcada.
+        $('#entrada').value = 'para o vazio (#94)';
+        await enviarDoCampo($('#entrada'), destinoDeEscrita(), $('#composer-erro'), desenharMensagens);
+        // O envio provoca um redesenho coalescido que SUBSTITUI a `vista`: o servidor que se
+        // fabrica tem de ser o da vista nova, senao mede-se contra um objecto morto.
+        await pausa(600);
+        const s = vista.servidores.find(x => x.id === alvo.id);
+        const saiuPara = ultimoEnvioSaiuPara;
+        const ultima = [...document.querySelectorAll('#stream .msg')].pop();
+        const marcada = !!ultima && ultima.classList.contains('msg--por-confirmar');
+        const marca = ultima && ultima.querySelector('.msg__estado');
+        const tituloSemNinguem = marca ? marca.title : '';
+        const marcaVisivel = !!marca && getComputedStyle(marca).display !== 'none';
+        const notaSemNinguem = $('#composer-nota').textContent;
+        // Um membro fabricado, ligado: o titulo muda, a marca fica.
+        s.membros.push({ chave: 'outro1', nome: 'x' });
+        aplicarLigados(['outro1']);
+        const tituloComLigado = marca ? marca.title : '';
+        const aindaMarcada = !!ultima && ultima.classList.contains('msg--por-confirmar');
+        const notaComLigado = $('#composer-nota').textContent;
+        // A prova chega: a marca sai, no MESMO no.
+        aoConfirmarEntrega([alvo.id, 'outro1', Number(ultima.dataset.instante), 'sync']);
+        const depoisDaProva = [...document.querySelectorAll('#stream .msg')].pop();
+        const saiu = !!ultima && !ultima.classList.contains('msg--por-confirmar');
+        const mesmoNo = depoisDaProva === ultima;
+        const naVista = (s.entregue || {}).outro1 === Number(ultima.dataset.instante);
+        // Uma prova mais antiga nao volta a marcar.
+        aoConfirmarEntrega([alvo.id, 'outro1', 1, 'prev']);
+        const naoRecua = !!ultima && !ultima.classList.contains('msg--por-confirmar');
+        // A nota numa conversa privada com o outro desligado.
+        vista.conversas = vista.conversas || [];
+        vista.conversas.push({ id: 'conversa-entregas', com: 'outro2', nome: 'ze', canal: 'conversa', nao_lidos: 0, entregue_ate: 0 });
+        modo = 'privado'; conversaAtual = 'conversa-entregas';
+        aplicarLigados([]);
+        const notaConversa = $('#composer-nota').textContent;
+        aplicarLigados(['outro2']);
+        const notaConversaLigada = $('#composer-nota').textContent;
+        modo = antes.modo; conversaAtual = antes.conv;
+        vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-entregas');
+        s.membros = s.membros.filter(m => m.chave !== 'outro1');
+        diz(`ui entregas: saiu-para=${saiuPara} marcada=${marcada} marca-visivel=${marcaVisivel}`
+          + ` titulo-sem-ninguem-diz-nao-saiu=${/não saiu deste computador/.test(tituloSemNinguem)}`
+          + ` nota-sem-ninguem=${/ninguém desta sala está ligado/.test(notaSemNinguem)}`
+          + ` com-ligado: marcada=${aindaMarcada} titulo-diz-nao-confirmou=${/ainda não confirmou/.test(tituloComLigado)}`
+          + ` nota-normal=${notaComLigado === NOTA_DA_CAIXA}`
+          + ` prova: saiu=${saiu} mesmo-no=${mesmoNo} na-vista=${naVista} nao-recua=${naoRecua}`
+          + ` conversa: nota-desligado=${/não está ligado/.test(notaConversa)} nota-ligado=${notaConversaLigada === NOTA_DA_CAIXA}`);
+        aplicarLigados(antes.ligados);
+        escolherServidor(antes.srv || alvo.id);
+        if (antes.cnl) escolherCanal(antes.cnl);
+        await pausa(400);
+      }
+    } catch (e) {
+      diz(`ui entregas: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------

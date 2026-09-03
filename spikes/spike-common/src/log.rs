@@ -380,6 +380,26 @@ impl Log {
         self.ilegiveis
     }
 
+    /// Uma entrada pelo hash, se cá está. Serve para ler o pai (`prev`) de uma entrada que
+    /// chega: se o pai é meu, quem a escreveu tinha a minha — é uma prova de entrega (#94)
+    /// que já vinha no fio, sem recibo nenhum.
+    pub fn entrada(&self, hash: &str) -> Option<&Entry> {
+        self.entries.get(hash)
+    }
+
+    /// O maior instante efectivo entre estes hashes (os que cá estiverem). Uma passagem só
+    /// pelo grafo, sem clones nem hashing.
+    pub fn maior_instante(&self, hashes: &[String]) -> Option<u64> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let inst = self.instantes();
+        hashes
+            .iter()
+            .filter_map(|h| inst.get(h.as_str()).copied())
+            .max()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -333,6 +333,10 @@ html, body {
 .msg__head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 1px; }
 .msg__head b { font: 600 14.5px/1.3 var(--ui); color: #e9f1f6; }
 .msg__head time { font: 400 11px/1 var(--mono); color: var(--dim); }
+/* «Ainda não saiu daqui» / «ele ainda não confirmou» (#94): só nas minhas, só enquanto
+   ninguém provou ter a mensagem. Confirmada = a marca desaparece; não há ✓. */
+.msg__estado { display: none; font: 400 11px/1 var(--mono); color: var(--dim); cursor: help; }
+.msg--por-confirmar .msg__estado { display: inline; }
 /* `pre-wrap` e o que faz as mudancas de linha aparecerem: em HTML, uma nova linha dentro de
    texto e apenas um espaco. Sem isto, escrever em varias linhas guardava-as no log e
    mostrava-as todas seguidas -- a mensagem chegava certa e via-se errada.

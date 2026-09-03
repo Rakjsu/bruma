@@ -214,6 +214,13 @@ pub struct Indice {
     /// não muda por chegar histórico.
     #[serde(default)]
     pub lido: BTreeMap<String, i64>,
+    /// Até que instante cada par provou ter as MINHAS mensagens (#94), por «servidor/par».
+    /// Não há recibos: a prova é o par mandar-me de volta uma entrada minha (num `Sync`) ou
+    /// escrever uma cujo pai é meu. Vai à boleia das gravações do índice que já existem —
+    /// nunca um fsync por mensagem recebida (#140); depois de um crash pode ficar atrás, e
+    /// isso é na direcção segura: mais marcas «por confirmar», nunca menos.
+    #[serde(default)]
+    pub entregue: BTreeMap<String, i64>,
     #[serde(default)]
     pub quem_escreve: QuemEscreve,
     /// Tudo o que uma versão MAIS RECENTE tenha escrito aqui e que esta não conhece.
@@ -310,6 +317,7 @@ impl App {
             bloqueados: Mutex::new(Vec::new()),
             quem_escreve: Mutex::new(QuemEscreve::default()),
             lido: Mutex::new(BTreeMap::new()),
+            entregue: Mutex::new(BTreeMap::new()),
             escrita_do_indice: Mutex::new(()),
             nao_abriram: Mutex::new(Vec::new()),
             resto_do_indice: Mutex::new(BTreeMap::new()),
@@ -767,6 +775,8 @@ pub struct App {
     pub quem_escreve: Mutex<QuemEscreve>,
     /// Ver [`Indice::lido`].
     pub lido: Mutex<BTreeMap<String, i64>>,
+    /// Ver [`Indice::entregue`].
+    pub entregue: Mutex<BTreeMap<String, i64>>,
     /// Serializa `gravar_indice` — duas escritas ao mesmo tempo destruíam o índice. Não guarda
     /// nada; é só um portão. É privado de propósito: se alguém o tomasse antes de chamar
     /// `gravar_indice`, prendia.
@@ -879,6 +889,7 @@ impl App {
             bloqueados: Mutex::new(indice.bloqueados),
             quem_escreve: Mutex::new(indice.quem_escreve),
             lido: Mutex::new(indice.lido),
+            entregue: Mutex::new(indice.entregue),
             escrita_do_indice: Mutex::new(()),
             nao_abriram: Mutex::new(nao_abriram),
             resto_do_indice: Mutex::new(indice.resto.clone()),
@@ -1150,6 +1161,14 @@ impl App {
             let prefixo = format!("{id}/");
             l.retain(|k, _| k != id && !k.starts_with(&prefixo));
         }
+        {
+            let mut e = self
+                .entregue
+                .lock()
+                .map_err(|_| anyhow!("estado partido"))?;
+            let prefixo = format!("{id}/");
+            e.retain(|k, _| !k.starts_with(&prefixo));
+        }
         // O índice PRIMEIRO: se a gravação falhar, a conversa volta no arranque seguinte com
         // o log ao lado, que é melhor do que um índice sem chave e um ficheiro que já não
         // abre. Ver a ordem em `gravar_semente`.
@@ -1239,6 +1258,32 @@ impl App {
         }
     }
 
+    /// Regista que `peer` provou ter as minhas mensagens deste servidor até `ate` (o instante
+    /// efectivo da mais recente). Só avança, como o `marcar_lido`: uma prova antiga que
+    /// chegue atrasada não desfaz uma mais recente. Devolve se mudou.
+    pub fn confirmar_entrega(&self, servidor: &str, peer: &str, ate: i64) -> bool {
+        let mut e = match self.entregue.lock() {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let k = format!("{servidor}/{peer}");
+        match e.get(&k) {
+            Some(anterior) if *anterior >= ate => false,
+            _ => {
+                e.insert(k, ate);
+                true
+            }
+        }
+    }
+
+    pub fn entregue_ate(&self, servidor: &str, peer: &str) -> i64 {
+        self.entregue
+            .lock()
+            .ok()
+            .and_then(|e| e.get(&format!("{servidor}/{peer}")).copied())
+            .unwrap_or(0)
+    }
+
     pub fn lido_ate(&self, servidor: &str, canal: &str) -> i64 {
         self.lido
             .lock()
@@ -1290,6 +1335,7 @@ impl App {
             bloqueados: self.bloqueados.lock().unwrap().clone(),
             quem_escreve: *self.quem_escreve.lock().unwrap(),
             lido: self.lido.lock().unwrap().clone(),
+            entregue: self.entregue.lock().unwrap().clone(),
             // O que uma versão mais recente escreveu e esta não conhece, devolvido intacto.
             resto: self.resto_do_indice.lock().unwrap().clone(),
         };
@@ -2805,6 +2851,35 @@ mod testes {
     /// Se recuasse, uma marcação atrasada (a app aberta duas vezes, um evento fora de ordem)
     /// ressuscitava mensagens já lidas — e o sintoma seria «o não lido volta sozinho», que
     /// não se liga a esta linha de código de maneira nenhuma.
+    /// A confirmação de entrega só avança (#94): uma prova antiga que chegue atrasada não
+    /// desfaz uma mais recente, e cada par tem o seu contador.
+    #[test]
+    fn confirmar_entrega_so_avanca() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-entrega-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = App::arrancar().expect("arrancar");
+
+        assert!(app.confirmar_entrega("s", "ze", 100), "a primeira prova");
+        assert_eq!(app.entregue_ate("s", "ze"), 100);
+        assert!(
+            !app.confirmar_entrega("s", "ze", 50),
+            "50 é para trás: não muda"
+        );
+        assert_eq!(app.entregue_ate("s", "ze"), 100, "e não pode ter recuado");
+        assert!(app.confirmar_entrega("s", "ze", 150), "150 é para a frente");
+        assert_eq!(app.entregue_ate("s", "ze"), 150);
+        assert_eq!(app.entregue_ate("s", "rui"), 0, "outro par, outro contador");
+        assert_eq!(
+            app.entregue_ate("t", "ze"),
+            0,
+            "outro servidor, outro contador"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn marcar_lido_nunca_recua() {
         let _guarda_dados = trava_dados();
