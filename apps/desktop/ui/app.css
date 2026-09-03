@@ -773,14 +773,17 @@ body.ghost .app { transition: filter .8s var(--ease); }
    desconfortavel. A nevoa tem ainda um custo proprio: e um blur(34px) sobre uma
    camada fixa de ecra inteiro, a animar sem parar numa app que fica aberta o dia
    todo -- ou seja, GPU e bateria a arder por decoracao. */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: .001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: .001ms !important;
-  }
-  .fog { animation: none; }
+/* UMA regra, ligada pela CLASSE (#24): o interruptor das Definições e o pedido do sistema
+   chegam os dois pela mesma decisão em `aplicarMovimento`. Antes só o media query tinha
+   regras e a classe não fazia nada — o interruptor mentia. Com .001ms e uma iteração cada
+   animação pára no último keyframe: o anel de quem fala fica cheio, o «a escrever» fica
+   visível, a mensagem fica opaca — nenhuma fica presa num estado feio. */
+:root.sem-movimento *, :root.sem-movimento *::before, :root.sem-movimento *::after {
+  animation-duration: .001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .001ms !important;
 }
+:root.sem-movimento .fog { animation: none; }
 
 /* --- scrollbars ---------------------------------------------------------- */
 

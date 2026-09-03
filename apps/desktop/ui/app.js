@@ -194,11 +194,13 @@ function destinoDeEscrita() {
 }
 
 function irParaPrivado() {
+  geracaoDaVista += 1;
   modo = 'privado';
   desenharTudo();
 }
 
 function escolherConversa(id) {
+  geracaoDaVista += 1;
   modo = 'privado';
   conversaAtual = id;
   desenharTudo();
@@ -213,7 +215,7 @@ function desenharConversas() {
   if (conversaAtual === null) amg.classList.add('is-active');
   amg.append(elemento('span', 'chan__glyph', '☺'));
   amg.append(elemento('span', null, 'Amigos'));
-  amg.onclick = () => { conversaAtual = null; desenharTudo(); };
+  amg.onclick = () => { geracaoDaVista += 1; conversaAtual = null; desenharTudo(); };
   lista.append(amg);
 
   const g = elemento('div', 'group');
@@ -370,6 +372,7 @@ function desenharMembros() {
 
 async function desenharMensagens() {
   if (modo === 'privado') return desenharMensagensPrivadas();
+  const minhaVez = geracaoDaVista;
   const stream = $('#stream');
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
@@ -413,6 +416,9 @@ async function desenharMensagens() {
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
 
   const msgs = await invoke('mensagens', { servidor: s.id, canal: canal.id }).catch(() => []);
+  // Se entretanto se navegou para outro sítio, este desenho é de um canal que já ninguém
+  // quer ver (#162): nem toca no stream, nem pede para marcar nada como lido.
+  if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
   stream.textContent = '';
   if (!msgs.length) {
     const v = elemento('div', 'vazio');
@@ -422,7 +428,7 @@ async function desenharMensagens() {
     return;
   }
 
-  await escreverMensagens(stream, msgs, s.id, canal.id);
+  await escreverMensagens(stream, msgs, s.id, canal.id, minhaVez);
   // Os avisos do sistema (#196, #131) voltam a seguir ao redesenho que os teria apagado.
   pintarAvisos();
 }
@@ -445,8 +451,22 @@ async function desenharMensagens() {
 let marcaDaVista = { onde: null, antes: 0 };
 // Só para medição: o valor de `marcar` do último pedido feito ao Rust.
 let ultimoMarcarPedido = null;
+// A GERAÇÃO DA VISTA (#162). Sobe a cada NAVEGAÇÃO (servidor, canal, conversa) e nunca
+// numa mensagem a chegar. Cada desenho guarda a geração com que nasceu e, depois de cada
+// `await`, confere se ainda é a actual: dois cliques rápidos (A e logo B) lançavam dois
+// desenhos, e o de A retomava depois do de B — escrevia o SEU `antes` no `marcaDaVista`
+// que já era de B (a linha das novas de B no corte de A) e pedia `marcar_lido` para um
+// canal que ninguém chegou a ver. Não é uma corrida de respostas — os comandos síncronos
+// respondem por ordem — é o entrelaçar dos `await` numa só thread.
+let geracaoDaVista = 0;
+// Medição: desenhos que chegaram tarde e foram deitados fora pela geração.
+let chegadasTarde = 0;
+// Medição: os últimos pedidos de `marcar_lido` feitos pelo desenho, com o `marcar` pedido.
+const marcarPedidos = [];
+// Medição: o último pedido de leitura feito pelo FOCO da janela (#27).
+let ultimoMarcarPorFoco = null;
 
-async function escreverMensagens(stream, msgs, servidorId, canalId) {
+async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = geracaoDaVista) {
   const onde = `${servidorId}/${canalId}`;
   if (marcaDaVista.onde !== onde) marcaDaVista = { onde, antes: null };
 
@@ -468,9 +488,14 @@ async function escreverMensagens(stream, msgs, servidorId, canalId) {
   // minhas nunca contam como por ler — portanto a marca não avança de qualquer maneira, e a
   // medição passava com e sem a correcção. Já lhe chamei uma medição e ela era uma opinião.
   ultimoMarcarPedido = aFrente;
+  marcarPedidos.push({ onde, marcar: aFrente });
+  if (marcarPedidos.length > 8) marcarPedidos.shift();
   const antes = await invoke('marcar_lido', {
     servidor: servidorId, canal: canalId, marcar: aFrente,
   }).catch(() => null);
+  // Navegou-se durante o `marcar_lido`: o `antes` é de um canal que já não está à frente
+  // e NÃO entra no `marcaDaVista` de quem entretanto chegou (#162).
+  if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
 
   // A linha fixa-se na PRIMEIRA vez que se olha para este canal, e fica.
   if (marcaDaVista.antes === null && antes !== null) marcaDaVista.antes = antes;
@@ -497,16 +522,40 @@ async function escreverMensagens(stream, msgs, servidorId, canalId) {
   }
   if (estavaNoFim || marcaDaVista.antes === antes) stream.scrollTop = stream.scrollHeight;
 
-  if (aFrente) {
-    // O contador na barra tem de desaparecer agora, e não só no redesenho seguinte. E a
-    // fotografia dos avisos também: sem isto ela ficava com a contagem antiga, e a rajada
-    // seguinte não parecia uma subida — ficava em silêncio.
-    if (porLerAnterior) {
-      porLerAnterior.delete(`s:${onde}`);
-      porLerAnterior.delete(`c:${servidorId}`);
-    }
-    await refrescarBolhas();
+  if (aFrente) await esquecerPorLer(servidorId, canalId);
+}
+
+/** O que se faz quando um canal ficou lido: o contador na barra tem de desaparecer agora,
+ *  e não só no redesenho seguinte. E a fotografia dos avisos também — sem isto ela ficava
+ *  com a contagem antiga, e a rajada seguinte não parecia uma subida: ficava em silêncio. */
+async function esquecerPorLer(servidorId, canalId) {
+  if (porLerAnterior) {
+    porLerAnterior.delete(`s:${servidorId}/${canalId}`);
+    porLerAnterior.delete(`c:${servidorId}`);
   }
+  await refrescarBolhas();
+}
+
+/** O canal que está à frente, se for um onde se lê (#27). */
+function destinoDeLeitura() {
+  if (modo === 'privado') {
+    const c = conversa();
+    return c ? { servidor: c.id, canal: c.canal } : null;
+  }
+  const s = servidor();
+  const canal = s && s.canais.find(c => c.id === canalAtual);
+  return s && canal && canal.tipo === 'texto' ? { servidor: s.id, canal: canal.id } : null;
+}
+
+/** Dá o canal à frente por lido SEM redesenhar (#27): voltar à janela é ver o que lá
+ *  está. O redesenho só marcava como lido quando a janela estava à frente — certo — mas
+ *  ninguém marcava ao VOLTAR: a bolha ficava acesa sobre um canal que se estava a olhar.
+ *  Não se redesenha o stream: o scroll e a linha «novas mensagens» ficam onde estão. */
+async function darPorLido(servidorId, canalId) {
+  ultimoMarcarPorFoco = { onde: `${servidorId}/${canalId}`, marcar: true };
+  await invoke('marcar_lido', { servidor: servidorId, canal: canalId, marcar: true })
+    .catch(() => null);
+  await esquecerPorLer(servidorId, canalId);
 }
 
 /** Volta a pedir o estado só para as contagens, sem redesenhar a conversa a meio da
@@ -546,13 +595,14 @@ function umaMensagem(m, anterior) {
 }
 
 async function desenharMensagensPrivadas() {
+  const minhaVez = geracaoDaVista;
   const stream = $('#stream');
   const c = conversa();
   $('#vista-voz').hidden = true;
   stream.hidden = false;
-  stream.textContent = '';
 
   if (!c) {
+    stream.textContent = '';
     $('#composer').hidden = true;
     await desenharAmigos(stream);
     return;
@@ -560,8 +610,13 @@ async function desenharMensagensPrivadas() {
 
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para ${c.nome}`;
+  // A conversa deixa de ficar em BRANCO durante a chamada ao Rust: limpava-se antes do
+  // `await` e a selecção morria a cada mensagem que chegasse. Limpa-se quando há o que
+  // escrever — e só se ninguém navegou entretanto (#162).
   const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
-  await escreverMensagens(stream, msgs, c.id, c.canal);
+  if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
+  stream.textContent = '';
+  await escreverMensagens(stream, msgs, c.id, c.canal, minhaVez);
   pintarAvisos();
 }
 
@@ -713,6 +768,7 @@ async function desenharTudo() {
 }
 
 function escolherServidor(id) {
+  geracaoDaVista += 1;
   modo = 'servidor';
   servidorAtual = id;
   canalAtual = null;
@@ -720,6 +776,7 @@ function escolherServidor(id) {
 }
 
 function escolherCanal(id) {
+  geracaoDaVista += 1;
   canalAtual = id;
   desenharCanais();
   desenharTopo();
@@ -818,11 +875,22 @@ function deteccaoDeJogoDesligada() {
   return localStorage.getItem(SEM_JOGO) === '1';
 }
 
+/** O sistema também pede menos movimento («Mostrar animações» desligado no Windows). */
+const pedeMenosMovimento = window.matchMedia
+  ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+
+/** UMA decisão para a classe `sem-movimento` (#24): o interruptor das Definições OU o
+ *  pedido do sistema. A classe existia e não fazia nada — só o media query do CSS tinha
+ *  regras, e o interruptor mentia. Agora é a classe que manda e o CSS só a conhece a ela. */
 function aplicarMovimento() {
-  document.documentElement.classList.toggle(
-    'sem-movimento', localStorage.getItem(SEM_MOVIMENTO) === '1');
+  const pedido = localStorage.getItem(SEM_MOVIMENTO) === '1';
+  const sistema = !!(pedeMenosMovimento && pedeMenosMovimento.matches);
+  document.documentElement.classList.toggle('sem-movimento', pedido || sistema);
 }
 aplicarMovimento();
+if (pedeMenosMovimento && pedeMenosMovimento.addEventListener) {
+  pedeMenosMovimento.addEventListener('change', aplicarMovimento);
+}
 
 /** O que o último teste do microfone disse. Sobrevive a redesenhos do painel (#107). */
 let testeDoMicro = null;
@@ -5170,7 +5238,13 @@ function qualidadeDe(quem) {
 let gentePorBaixoOculta = false;
 
 /** Se a janela do Bruma tem o foco — ver a pausa da pré-visualização no palco. */
-window.addEventListener('focus', () => { janelaComFoco = true; if (voz.aVer) desenharVoz(); });
+window.addEventListener('focus', () => {
+  janelaComFoco = true;
+  if (voz.aVer) desenharVoz();
+  // Voltar à janela é ver o canal que lá está (#27).
+  const d = destinoDeLeitura();
+  if (d) darPorLido(d.servidor, d.canal);
+});
 window.addEventListener('blur', () => { janelaComFoco = false; if (voz.aVer) desenharVoz(); });
 
 const ICO = {
@@ -6552,6 +6626,18 @@ function pararDeAssistir() {
     + ` MediaStreamTrackProcessor=${typeof window.MediaStreamTrackProcessor === 'undefined' ? 'não existe' : 'existe'}`
     + ` AudioWorklet=${typeof AudioWorkletNode === 'undefined' ? 'não existe' : 'existe'}`);
 })();
+
+/** Um SEGUNDO canal de texto no servidor de medição, criado uma vez e reutilizado (#162,
+ *  #28): o guião só cria «palco» de voz, e dois cliques rápidos precisam de dois canais de
+ *  texto. Devolve o canal já visto pela `vista`, ou `null` se não conseguiu. */
+async function segundoCanalDeTexto(servidorId) {
+  const ver = () => ((vista.servidores || []).find(x => x.id === servidorId) || { canais: [] })
+    .canais.find(c => c.tipo === 'texto' && c.nome === 'segundo') || null;
+  if (ver()) return ver();
+  await invoke('criar_canal', { servidor: servidorId, nome: 'segundo', tipo: 'texto' }).catch(() => {});
+  vista = await invoke('estado').catch(() => vista);
+  return ver();
+}
 
 /* ---------- autoteste do ECO ------------------------------------------------ */
 
@@ -8121,6 +8207,97 @@ function pararDeAssistir() {
           + ` a-frente-pediu=${pediuComJanelaAFrente}`
           + ` decide-pelo-foco=${pediuComJanelaAtras === false && pediuComJanelaAFrente === true}`);
       }
+    }
+
+    // ---- voltar a janela da por lido o canal aberto (#27) -------------------------
+    {
+      const alvo = (vista.servidores || [])[0];
+      const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      if (alvo && canal) {
+        const guardado = janelaComFoco;
+        escolherServidor(alvo.id);
+        escolherCanal(canal.id);
+        await new Promise(r => setTimeout(r, 400));
+        janelaComFoco = false;
+        ultimoMarcarPorFoco = null;
+        const n = $('#stream').children.length;
+        window.dispatchEvent(new Event('focus'));
+        await new Promise(r => setTimeout(r, 300));
+        const pediu = ultimoMarcarPorFoco;
+        const intacto = $('#stream').children.length === n;
+        // Contra-prova: em «Amigos» (modo privado sem conversa) o foco nao tem o que ler.
+        const modoAntes = modo;
+        const convAntes = conversaAtual;
+        modo = 'privado'; conversaAtual = null;
+        janelaComFoco = false; ultimoMarcarPorFoco = null;
+        window.dispatchEvent(new Event('focus'));
+        await new Promise(r => setTimeout(r, 200));
+        const pediuEmAmigos = ultimoMarcarPorFoco;
+        modo = modoAntes; conversaAtual = convAntes;
+        janelaComFoco = guardado;
+        diz(`ui foco da por lido: pediu=${!!pediu}`
+          + ` onde-certo=${!!pediu && pediu.onde === alvo.id + '/' + canal.id}`
+          + ` stream-intacto=${intacto} em-amigos-pediu=${!!pediuEmAmigos}`);
+      }
+    }
+
+    // ---- dois cliques rapidos: o segundo canal ganha (#162) -------------------------
+    //
+    // Sincronos, na mesma tarefa: os dois desenhos arrancam antes de qualquer resposta,
+    // e o de A tem de morrer no primeiro `await` sem tocar no stream nem pedir para
+    // marcar A como lido. Nao depende de tempos.
+    {
+      const alvo = (vista.servidores || [])[0];
+      const a = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      if (alvo && a) {
+        const b = await segundoCanalDeTexto(alvo.id);
+        if (b) {
+          await invoke('enviar', { servidor: alvo.id, canal: b.id, texto: 'no segundo canal' }).catch(() => {});
+          escolherServidor(alvo.id);
+          escolherCanal(a.id);
+          await new Promise(r => setTimeout(r, 400));
+          const guardado = janelaComFoco;
+          janelaComFoco = true;
+          marcarPedidos.length = 0;
+          const tardeAntes = chegadasTarde;
+          escolherCanal(a.id);
+          escolherCanal(b.id);
+          await new Promise(r => setTimeout(r, 800));
+          const nomeDe = onde => onde === alvo.id + '/' + a.id ? 'A' : onde === alvo.id + '/' + b.id ? 'B' : '?';
+          const pedidos = marcarPedidos.filter(p => p.marcar).map(p => nomeDe(p.onde));
+          const mostraB = [...$('#stream').querySelectorAll('.msg p')].some(p => /no segundo canal/.test(p.textContent));
+          janelaComFoco = guardado;
+          diz(`ui dois cliques: onde=${nomeDe(marcaDaVista.onde)} pedidos-marcar=[${pedidos.join(',')}]`
+            + ` chegadas-tarde=${chegadasTarde - tardeAntes} stream-mostra-B=${mostraB}`
+            + ` canal-actual-e-B=${canalAtual === b.id}`);
+        } else {
+          diz('ui dois cliques: nao consegui criar o segundo canal');
+        }
+      }
+    }
+
+    // ---- «Reduzir o movimento» faz alguma coisa (#24) ------------------------------
+    {
+      const sistemaPede = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+      const guardado = localStorage.getItem(SEM_MOVIMENTO);
+      const nevoa = () => $('.fog') ? getComputedStyle($('.fog')).animationName : '?';
+      localStorage.setItem(SEM_MOVIMENTO, '0'); aplicarMovimento();
+      const desligado = nevoa();
+      localStorage.setItem(SEM_MOVIMENTO, '1'); aplicarMovimento();
+      const ligado = nevoa();
+      const classe = document.documentElement.classList.contains('sem-movimento');
+      const msg = $('.msg') ? getComputedStyle($('.msg')).animationDuration : '?';
+      const vm = document.createElement('div'); vm.className = 'vm is-speaking';
+      const ring = document.createElement('div'); ring.className = 'vm__ring';
+      vm.append(ring); document.body.append(vm);
+      const cs = getComputedStyle(ring);
+      const anel = `${cs.animationDuration}x${cs.animationIterationCount}`;
+      vm.remove();
+      if (guardado === null) localStorage.removeItem(SEM_MOVIMENTO); else localStorage.setItem(SEM_MOVIMENTO, guardado);
+      aplicarMovimento();
+      const reposto = document.documentElement.classList.contains('sem-movimento') === (guardado === '1' || sistemaPede);
+      diz(`ui reduzir movimento: sistema-pede=${sistemaPede} desligado=${desligado} ligado=${ligado}`
+        + ` classe=${classe} msg=${msg} anel=${anel} reposto=${reposto}`);
     }
 
     // ---- o que o aviso do sistema deixa sair -----------------------------------
