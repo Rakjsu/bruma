@@ -444,7 +444,7 @@ fn carimbo_de_actualizacao(estado: &str) {
 fn fechar_o_bruma() {
     use std::os::windows::process::CommandExt;
     // 0x08000000 = CREATE_NO_WINDOW: sem consolas a piscar no meio da instalação.
-    let _ = std::process::Command::new("taskkill")
+    let _ = std::process::Command::new(do_windows("System32").join("taskkill.exe"))
         .args(["/F", "/IM", "bruma.exe"])
         .creation_flags(0x0800_0000)
         .status();
@@ -557,6 +557,138 @@ fn escrever_registo(destino: &Path) -> Result<()> {
     Ok(())
 }
 
+/// UM EXECUTÁVEL DO WINDOWS, PELO CAMINHO E NÃO PELO NOME.
+///
+/// Este instalador relança-se ELEVADO. Um `Command` com o NOME de um executável procura na
+/// pasta de onde o processo foi lançado — tipicamente as Transferências, onde qualquer
+/// programa escreve — e um `taskkill.exe` plantado lá corria como administrador no instante
+/// em que a pessoa carrega em «Sim» no UAC. O `explorer.exe` não vive em System32, vive na
+/// raiz do Windows: por isso o ajudante recebe o resto do caminho.
+fn do_windows(resto: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+        .join(resto)
+}
+
+/// O ATALHO LEVA O NOME (revisão da Fase 8): sem o `AppUserModel.ID` no `.lnk`, o aviso do
+/// sistema não é atribuído ao Bruma — e a app não tem como saber (o `Toast::show()` devolve
+/// sucesso com um AUMID que a máquina nunca viu).
+#[cfg(all(windows, test))]
+mod testes_do_atalho {
+    use super::*;
+
+    #[test]
+    fn o_atalho_leva_o_appusermodelid() {
+        let dir = std::env::temp_dir().join(format!("bruma-lnk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("bruma.exe");
+        std::fs::write(&alvo, b"nao e um exe, e um alvo").unwrap();
+        let lnk = dir.join("Bruma.lnk");
+
+        criar_atalho(&lnk, &alvo).expect("criar o atalho");
+        assert!(lnk.exists(), "o atalho tem de existir");
+        let lido = ler_o_aumid(&lnk).expect("ler o AUMID de volta");
+        assert_eq!(
+            lido, AUMID,
+            "o atalho tem de levar o mesmo id que a app usa"
+        );
+
+        // E o id tem de ser o MESMO que o `tauri.conf.json` declara: se divergirem, o aviso
+        // sai sem nome e ninguém repara.
+        let conf = include_str!("../../desktop/tauri.conf.json");
+        assert!(
+            conf.contains(&format!("\"identifier\": \"{AUMID}\"")),
+            "o identifier do tauri.conf.json tem de ser {AUMID}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod testes_do_caminho {
+    /// Os executáveis do sistema saem de `%SystemRoot%`, e nunca de um nome solto que a pasta
+    /// de onde o instalador foi corrido pudesse satisfazer.
+    #[test]
+    fn os_executaveis_do_sistema_vao_pelo_caminho() {
+        let fonte = include_str!("main.rs");
+        for nome in ["taskkill", "cmd", "explorer.exe"] {
+            let solto = format!("Command::new(\"{nome}\")");
+            assert!(
+                !fonte.contains(&solto),
+                "{solto} é pelo nome: num processo elevado, a pasta de onde ele foi lançado é procurada primeiro"
+            );
+        }
+        assert!(
+            fonte.contains("fn do_windows("),
+            "o ajudante tem de existir"
+        );
+    }
+}
+
+/// O identificador desta app para o Windows — o mesmo que o `tauri.conf.json` declara e que
+/// a app usa ao mostrar um aviso do sistema. Se os dois não forem iguais, o aviso não é
+/// atribuído a este atalho e sai sem o nome «Bruma».
+#[cfg(windows)]
+const AUMID: &str = "dev.bruma.app";
+
+/// Escreve o `System.AppUserModel.ID` no atalho. Separado para poder ser lido de volta num
+/// teste: um atalho que se cria e não se verifica é uma promessa.
+#[cfg(windows)]
+fn por_o_aumid(link: &windows::Win32::UI::Shell::IShellLinkW, id: &str) -> Result<()> {
+    use windows::core::Interface;
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    unsafe {
+        let store: IPropertyStore = link.cast()?;
+        // A string tem de viver até ao `SetValue`, que a copia; o `Vec` morre no fim do bloco.
+        let mut largo: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut pv = PROPVARIANT::default();
+        {
+            // `ManuallyDrop` numa união: escreve-se pelo ponteiro, senão o Rust tentava
+            // correr o destrutor do valor antigo (que nem existe).
+            let dentro = &mut *pv.Anonymous.Anonymous;
+            dentro.vt = VT_LPWSTR;
+            dentro.Anonymous.pwszVal = windows::core::PWSTR(largo.as_mut_ptr());
+        }
+        store.SetValue(&PKEY_AppUserModel_ID, &pv)?;
+        store.Commit()?;
+        // O `pv` aponta para o `Vec` desta função: esvazia-se antes de o `Drop` do PROPVARIANT
+        // tentar libertar memória que não é dele.
+        {
+            let dentro = &mut *pv.Anonymous.Anonymous;
+            dentro.Anonymous.pwszVal = windows::core::PWSTR::null();
+            dentro.vt = windows::Win32::System::Variant::VT_EMPTY;
+        }
+    }
+    Ok(())
+}
+
+/// Lê o `System.AppUserModel.ID` de um atalho já gravado. Só serve ao teste — é o que
+/// distingue «escrevi o AUMID» de «chamei a função que o escreve».
+#[cfg(all(windows, test))]
+fn ler_o_aumid(lnk: &Path) -> Result<String> {
+    use windows::core::{Interface, HSTRING, PCWSTR};
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        let ficheiro: IPersistFile = link.cast()?;
+        let lnk_h = HSTRING::from(lnk.as_os_str());
+        ficheiro.Load(PCWSTR(lnk_h.as_ptr()), STGM_READ)?;
+        let store: IPropertyStore = link.cast()?;
+        let pv = store.GetValue(&PKEY_AppUserModel_ID)?;
+        Ok(pv.to_string())
+    }
+}
+
 #[cfg(windows)]
 fn criar_atalho(lnk: &Path, alvo: &Path) -> Result<()> {
     use windows::core::{Interface, HSTRING, PCWSTR};
@@ -574,6 +706,16 @@ fn criar_atalho(lnk: &Path, alvo: &Path) -> Result<()> {
         let pasta = alvo.parent().unwrap_or(Path::new(""));
         let pasta_h = HSTRING::from(pasta.as_os_str());
         link.SetWorkingDirectory(PCWSTR(pasta_h.as_ptr()))?;
+        // O NOME QUE APARECE NO AVISO DO SISTEMA.
+        //
+        // Um toast é atribuído a um AppUserModelID, e o Windows só o conhece se um atalho o
+        // registar. Sem isto o aviso do Bruma sai sem ser dele — e não há forma de detectar
+        // isso de dentro da app: medido, o `Toast::show()` devolve sucesso com um AUMID que
+        // esta máquina nunca viu. Vai aqui, e nunca pode impedir a criação do atalho: um
+        // atalho sem AUMID continua a abrir a app.
+        if let Err(e) = por_o_aumid(&link, AUMID) {
+            eprintln!("[atalho] sem AppUserModelID ({e}); os avisos do sistema saem sem o nome");
+        }
         let ficheiro: IPersistFile = link.cast()?;
         let lnk_h = HSTRING::from(lnk.as_os_str());
         ficheiro.Save(PCWSTR(lnk_h.as_ptr()), true)?;
@@ -784,7 +926,7 @@ fn desinstalar(destino: &Path, apagar_dados: bool, teste: bool) -> Result<Result
     ]);
     let conteudo = linhas.join("\r\n") + "\r\n";
     if std::fs::write(&script, conteudo).is_ok() {
-        let _ = std::process::Command::new("cmd")
+        let _ = std::process::Command::new(do_windows("System32").join("cmd.exe"))
             .args(["/C", &script.display().to_string()])
             .creation_flags(0x0800_0000)
             .spawn();
@@ -816,7 +958,7 @@ fn abrir_a_app(destino: &Path, args: &[String]) {
 /// O explorer não passa argumentos — é o preço deste atalho, e a app não usa nenhuns.
 fn abrir_a_app_sem_privilegios(destino: &Path) {
     use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("explorer.exe")
+    let _ = std::process::Command::new(do_windows("explorer.exe"))
         .arg(destino.join("bruma.exe"))
         .creation_flags(0x0800_0000)
         .spawn();
@@ -903,7 +1045,7 @@ fn abrir_e_sair(app: tauri::AppHandle, dir: String) {
     use std::os::windows::process::CommandExt;
     // Pelo explorer, para a app abrir SEM os privilégios do instalador. Uma app de
     // conversas não tem nada que correr como administrador.
-    let _ = std::process::Command::new("explorer.exe")
+    let _ = std::process::Command::new(do_windows("explorer.exe"))
         .arg(format!("{dir}\\bruma.exe"))
         .creation_flags(0x0800_0000)
         .spawn();

@@ -282,6 +282,13 @@ impl Log {
     /// dá exatamente a ordem de parede; com um relógio atrasado, a entrada é empurrada para
     /// depois do pai em vez de saltar para trás. Depende só do grafo e dos carimbos guardados,
     /// portanto todos os peers convergem para a mesma ordem sem falarem uns com os outros.
+    /// UM CARIMBO ABSURDO NÃO É UM RELÓGIO.
+    ///
+    /// Acima deste tecto (1 de Janeiro de 2100) um `ts_ms` não é uma data: é um relógio
+    /// partido, ou alguém a fazê-lo de propósito. É uma CONSTANTE e não «agora», porque a
+    /// ordem do log tem de ser a mesma em todos os peers e em qualquer dia.
+    pub const TECTO_DO_RELOGIO: u64 = 4_102_444_800_000;
+
     fn instantes(&self) -> BTreeMap<&str, u64> {
         let mut cache: BTreeMap<&str, u64> = BTreeMap::new();
         for inicio in self.entries.keys() {
@@ -313,7 +320,21 @@ impl Log {
                 // Pai ausente (ainda não sincronizado): a entrada é uma raiz e vale o seu
                 // próprio relógio. Quando o pai chegar, isto recalcula-se sozinho.
                 let base = cache.get(e.prev.as_str()).copied().unwrap_or(0);
-                let v = e.ts_ms.max(base.saturating_add(1));
+                // E UM CARIMBO ABSURDO NÃO ENVENENA OS FILHOS (#198).
+                //
+                // A regra é `max(ts, pai+1)`. Uma entrada com um `ts_ms` colossal levava
+                // consigo TODAS as seguintes — cada filho herdava `pai+1` a partir dela — e o
+                // por-ler, que desde o #198 compara INSTANTES, passava a medir contra um
+                // número que nunca mais era ultrapassado: a sala ficava lida para sempre.
+                // Era exactamente o defeito que o filtro do carimbo cru tinha fechado, a
+                // entrar outra vez por outra porta. Acima do tecto a entrada não vale como
+                // relógio e fica logo a seguir ao pai, onde a causalidade a põe.
+                let seu = if e.ts_ms > Self::TECTO_DO_RELOGIO {
+                    0
+                } else {
+                    e.ts_ms
+                };
+                let v = seu.max(base.saturating_add(1));
                 cache.insert(h, v);
             }
         }
@@ -868,6 +889,33 @@ mod tests {
         let esperado: Vec<String> = [&a, &b, &c].iter().map(|e| e.hash_hex().unwrap()).collect();
         assert_eq!(ordem, esperado);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Um carimbo absurdo não envenena os filhos (#198): as entradas seguintes continuam com
+    /// instantes sãos, e o log continua a ter uma ordem só.
+    #[test]
+    fn um_carimbo_absurdo_nao_envenena_os_filhos() {
+        for veneno in [u64::MAX, (i64::MAX as u64) + 1, Log::TECTO_DO_RELOGIO + 1] {
+            let mut log = Log::load(tmp(&format!("veneno-{veneno}"))).unwrap();
+            let t = 1_700_000_000_000u64;
+            log.append_local(&key(1), [0u8; 24], vec![1], t).unwrap();
+            log.append_local(&key(1), [1u8; 24], vec![2], veneno)
+                .unwrap();
+            log.append_local(&key(1), [2u8; 24], vec![3], t + 1_000)
+                .unwrap();
+            log.append_local(&key(1), [3u8; 24], vec![4], t + 2_000)
+                .unwrap();
+            let instantes: Vec<u64> = log.ordered_ref().into_iter().map(|(i, _, _)| i).collect();
+            assert_eq!(instantes.len(), 4);
+            for i in &instantes {
+                assert!(
+                    *i <= Log::TECTO_DO_RELOGIO,
+                    "com {veneno} o instante {i} passou o tecto: os filhos foram envenenados"
+                );
+            }
+            // E a ordem continua a ser uma só: estritamente crescente, sem empates.
+            assert!(instantes.windows(2).all(|p| p[0] < p[1]), "{instantes:?}");
+        }
     }
 
     /// Os extremos (#21): o mínimo e o máximo dos carimbos, e nada num log vazio.

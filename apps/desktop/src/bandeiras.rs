@@ -37,6 +37,18 @@ pub fn aviso_clica_sozinho() -> bool {
     false
 }
 
+/// O toast directo falha, como falharia numa instalação cujo atalho não registou o AUMID
+/// (#95): serve para medir que o aviso sai na mesma, pelo plugin, em vez de ficar em silêncio.
+/// Com esta bandeira o «clica sozinho» não corta caminho — o que se quer medir é o recurso.
+#[cfg(debug_assertions)]
+pub fn aviso_sem_aumid() -> bool {
+    std::env::var("BRUMA_AVISO_SEM_AUMID").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn aviso_sem_aumid() -> bool {
+    false
+}
+
 /// A sessão morre ENTRE o registo e o stream — o caminho que deixava um par inalcançável.
 #[cfg(debug_assertions)]
 pub fn sessao_morre() -> bool {

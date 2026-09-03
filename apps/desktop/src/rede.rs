@@ -80,6 +80,15 @@ const TECTO_DE_ESTRANHOS: usize = 5;
 /// chave rodou, ou restos de um formato antigo, e isso não deve fechar-lhe a porta.
 const LIXO_TOLERADO: usize = 50;
 
+/// O tecto do lixo, e o que uma recusa custa — extraídos para o `aplicar` e o teste falarem
+/// da MESMA regra. Uma cópia da regra dentro de um teste não prova nada sobre o código.
+fn cabe_no_orcamento(gasto: usize, lote: usize) -> bool {
+    gasto + lote <= LIXO_TOLERADO
+}
+
+/// Uma recusa custa UMA tentativa, e não o tamanho do lote. Ver o `aplicar`.
+const CUSTO_DA_RECUSA: usize = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -2985,9 +2994,21 @@ fn aplicar(
     let chave = (peer.to_string(), servidor.to_string());
     if !pode_sincronizar(app, servidor, peer) {
         let gasto = orcamento.get(&chave).copied().unwrap_or(0);
-        if gasto + entradas.len() > LIXO_TOLERADO {
-            // Conta-se a tentativa, senão bastava repetir para nunca esgotar.
-            *orcamento.entry(chave).or_insert(0) += entradas.len();
+        if !cabe_no_orcamento(gasto, entradas.len()) {
+            // CONTA-SE A TENTATIVA, E NÃO O LOTE.
+            //
+            // Contar o lote inteiro fechava a conta daquele par NESTA SALA à primeira
+            // recusa — e um `Sync` de aperto de mão traz o histórico todo, portanto 51
+            // mensagens chegavam. Depois de eu apagar uma conversa, o par volta a mandar o
+            // mesmo `Sync` em cada ligação, gastava 51 outra vez, e as mensagens NOVAS dele
+            // (uma entrada, que caberia à vontade) eram deitadas fora em silêncio: o
+            // contacto ficava calado para sempre, com o véu do apagar a prometer o
+            // contrário («se te escrever outra vez, a conversa volta»).
+            //
+            // O lote recusado não custou nada — nem se decifrou —, por isso o que se conta é
+            // a tentativa. O tecto continua a travar quem martela: cinquenta tentativas e a
+            // conta fecha na mesma.
+            *orcamento.entry(chave).or_insert(0) += CUSTO_DA_RECUSA;
             return;
         }
     }
@@ -4072,9 +4093,8 @@ mod testes {
     /// Agora conta-se o que já se gastou MAIS o pior caso deste lote, que é ele inteiro.
     #[test]
     fn o_orcamento_trava_o_primeiro_lote_e_nao_o_segundo() {
-        // A decisão, extraída tal como está no `aplicar`: quem não provou tem tecto, e o
-        // tecto olha para o lote que vem a caminho.
-        let cabe = |gasto: usize, lote: usize| gasto + lote <= LIXO_TOLERADO;
+        // A MESMA função que o `aplicar` usa — e não uma cópia da regra escrita no teste.
+        let cabe = cabe_no_orcamento;
 
         assert!(
             !cabe(0, LIXO_TOLERADO + 1),
@@ -4087,6 +4107,31 @@ mod testes {
         assert!(
             !cabe(LIXO_TOLERADO, 1),
             "esgotado o orçamento, nem mais uma entrada"
+        );
+    }
+
+    /// UMA RECUSA CUSTA UMA TENTATIVA, E NÃO O LOTE (revisão da Fase 8).
+    ///
+    /// Depois de eu apagar uma conversa, o par volta a mandar-me o `Sync` dela em cada
+    /// ligação. Contar o lote inteiro fechava a conta daquele par à PRIMEIRA recusa — e as
+    /// mensagens novas dele, que cabem à vontade, eram deitadas fora em silêncio para sempre.
+    #[test]
+    fn uma_recusa_custa_uma_tentativa_e_nao_o_lote() {
+        let mut gasto = 0usize;
+        assert!(
+            !cabe_no_orcamento(gasto, 60),
+            "um Sync de 60 entradas de quem não provou nada tem de ser travado"
+        );
+        gasto += CUSTO_DA_RECUSA;
+        assert!(
+            cabe_no_orcamento(gasto, 1),
+            "e a mensagem NOVA dele — uma entrada — tem de passar na mesma"
+        );
+        // Quem martela esgota a conta como sempre esgotou.
+        gasto = LIXO_TOLERADO;
+        assert!(
+            !cabe_no_orcamento(gasto, 1),
+            "esgotado, nem mais uma entrada"
         );
     }
 

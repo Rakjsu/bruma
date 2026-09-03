@@ -1528,7 +1528,9 @@ pub fn actualizacao_incompleta() -> Option<String> {
 #[tauri::command]
 pub fn abrir_pasta_de_dados() -> R<()> {
     let raiz = crate::estado::raiz();
-    std::process::Command::new("explorer")
+    // Pelo caminho e não pelo nome: um processo procura primeiro na pasta de onde foi
+    // lançado, e um `explorer.exe` plantado lá corria em vez do verdadeiro.
+    std::process::Command::new(crate::estado::do_windows("explorer.exe"))
         .arg(raiz.as_os_str())
         .spawn()
         .map_err(erro)?;
@@ -1564,40 +1566,87 @@ pub fn trazer_a_janela(app: &AppHandle) {
 /// activação corre numa thread WinRT — o `AppHandle` é Send + Sync, e show/unminimize/
 /// set_focus despacham para a principal.
 #[tauri::command]
-pub fn avisar_do_sistema(titulo: String, corpo: String, destino: Destino, app: AppHandle) -> R<()> {
+pub fn avisar_do_sistema(
+    titulo: String,
+    corpo: String,
+    destino: Destino,
+    app: AppHandle,
+) -> R<&'static str> {
     let ao_clicar = {
         let app = app.clone();
-        move || {
+        std::sync::Arc::new(move || {
             trazer_a_janela(&app);
             let _ = app.emit("aviso-clicado", &destino);
-        }
+        })
     };
-    if crate::bandeiras::aviso_clica_sozinho() {
+    let sem_aumid = crate::bandeiras::aviso_sem_aumid();
+    if crate::bandeiras::aviso_clica_sozinho() && !sem_aumid {
         ao_clicar();
-        return Ok(());
+        return Ok("sozinho");
     }
-    let app_id = if cfg!(debug_assertions) {
-        tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+    // O AUMID decide o NOME que aparece no cabeçalho do toast — e é o único sítio onde a
+    // instalação a sério se distingue: em debug o exe não tem atalho nenhum, portanto usa-se
+    // o do PowerShell, que existe em qualquer Windows. O CLIQUE não depende disto: o
+    // `on_activated` é entregue em processo, seja qual for o identificador.
+    let ao_mostrar = |app_id: &str, ao_clicar: Box<dyn Fn() + Send + 'static>| {
+        tauri_winrt_notification::Toast::new(app_id)
+            .title(&titulo)
+            .text1(&corpo)
+            .on_activated(move |_| {
+                ao_clicar();
+                Ok(())
+            })
+            .show()
+            .map_err(|e| e.to_string())
+    };
+    let recurso = tauri_winrt_notification::Toast::POWERSHELL_APP_ID;
+    let meu = if sem_aumid {
+        // A bandeira não fabrica um erro: põe aqui um nome que o Windows não conhece, que é
+        // exactamente a situação de uma instalação cujo atalho não registou o AUMID. Quem
+        // decide se isto falha é o Windows, não este código.
+        "dev.bruma.app.nao-registado".to_string()
+    } else if cfg!(debug_assertions) {
+        recurso.to_string()
     } else {
         app.config().identifier.clone()
     };
-    tauri_winrt_notification::Toast::new(&app_id)
-        .title(&titulo)
-        .text1(&corpo)
-        .on_activated(move |_| {
-            ao_clicar();
-            Ok(())
-        })
-        .show()
-        .map_err(erro)?;
-    Ok(())
+    let ao_clicar2 = ao_clicar.clone();
+    let directo = ao_mostrar(&meu, Box::new(move || ao_clicar()));
+    match directo {
+        Ok(()) => Ok("directo"),
+        Err(e) if meu != recurso => {
+            // SE O NOME FALHAR, O AVISO SAI À MESMA — E COM O CLIQUE.
+            //
+            // O identificador desta app é conhecido pelo Windows porque o atalho que o
+            // instalador cria o regista (ver `por_o_aumid`, com teste). Se ainda assim o
+            // toast falhar, ficar em silêncio seria pior do que um aviso com o nome errado:
+            // a pessoa deixava de saber que lhe escreveram. Repete-se com o identificador do
+            // PowerShell, que existe em qualquer Windows, e o clique continua a funcionar
+            // porque a activação é entregue dentro deste processo.
+            //
+            // MEDIDO, e ao contrário do que este recurso pressupunha: com um AUMID que a
+            // máquina nunca viu, o `show()` devolve SUCESSO (`ui aviso via: directo` com
+            // `BRUMA_AVISO_SEM_AUMID`). Ou seja, este ramo quase nunca corre e a app não tem
+            // como saber se o toast foi desenhado — o que faz o aviso dizer «Bruma» é o
+            // AUMID no atalho, e é lá que a correcção está. Isto fica como rede.
+            eprintln!("[aviso] o toast com o nome desta app falhou ({e}); vai com o do sistema");
+            ao_mostrar(recurso, Box::new(move || ao_clicar2()))?;
+            Ok("recurso")
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// O X esconde em vez de matar (#100) — quando o JS o pedir. Enquanto não disser nada (arranque
 /// a meio, webview morta) o X fecha como sempre: o default seguro é o comportamento antigo.
 #[tauri::command]
-pub fn fechar_na_bandeja(ligado: bool) {
-    crate::FECHAR_ESCONDE.store(ligado, std::sync::atomic::Ordering::Relaxed);
+pub fn fechar_na_bandeja(ligado: bool) -> bool {
+    // Sem ícone na bandeja não se esconde nada: era a janela a desaparecer sem forma de
+    // voltar. Devolve o que ficou mesmo ligado, para a interface não prometer o que não há.
+    let ha = crate::HA_BANDEJA.load(std::sync::atomic::Ordering::Relaxed);
+    let vai = ligado && ha;
+    crate::FECHAR_ESCONDE.store(vai, std::sync::atomic::Ordering::Relaxed);
+    vai
 }
 
 #[tauri::command]
@@ -1650,10 +1699,7 @@ pub fn ligacao_aceitavel(url: &str) -> Result<&str, String> {
 #[tauri::command]
 pub fn abrir_ligacao(url: String) -> R<()> {
     let url = ligacao_aceitavel(&url)?;
-    let sistema = std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows"));
-    std::process::Command::new(sistema.join("System32").join("rundll32.exe"))
+    std::process::Command::new(crate::estado::do_system32("rundll32.exe"))
         .args(["url.dll,FileProtocolHandler", url])
         .spawn()
         .map_err(erro)?;

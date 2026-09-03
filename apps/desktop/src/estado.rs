@@ -54,6 +54,19 @@ pub fn raiz() -> PathBuf {
     RAIZ.get_or_init(resolver_raiz).clone()
 }
 
+/// Um executável do Windows, pelo CAMINHO e não pelo nome.
+///
+/// `Command::new("taskkill")` procura primeiro na pasta de onde o processo foi lançado: um
+/// ficheiro plantado ao lado corre em vez do verdadeiro. Num processo elevado isso é uma
+/// entrega de privilégios; num normal é uma execução de código alheio na mesma.
+pub fn do_windows(nome: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join(nome)
+}
+
+pub fn do_system32(nome: &str) -> PathBuf {
+    do_windows("System32").join(nome)
+}
+
 /// A pasta de dados em produção, resolvida em ABSOLUTO e estável ao cwd.
 fn resolver_raiz() -> PathBuf {
     // `dados` ao lado do EXECUTÁVEL, não do directório de trabalho. É o que torna a pasta
@@ -316,6 +329,7 @@ impl App {
             amigos: Mutex::new(Vec::new()),
             bloqueados: Mutex::new(Vec::new()),
             quem_escreve: Mutex::new(QuemEscreve::default()),
+            _aberto: None,
             lido: Mutex::new(BTreeMap::new()),
             entregue: Mutex::new(BTreeMap::new()),
             escrita_do_indice: Mutex::new(()),
@@ -777,6 +791,10 @@ pub struct App {
     pub lido: Mutex<BTreeMap<String, i64>>,
     /// Ver [`Indice::entregue`].
     pub entregue: Mutex<BTreeMap<String, i64>>,
+    /// O ficheiro que diz «esta pasta já está aberta» (#100). Não se lê nem se escreve: o que
+    /// vale é o HANDLE, aberto sem partilha — enquanto ele viver, mais ninguém abre a mesma
+    /// pasta. Morre com o processo, mesmo que a app seja morta a matar.
+    _aberto: Option<std::fs::File>,
     /// Serializa `gravar_indice` — duas escritas ao mesmo tempo destruíam o índice. Não guarda
     /// nada; é só um portão. É privado de propósito: se alguém o tomasse antes de chamar
     /// `gravar_indice`, prendia.
@@ -798,6 +816,7 @@ impl App {
     pub fn arrancar() -> Result<Self> {
         let raiz = raiz();
         std::fs::create_dir_all(raiz.join("servidores"))?;
+        let aberto = tomar_a_pasta(&raiz)?;
         let semente = semente_ou_cria(&raiz.join("identidade.key"))?;
         let ident = crypto::Identity::from_seed(&semente);
 
@@ -888,6 +907,7 @@ impl App {
             amigos: Mutex::new(indice.amigos),
             bloqueados: Mutex::new(indice.bloqueados),
             quem_escreve: Mutex::new(indice.quem_escreve),
+            _aberto: aberto,
             lido: Mutex::new(indice.lido),
             entregue: Mutex::new(indice.entregue),
             escrita_do_indice: Mutex::new(()),
@@ -1489,6 +1509,51 @@ pub fn inventario_da_pasta(raiz: &std::path::Path) -> InventarioDaPasta {
         .unwrap_or(0);
     inv.quarentena.sort();
     inv
+}
+
+/// UMA PASTA DE DADOS, UM BRUMA (#100).
+///
+/// Desde que o X passou a esconder a janela em vez de fechar a app, clicar outra vez no
+/// atalho — o gesto natural de quem julga que ela não está aberta — abria um SEGUNDO
+/// processo sobre a mesma pasta. Dois processos com o mesmo índice em memória: o que gravasse
+/// por último apagava o que o outro tivesse aprendido, incluindo chaves de salas — e sem a
+/// chave o log que fica no disco não se volta a ler.
+///
+/// A guarda é por PASTA e não por app: duas identidades em pastas diferentes (o `--par`, uma
+/// pen) continuam a poder correr ao mesmo tempo, que é uma coisa que o projecto quer.
+fn tomar_a_pasta(raiz: &std::path::Path) -> Result<Option<std::fs::File>> {
+    let caminho = raiz.join("aberto.lock");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0) // ninguém mais abre este ficheiro enquanto o handle viver
+            .open(&caminho)
+        {
+            Ok(f) => Ok(Some(f)),
+            // 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION. Pelo CÓDIGO e não
+            // pelo `ErrorKind`: o Rust não mapeia o 32 para `PermissionDenied`, e um
+            // `PermissionDenied` a sério (pasta só de leitura) não é «já está aberto».
+            Err(e) if matches!(e.raw_os_error(), Some(32) | Some(33)) => {
+                bail!("o Bruma já está aberto nesta pasta — vê o ícone na bandeja, ao lado do relógio")
+            }
+            // Um erro de outro género (pasta só de leitura, disco cheio) não pode impedir a
+            // app de abrir: a guarda é uma defesa, não um requisito.
+            Err(e) => {
+                eprintln!("[dados] não consegui tomar a pasta ({e}); sigo sem a guarda");
+                Ok(None)
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = caminho;
+        Ok(None)
+    }
 }
 
 fn pos_de_lado(p: &std::path::Path) {
@@ -2486,6 +2551,8 @@ mod testes {
         };
         assert_eq!(de_lado(&s), 1, "exactamente uma cópia posta de lado");
 
+        // A pasta é de UM Bruma de cada vez (#100): a primeira App tem de sair antes.
+        drop(app);
         let app2 = App::arrancar().expect("arrancar de novo");
         let ids: Vec<String> = app2.servidores.lock().unwrap().keys().cloned().collect();
         assert_eq!(ids, vec![t.clone()], "só o outro volta");
@@ -2515,6 +2582,28 @@ mod testes {
         std::fs::write(caminho_do_log(&c), b"{}\n").unwrap();
         app2.apagar_conversa(&c).expect("apagar outra vez");
         assert_eq!(de_lado(&c), 2, "duas cópias, nenhuma sobrescrita");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uma pasta de dados, um Bruma (#100): a segunda instância é recusada, com uma razão que
+    /// se percebe — e quando a primeira sai, a pasta volta a estar livre.
+    #[test]
+    fn uma_pasta_de_dados_um_bruma() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-aberta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+
+        let primeira = App::arrancar().expect("a primeira abre");
+        let segunda = App::arrancar();
+        let erro = segunda.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            erro.contains("já está aberto"),
+            "a segunda instância tinha de ser recusada, e disse: {erro:?}"
+        );
+
+        drop(primeira);
+        App::arrancar().expect("com a primeira fora, a pasta está livre");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2741,6 +2830,94 @@ mod testes {
             "quem escreve depois entra"
         );
         assert_eq!(dec() - d3, 0, "sem passagem nova");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UMA MENSAGEM COM UMA DATA ABSURDA NÃO MARCA O CANAL COMO LIDO PARA SEMPRE (#198).
+    ///
+    /// É a promessa que está no README, e o #198 tinha-a reaberto por outra porta: o carimbo
+    /// cru continuava filtrado, mas o instante — o eixo novo da comparação — vinha
+    /// envenenado do relógio lógico, e depois de uma data absurda a marca saturava e nada
+    /// mais contava como por ler.
+    #[test]
+    fn uma_data_absurda_nao_deixa_o_canal_lido_para_sempre() {
+        let dir = std::env::temp_dir().join(format!("bruma-veneno-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eu = crypto::Identity::from_seed(&[1u8; 32]);
+        let outro = crypto::Identity::from_seed(&[2u8; 32]);
+        let minha = HEXLOWER.encode(eu.signing.verifying_key().as_bytes());
+        fn escreve_em(srv: &mut Servidor, quem: &crypto::Identity, ts: u64, texto: &str) {
+            let carga = Carga::Mensagem {
+                canal: "geral".into(),
+                texto: texto.into(),
+            };
+            let claro = serde_json::to_vec(&carga).unwrap();
+            let (nonce, ct) = crypto::seal(&srv.chave, &claro).unwrap();
+            srv.log.append_local(&quem.signing, nonce, ct, ts).unwrap();
+        }
+        let contaveis: std::collections::BTreeSet<String> =
+            ["geral".to_string()].into_iter().collect();
+
+        // Sem `:` nos nomes: são o nome do ficheiro, e o Windows recusa-os.
+        for (nome, veneno) in [
+            ("u64max", u64::MAX),
+            ("i64max-mais-um", (i64::MAX as u64) + 1),
+        ] {
+            let log = blog::Log::load(dir.join(format!("{nome}.json"))).unwrap();
+            let mut srv = Servidor::novo("bb".repeat(16), [7u8; 32], log, vec![], None, None);
+            let t = agora_ms();
+            escreve_em(&mut srv, &outro, t, "normal");
+            escreve_em(&mut srv, &outro, veneno, "a data absurda");
+            escreve_em(&mut srv, &outro, t + 1_000, "depois do veneno");
+
+            // Eu leio o que está aqui, e a marca não pode saturar.
+            let marca = srv.ultima_mensagem("geral", &minha);
+            assert!(
+                marca < i64::MAX && marca <= blog::Log::TECTO_DO_RELOGIO as i64,
+                "{nome}: a marca saturou em {marca}"
+            );
+            let mut lido = BTreeMap::new();
+            lido.insert(App::chave_de_leitura(&srv.id, "geral"), marca);
+            assert!(
+                !srv.nao_lidos(&minha, &lido, &contaveis)
+                    .contains_key("geral"),
+                "{nome}: acabei de ler, não pode haver nada por ler"
+            );
+
+            // E o que chega DEPOIS de eu ler tem de acender a bolha na mesma.
+            escreve_em(&mut srv, &outro, t + 2_000, "escrita depois de eu ler");
+            let c = srv.nao_lidos(&minha, &lido, &contaveis);
+            assert_eq!(
+                c.get("geral").map(|(n, _)| *n),
+                Some(1),
+                "{nome}: a sala ficou lida para sempre"
+            );
+            // E a prova de ENTREGA (#94) sai do mesmo relógio: sem tecto, o `entregue` daquele
+            // par saltava para i64::MAX e todas as minhas mensagens nasciam «ele tem-na».
+            let hashes: Vec<String> = srv
+                .log
+                .ordered()
+                .iter()
+                .map(|e| e.hash_hex().unwrap())
+                .collect();
+            let maior = srv.log.maior_instante(&hashes).unwrap_or(0);
+            assert!(
+                maior < i64::MAX as u64 && maior <= blog::Log::TECTO_DO_RELOGIO,
+                "{nome}: a prova de entrega saturou em {maior}"
+            );
+
+            // A mensagem venenosa aparece no canal, mas nunca acende a bolha.
+            let textos: Vec<String> = srv
+                .mensagens("geral")
+                .into_iter()
+                .map(|m| m.texto)
+                .collect();
+            assert!(
+                textos.iter().any(|x| x == "a data absurda"),
+                "{nome}: a mensagem tem de continuar a ver-se"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

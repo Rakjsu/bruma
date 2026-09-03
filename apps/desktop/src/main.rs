@@ -234,6 +234,8 @@ pub static ARRANQUE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLo
 /// O X esconde na bandeja em vez de fechar (#100). Falso até o JS dizer o que a pessoa quer.
 pub static FECHAR_ESCONDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Há mesmo um ícone na bandeja? Sem ele, esconder a janela era escondê-la para sempre.
+pub static HA_BANDEJA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ARRANQUE_INICIO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARRANQUE_ATE_SETUP_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -354,10 +356,15 @@ fn main() {
             }
 
             // A rede precisa de um runtime async; o Tauri já traz um.
-            let rede = tauri::async_runtime::block_on(rede::Rede::arrancar(
+            // A MESMA DIGNIDADE DO NÚCLEO (#14): sem consola no binário de release, um `?`
+            // aqui era a janela a abrir, piscar e desaparecer sem uma palavra.
+            let rede = match tauri::async_runtime::block_on(rede::Rede::arrancar(
                 nucleo.clone(),
                 janela.clone(),
-            ))?;
+            )) {
+                Ok(r) => r,
+                Err(e) => avisar_e_sair(&format!("não consegui abrir a rede: {e}")),
+            };
             let rede_ms = (relogio.elapsed().as_millis() as u64).saturating_sub(nucleo_ms);
             ARRANQUE_REDE_MS.store(rede_ms, std::sync::atomic::Ordering::Relaxed);
             // O arranque medido antes de o mexer (#99): até aqui a janela existe mas não
@@ -385,7 +392,9 @@ fn main() {
 
             // A BANDEJA (#100): «Abrir» e «Sair mesmo» no menu; um clique no ícone traz a
             // janela. O ícone é o da janela (icons/icon.ico).
-            {
+            // E a bandeja NÃO pode matar o arranque: sem ícone a app abre à mesma, e é o
+            // `HA_BANDEJA` que impede o X de esconder uma janela que ninguém traria de volta.
+            let bandeja_montada = (|| -> tauri::Result<()> {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
                 let abrir = MenuItem::with_id(app, "abrir", "Abrir", true, None::<&str>)?;
@@ -414,6 +423,11 @@ fn main() {
                     bandeja = bandeja.icon(icone);
                 }
                 bandeja.build(app)?;
+                Ok(())
+            })();
+            match bandeja_montada {
+                Ok(()) => HA_BANDEJA.store(true, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => eprintln!("[bandeja] sem ícone na barra ({e}); o X passa a fechar"),
             }
 
             app.manage(nucleo);

@@ -329,8 +329,9 @@ function desenharConversas() {
     const txt = elemento('span');
     txt.append(rotuloDePessoa(c.com, c.nome));
     const avisoC = avisoDeVersao(c.com);
-    txt.append(elemento('i', avisoC && conhecido ? 'versao-diferente' : null,
-      !conhecido ? 'nunca falaste com esta pessoa — chave por verificar' : (avisoC || chaveCurta(c.com))));
+    txt.append(elemento('i', null,
+      !conhecido ? 'nunca falaste com esta pessoa — chave por verificar' : chaveCurta(c.com)));
+    if (avisoC && conhecido) txt.append(elemento('i', 'versao-diferente', ` · ${avisoC}`));
     l.append(av, txt);
     if (c.nao_lidos) {
       l.classList.add('tem-novas');
@@ -482,14 +483,12 @@ function desenharMembros() {
     }
     bloco.append(rotulo);
     const aviso = avisoDeVersao(m.chave);
-    bloco.append(elemento(
-      'i',
-      aviso && !repetido ? 'versao-diferente' : null,
-      // O «fundou este servidor» saiu (#144): era forjável por qualquer membro da sala, e
-      // não há substituto honesto. A chave curta é verdade e chega — e com o nome repetido
-      // é a chave que manda, mesmo por cima do aviso de versão.
-      repetido ? chaveCurta(m.chave) : (aviso || chaveCurta(m.chave)),
-    ));
+    // O «fundou este servidor» saiu (#144): era forjável por qualquer membro da sala, e não
+    // há substituto honesto. A chave curta é verdade e chega — e NUNCA desaparece: o aviso de
+    // versão é texto que o outro lado escolheu, e punha-se no lugar dela, que é a única coisa
+    // que distingue duas pessoas com o mesmo nome. Vai ao lado, e aparado.
+    bloco.append(elemento('i', null, chaveCurta(m.chave)));
+    if (aviso && !repetido) bloco.append(elemento('i', 'versao-diferente', ` · ${aviso}`));
     linha.append(av, bloco);
     lista.append(linha);
   }
@@ -511,17 +510,22 @@ async function desenharMensagens() {
     $('#composer').hidden = true;
     const msgs = await invoke('mensagens', { servidor: s.id, canal: arquivado.id }).catch(() => []);
     if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
-    limparStream(stream);
-    if (msgs.length) await escreverMensagens(stream, msgs, s.id, arquivado.id, minhaVez);
-    const faixa = elemento('div', 'faixa-arquivado');
-    faixa.append(elemento('span', null,
-      `Este canal foi arquivado por ${arquivado.apagado_por ? nomeDoPeer(arquivado.apagado_por) : 'alguém'}. `
-      + 'Continua a ler-se; ninguém escreve aqui.'));
-    const reabrir = elemento('button', 'btn', 'Reabrir para todos');
-    reabrir.onclick = () => invoke('reabrir_canal', { servidor: s.id, canal: arquivado.id }).catch(alertar);
-    faixa.append(reabrir);
+    // Pelo caminho normal (#98): ler um canal arquivado é ler, e uma mensagem que chegue a
+    // outro canal da sala não pode roubar a posição de quem está a ler aqui.
+    if (msgs.length) await escreverMensagens(stream, msgs, s.id, arquivado.id, minhaVez, '#arquivado');
+    else limparStream(stream);
+    // Uma faixa só, sempre no fim: re-anexar um nó que já existe move-o, não o duplica.
+    let faixa = stream.querySelector('.faixa-arquivado');
+    if (!faixa) {
+      faixa = elemento('div', 'faixa-arquivado');
+      faixa.append(elemento('span', null,
+        `Este canal foi arquivado por ${arquivado.apagado_por ? nomeDoPeer(arquivado.apagado_por) : 'alguém'}. `
+        + 'Continua a ler-se; ninguém escreve aqui.'));
+      const reabrir = elemento('button', 'btn', 'Reabrir para todos');
+      reabrir.onclick = () => invoke('reabrir_canal', { servidor: s.id, canal: arquivado.id }).catch(alertar);
+      faixa.append(reabrir);
+    }
     stream.append(faixa);
-    stream.scrollTop = stream.scrollHeight;
     return;
   }
 
@@ -693,12 +697,16 @@ function actualizarBotaoDoFim() {
   btn.textContent = n > 0 ? `↓ ${n > 99 ? '99+' : n} novas abaixo` : '↓ ir para o fim';
 }
 
-async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez = geracaoDaVista) {
+async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez = geracaoDaVista, sufixo = '') {
   // `aberto` é o que `abrir_canal` devolveu — ou uma lista crua, nas medições.
   const msgs = Array.isArray(aberto) ? aberto : aberto.mensagens;
   const lidoAntes = Array.isArray(aberto) ? 0 : aberto.lido_antes;
   const ultima = Array.isArray(aberto) ? 0 : aberto.ultima;
-  const onde = `${servidorId}/${canalId}`;
+  // O `sufixo` distingue a vista SÓ-LEITURA de um canal arquivado do mesmo canal aberto: são
+  // dois sítios, e o stream de um não é a continuação do outro. Sem isto, reabrir um canal
+  // entrava no caminho incremental (os ids batem todos) e a faixa «arquivado» ficava lá,
+  // por cima da caixa de escrita já activa.
+  const onde = `${servidorId}/${canalId}${sufixo}`;
   // «Acabei de abrir este canal» lê-se ANTES de a marca ser reposta: é o que decide se a
   // linha das novas vai ao centro e se o scroll vai ao fim.
   const abriuAgora = marcaDaVista.onde !== onde;
@@ -797,6 +805,7 @@ async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez =
   };
   // Quem tem o nome repetido nesta sala, em TODAS as mensagens desenhadas (#31) — também
   // nas que já cá estavam, porque o repetido pode ter chegado agora.
+  actualizarNomes(stream, msgs);
   aplicarRepetidos(stream, modo === 'privado' ? new Map() : nomesRepetidos(servidor()));
 
   // O SCROLL. Incremental: só segue se se estava no fim. Completo: a linha das novas ao
@@ -1117,6 +1126,7 @@ function pintarChipDosLigados(texto, title, aceso) {
 }
 
 function desenharTopo() {
+  desenhosDoTopo += 1;
   if (modo === 'privado') {
     const c = conversa();
     $('#nome-servidor').textContent = 'Mensagens privadas';
@@ -1204,6 +1214,10 @@ async function desenharTudo() {
   if (JSON.stringify(amigos) !== amigosAntes) {
     desenharCanais();
     desenharMembros();
+    // E o TOPO: o chip «chave verificada» e o nome da conversa saem os dois da lista de
+    // amigos. Sem isto, marcar uma chave como verificada deixava o chip a dizer «por
+    // verificar» até um evento qualquer redesenhar o topo por outra razão.
+    desenharTopo();
   }
   await desenharMensagens();
   desenharRodape();
@@ -1305,8 +1319,14 @@ function sairDoServidor(s) {
    compara de cabeça em minutos. Uma caixa só, com três entradas: a ficha do amigo, o menu de
    quem tem chave, e o chip no topo de uma conversa. */
 let verificacaoAberta = null;
+let geracaoDaVerificacao = 0;
 
 async function abrirVerificacao(chave) {
+  // UMA CAIXA, UMAS PALAVRAS (a guarda do #162 aplicada ao #89): a zona limpa-se antes do IPC
+  // e enche-se depois. Dois cliques — ou duas pessoas — punham lá 12 palavras, e o botão
+  // marcava alguém com palavras que não eram só dele. Este ecrã vale exactamente «são estas
+  // seis e mais nenhumas», portanto o pedido que chega tarde não escreve nada.
+  const minhaVez = (geracaoDaVerificacao += 1);
   const nome = nomeComOrigem(chave, '');
   $('#verificar-nome').textContent = '';
   $('#verificar-nome').append(rotuloDePessoa(chave, ''));
@@ -1315,11 +1335,15 @@ async function abrirVerificacao(chave) {
   zona.textContent = '';
   $('#erro-verificar').textContent = '';
   let palavras = '';
+  let falhou = null;
   try {
     palavras = await invoke('numero_de_seguranca', { peer: chave });
   } catch (e) {
-    $('#erro-verificar').textContent = String(e);
+    falhou = String(e);
   }
+  if (minhaVez !== geracaoDaVerificacao) return palavras;
+  if (falhou) $('#erro-verificar').textContent = falhou;
+  zona.textContent = '';
   for (const p of palavras.split(' ').filter(Boolean)) zona.append(elemento('b', null, p));
   // `marcar_verificado` exige estar na lista: quem não está, entra ao marcar.
   const amigo = (amigos || []).find(a => a.chave === chave);
@@ -1329,6 +1353,8 @@ async function abrirVerificacao(chave) {
   $('#ok-verificar').textContent = amigo
     ? 'Li-lhe as palavras e batem certo'
     : 'Adicionar aos amigos e marcar a chave como verificada';
+  // Sem palavras não há o que comparar: o botão de confirmar não pode ficar armado.
+  $('#ok-verificar').disabled = !palavras;
   verificacaoAberta = chave;
   abrir('veu-verificar');
   return palavras;
@@ -2287,9 +2313,14 @@ const PAINEIS = {
         + 'desliga isto e o X sai mesmo. Para sair de vez com isto ligado: clique direito no '
         + 'ícone da bandeja, «Sair mesmo».',
         fecharNaBandeja(),
-        v => {
+        async v => {
           localStorage.setItem(FECHAR, v ? 'bandeja' : 'sair');
-          invoke('fechar_na_bandeja', { ligado: v }).catch(() => {});
+          const vai = await invoke('fechar_na_bandeja', { ligado: v }).catch(() => false);
+          if (v && vai === false) {
+            // Não há ícone na bandeja nesta máquina: esconder seria esconder para sempre.
+            localStorage.setItem(FECHAR, 'sair');
+            await mostrarPainel('sistema');
+          }
         },
       ));
       painel.append(sF);
@@ -2607,6 +2638,13 @@ document.addEventListener('keydown', ev => {
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing || ev.key.length !== 1) return;
   const a = document.activeElement;
   if (a && a.closest && a.closest('input, textarea, [contenteditable="true"]')) return;
+  // O ESPACO E DE QUEM ESTA FOCADO.
+  //
+  // Um `<button>` so se activa no `keyup`; roubar-lhe o foco no `keydown` fazia o Espaco
+  // meter um espaco na caixa e o botao nunca disparar — todos os botoes do ecra, incluindo o
+  // de fechar a janela e o «Sair mesmo» da bandeja, deixavam de funcionar pelo teclado. Uma
+  // letra continua a ir para a caixa; o Espaco, nao.
+  if (ev.key === ' ' && a && a !== document.body) return;
   if (!podeFocarACaixa()) return;
   const alvo = !$('#composer').hidden ? $('#entrada') : (!$('#sala-chat').hidden ? $('#sala-entrada') : null);
   if (alvo) alvo.focus();
@@ -4167,6 +4205,7 @@ async function talvezAvisar() {
 const mudancas = { ids: new Set(), timer: null };
 let mudancasRecebidas = 0;    // eventos `servidor-mudou` (e `peer-versao`) recebidos
 let desenhosCompletos = 0;    // `desenharTudo` corridos, por qualquer razão
+let desenhosDoTopo = 0;       // quantas vezes o topo foi pintado (a ordem do #81/#89)
 let refrescosPorMudanca = 0;  // rajadas resolvidas só com `refrescarBolhas`
 
 function anotarMudanca(id) {
@@ -4240,7 +4279,9 @@ listen('peer-versao', ev => {
 function avisoDeVersao(chave) {
   const dele = versaoDoPar.get(chave);
   if (!dele || !minhaVersao || dele === minhaVersao) return null;
-  return `tem a ${dele}, tu tens a ${minhaVersao}`;
+  // A versão dele é texto que o outro lado mandou: apara-se. Trezentos caracteres rebentavam
+  // a coluna, e um «✓ chave verificada» lá dentro lia-se como um selo desta app.
+  return `tem a ${umaLinha(String(dele), 14)}, tu tens a ${minhaVersao}`;
 }
 
 /** Quem estava ligado e deixou de estar, sem o ter dito (#51).
@@ -4306,6 +4347,11 @@ function aplicarLigados(lista) {
   for (const chave of vivos) paresLigados.add(chave);
   ligados = vivos.size;
   if (ligados > ligadosMax) ligadosMax = ligados;
+  // O ouvinte existe desde que o script carrega; a `vista` só existe depois de três idas ao
+  // Rust. Um par que se ligue nessa janela fazia isto rebentar no `servidor()` — e o resto
+  // da função (as câmaras de quem caiu, os espectadores) não corria. O Set fica preenchido:
+  // o primeiro `desenharTudo` desenha o que ele diz.
+  if (!vista) return;
 
   let mexeu = false;
   for (const chave of [...voz.presentes.keys()]) {
@@ -5985,6 +6031,22 @@ function nomesRepetidos(s) {
   return new Map([...contagem].filter(([, n]) => n >= 2));
 }
 
+/** Actualiza IN-PLACE o nome no cabeçalho das mensagens já desenhadas. Quem se reapresenta
+ *  com outro nome — ou um impostor que RENOMEIA para o nome de outra pessoa — só mudava as
+ *  mensagens novas: o caminho incremental (#98) nunca revisita as que já lá estão, e a marca
+ *  de nome repetido comparava o texto velho com os nomes novos. */
+function actualizarNomes(stream, msgs) {
+  const nomes = new Map(msgs.map(m => [m.id, m]));
+  for (const art of stream.querySelectorAll('.msg[data-id][data-autor]')) {
+    const b = art.querySelector('.msg__head b');
+    const m = nomes.get(art.dataset.id);
+    if (!b || !m) continue;
+    const novo = rotuloDePessoa(m.autor, m.autor_nome);
+    if (b.textContent === novo.textContent && b.className === novo.className) continue;
+    b.replaceWith(novo);
+  }
+}
+
 /** Marca (ou desmarca) IN-PLACE as mensagens de quem tem o nome repetido: um segundo
  *  «Bruno» que chega depois tem de marcar as mensagens já desenhadas do primeiro, e o
  *  stream é incremental (#98) — não se reconstrói para isto. */
@@ -6713,11 +6775,13 @@ function avisoNaConversa(id, texto) {
 
 /** Os avisos por sala/conversa, à espera de caber no ecrã. */
 const avisosPendentes = new Map();
-/** E os já pintados, por sala/conversa (#157): com o redesenho coalescido o aviso pinta-se
- *  ANTES do redesenho, e uma reconstrução completa do stream (mudar de canal e voltar, uma
- *  inserção a meio) levava-o — com a fila já vazia, ninguém o repunha. Agora repõe-se do que
- *  se mostrou, não só do que está por mostrar. */
+/** E os já pintados, POR CANAL (#157): com o redesenho coalescido o aviso pinta-se ANTES do
+ *  redesenho, e uma reconstrução completa do stream (uma inserção a meio) levava-o — com a
+ *  fila já vazia, ninguém o repunha. Repõe-se do que se mostrou; mas por canal e não por
+ *  sala, senão um aviso dado uma vez reaparecia no fundo de todos os canais da sala, para o
+ *  resto da sessão. A fila (`avisosPendentes`) continua por sala: é o que o Rust manda. */
 const avisosMostrados = new Map();
+const ondeSeMostrou = () => `${modo === 'privado' ? conversaAtual : servidorAtual}/${canalAtual || ''}`;
 
 function pintarAvisos() {
   const zona = $('#stream');
@@ -6725,8 +6789,9 @@ function pintarAvisos() {
   // Só se mostram os da sala/conversa ABERTA — um aviso sobre outra sala no meio desta
   // conversa seria ruído no sítio errado. Os outros ficam na fila até lá se ir.
   const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
+  const aqui = ondeSeMostrou();
   const fila = avisosPendentes.get(aberto) || [];
-  const mostrados = avisosMostrados.get(aberto) || [];
+  const mostrados = avisosMostrados.get(aqui) || [];
   const todos = [...mostrados, ...fila.filter(t => !mostrados.includes(t))];
   if (!todos.length) return;
   const noFim = noFimDo(zona);
@@ -6737,7 +6802,7 @@ function pintarAvisos() {
     zona.append(elemento('div', 'aviso-sistema', texto));
   }
   avisosPendentes.set(aberto, []);
-  avisosMostrados.set(aberto, todos);
+  avisosMostrados.set(aqui, todos);
   // Um aviso do sistema não puxa a página das mãos de quem está a ler mais acima (#23).
   if (noFim) zona.scrollTop = zona.scrollHeight;
 }
@@ -7540,7 +7605,11 @@ window.addEventListener('unhandledrejection', ev => {
   // Quem já está ligado, pela verdade do Rust (#97): a rede arrancou antes desta linha.
   semearLigados();
   // O que o X faz (#100): só a partir daqui é que o Rust esconde em vez de fechar.
-  invoke('fechar_na_bandeja', { ligado: fecharNaBandeja() }).catch(() => {});
+  // O Rust devolve o que ficou MESMO ligado: sem ícone na bandeja não se esconde nada, e a
+  // preferência corrige-se aqui em vez de a app prometer o que não há.
+  invoke('fechar_na_bandeja', { ligado: fecharNaBandeja() })
+    .then(vai => { if (fecharNaBandeja() && vai === false) localStorage.setItem(FECHAR, 'sair'); })
+    .catch(() => {});
   // A fotografia do que JÁ estava por ler, agora e não na primeira mensagem que chegar.
   // Estava a ser tirada dentro do `talvezAvisar`, que só corre no `servidor-mudou` — logo a
   // primeira mensagem de cada sessão servia de base e nunca avisava. Numa app de mensagens,
@@ -8954,6 +9023,39 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
           srv.membros = srv.membros.filter(m => m.chave !== 'bb'.repeat(32));
           await desenharTres();
           const soUm = document.querySelectorAll('#lista-membros .member.nome-repetido').length;
+          // Um membro que MUDA de nome (nao um membro novo): as mensagens ja desenhadas tem
+          // de passar a mostrar o nome novo, e a marca de repetido tem de bater certo.
+          await desenharTres();
+          const nomeAntes = (com.msg || {}).textContent;
+          srv.membros.find(m => m.chave === falso).nome = 'Bruno';
+          srv.membros.push({ chave: 'bb'.repeat(32), nome: 'Bruno' });
+          amigos = [];
+          await escreverMensagens($('#stream'), [{
+            id: 'nome-1', autor: falso, autor_nome: 'Bruno', canal: texto.id,
+            ts_ms: Date.now(), instante: Date.now(), texto: 'ola',
+          }], srv.id, texto.id);
+          const noStream = $('#stream .msg[data-autor] .msg__head b');
+          linhasDosNomes.push(`ui nomes mudou: antes="${nomeAntes}" depois="${noStream ? noStream.textContent : null}"`
+            + ` marcado=${!!$('#stream .msg.nome-repetido')}`);
+          srv.membros = srv.membros.filter(m => m.chave !== 'bb'.repeat(32));
+          amigos = await invoke('amigos');
+          // A chave curta NUNCA desaparece, nem com uma versao esquisita do outro lado.
+          {
+            const guardada = versaoDoPar.get(falso);
+            const minhaAntes = minhaVersao;
+            minhaVersao = minhaVersao || '0.23.0';
+            versaoDoPar.set(falso, '! chave verificada '.repeat(20));
+            desenharMembros();
+            const linha = $(`#lista-membros .member[data-chave="${falso}"]`);
+            const is = linha ? [...linha.querySelectorAll('i')] : [];
+            const curtaFica = is.some(i => i.textContent.includes(chaveCurta(falso)));
+            const maior = Math.max(0, ...is.map(i => i.textContent.length));
+            if (guardada === undefined) versaoDoPar.delete(falso);
+            else versaoDoPar.set(falso, guardada);
+            minhaVersao = minhaAntes;
+            desenharMembros();
+            linhasDosNomes.push(`ui nomes versao esquisita: chave-curta-fica=${curtaFica} maior-i=${maior}`);
+          }
           linhasDosNomes.push(`ui nomes repetidos: marcados=${marcados} sufixo-visivel=${sufixoVisivel}`
             + ` chave-na-lista=${chaveNaLista} in-place=${antesDoSegundo}->${depoisDoSegundo} so-um=${soUm}`);
           srv.membros = srv.membros.filter(m => m.chave !== falso);
@@ -8998,7 +9100,27 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         await new Promise(r => setTimeout(r, 600));
         const novo = (await invoke('amigos')).find(x => x.chave === falso) || {};
         amigos = await invoke('amigos');
-        diz(`ui verificacao: palavras=${noDom.length} iguais-ao-comando=${noDom.join(' ') === palavras}`
+        // O CHIP no topo sai da lista de AMIGOS, que o `desenharTudo` so vai buscar DEPOIS de
+      // pintar a casca: se a lista mudar, o topo tem de ser pintado outra vez. Mede-se a
+      // ordem (que e o que a correccao muda) e nao um estado fabricado, que o proprio
+      // `desenharTudo` substituiria.
+      const t0 = desenhosDoTopo;
+      amigos = [{ chave: 'ff'.repeat(32), nome: 'forcar diferenca' }];
+      await desenharTudo();
+      const comMudanca = desenhosDoTopo - t0;
+      const t1 = desenhosDoTopo;
+      await desenharTudo();
+      const semMudanca = desenhosDoTopo - t1;
+      diz(`ui verificacao no chip: topo-repintado-com-lista-nova=${comMudanca} sem-mudanca=${semMudanca}`);
+      // DOIS CLIQUES na caixa das 6 palavras: uma so lista, e do ultimo pedido.
+      const p1 = abrirVerificacao(falso);
+      const p2 = abrirVerificacao('cc'.repeat(32));
+      await Promise.all([p1, p2]);
+      const naCaixa = [...document.querySelectorAll('#verificar-palavras b')].map(b => b.textContent);
+      const doUltimo = await invoke('numero_de_seguranca', { peer: 'cc'.repeat(32) }).catch(() => '');
+      $('#fechar-verificar').click();
+      diz(`ui verificacao dois cliques: palavras=${naCaixa.length} e-do-ultimo=${naCaixa.join(' ') === doUltimo}`);
+      diz(`ui verificacao: palavras=${noDom.length} iguais-ao-comando=${noDom.join(' ') === palavras}`
           + ` so-letras=${noDom.every(w => /^[a-z]+$/.test(w))} frase-nao-e-semente=${/não é a tua semente/.test(texto)}`
           + ` janela-de-6-nas-24=${janela} outra-chave-difere=${outra !== palavras && outra.split(' ').length === 6}`
           + ` a-minha=${recusaMinha} verificado-pelo-botao=${guardado} veu-fechou=${fechou}`
@@ -9526,6 +9648,27 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         colado = `nao-simulavel (${e && e.message ? e.message : e})`;
       }
       erro.textContent = '';
+      // Um aviso e sobre AGORA e sobre ESTE canal: nao pode reaparecer noutro canal da sala.
+      let avisoNoutroCanal = 'sem segundo canal';
+      {
+        const outro = servidorAtual ? await segundoCanalDeTexto(servidorAtual) : null;
+        if (outro) {
+          const cnlAntes = canalAtual;
+          avisoNaConversa(servidorAtual, 'aviso so deste canal (#157)');
+          await pausa(120);
+          const aqui = [...document.querySelectorAll('.aviso-sistema')].some(n => /so deste canal/.test(n.textContent));
+          escolherCanal(outro.id);
+          await pausa(600);
+          const acola = [...document.querySelectorAll('.aviso-sistema')].some(n => /so deste canal/.test(n.textContent));
+          escolherCanal(cnlAntes);
+          await pausa(600);
+          const devolta = [...document.querySelectorAll('.aviso-sistema')].some(n => /so deste canal/.test(n.textContent));
+          avisoNoutroCanal = `no-canal=${aqui} noutro-canal=${acola} de-volta=${devolta}`;
+          document.querySelectorAll('.aviso-sistema').forEach(n => n.remove());
+          avisosMostrados.clear();
+        }
+      }
+      diz(`ui aviso por canal: ${avisoNoutroCanal}`);
       const frase = anexoRecusado([nomeDoFicheiro('C:' + String.fromCharCode(92) + 'x' + String.fromCharCode(92) + 'jogo.exe')]);
       const largadoDirecto = erro.textContent.includes('jogo.exe') && /não foi enviado/.test(frase);
       erro.textContent = '';
@@ -9731,8 +9874,21 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
         const naoFocaVeu = document.activeElement !== entrada;
         fechar('veu-novo');
+        // O ESPACO nao pode ser roubado a um botao focado (e assim que um botao se activa) --
+        // mas uma LETRA tem de ir para a caixa na mesma. Mede-se AQUI, com os veus ainda
+        // fechados: depois de eles voltarem, o `podeFocarACaixa` diz nao a tudo e as duas
+        // leituras davam «ninguem roubou» sem provarem nada.
+        const bt = $('#btn-privado');
+        bt.focus();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+        const espacoFicou = document.activeElement === bt;
+        bt.focus();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true }));
+        const letraFoiParaACaixa = document.activeElement === entrada;
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
         veusAbertos.forEach(v => { v.hidden = false; });
-        diz(`ui escrever sem clicar: foca=${foca} nao-foca-ctrl=${naoFocaCtrl} nao-foca-veu=${naoFocaVeu}`);
+        diz(`ui escrever sem clicar: foca=${foca} nao-foca-ctrl=${naoFocaCtrl} nao-foca-veu=${naoFocaVeu}`
+          + ` espaco-fica-no-botao=${espacoFicou} letra-vai-para-a-caixa=${letraFoiParaACaixa}`);
 
         // O MENU NO CAMPO: nativo dentro, o da app fora; e o da app nao rouba o foco.
         const clique = el => {
@@ -9856,6 +10012,19 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         await pausa(600);
         const sv = acha();
         const msgsArq = await invoke('mensagens', { servidor: alvo.id, canal: ef.id }).catch(() => []);
+        // A leitura de um canal arquivado nao pode ser roubada por uma mensagem noutro canal
+        // da mesma sala: nem reconstroi, nem salta para o fim (#22 «continua a ler-se»).
+        const outroTexto = sv.canais.find(c => c.tipo === 'texto' && c.id !== ef.id);
+        let leituraFirme = 'sem outro canal';
+        if (outroTexto && msgsArq.length) {
+          $('#stream').scrollTop = 0;
+          const scrollAntes = $('#stream').scrollTop;
+          const recAntes = reconstrucoesDoStream;
+          await invoke('enviar', { servidor: alvo.id, canal: outroTexto.id, texto: 'ruido noutro canal' }).catch(() => {});
+          await pausa(700);
+          leituraFirme = `reconstruiu=${reconstrucoesDoStream - recAntes} scroll-mexeu=${$('#stream').scrollTop !== scrollAntes}`;
+        }
+        diz(`ui canal arquivado a ler: ${leituraFirme}`);
         diz(`ui canal arquivado: em-arquivados=${(sv.arquivados || []).some(c => c.id === ef.id)}`
           + ` nos-canais=${sv.canais.some(c => c.id === ef.id)}`
           + ` na-barra=${!!$(`.chan--arquivado[data-canal="${ef.id}"]`)} mensagens=${msgsArq.length}`
@@ -9866,7 +10035,10 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         const sv2 = acha();
         diz(`ui canal reaberto: nos-canais=${sv2.canais.some(c => c.id === ef.id)}`
           + ` fora-dos-arquivados=${!(sv2.arquivados || []).some(c => c.id === ef.id)}`
-          + ` composer-visivel=${!$('#composer').hidden}`);
+          + ` composer-visivel=${!$('#composer').hidden}`
+          // A faixa «arquivado» e o botao «Reabrir» nao podem ficar por cima da caixa activa.
+          + ` faixa-sumiu=${!$('#stream .faixa-arquivado')}`
+          + ` faixa-e-composer-juntos=${!$('#composer').hidden && !!$('#stream .faixa-arquivado')}`);
 
         // Sair da sala: o menu do rail e o texto honesto (e cancela-se); e a saida a serio,
         // numa sala descartavel.
@@ -9886,7 +10058,6 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
           const st = await invoke('estado');
           saiu = !(st.servidores || []).some(x => x.id === descartavel);
         }
-        let recusaConversa = 'sem conversa';
         diz(`ui sair da sala: menu-tem-sair=${menuTemSair} veu=${veuSair} texto-honesto=${/continua a ter/.test(textoSair)}`
           + ` cancelou=${$('#veu-remover').hidden && vista.servidores.some(x => x.id === alvo.id)} saiu-da-descartavel=${saiu}`);
         // O erro de uma remocao aparece no veu, e nao na consola.
@@ -9897,7 +10068,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         const erroVisivel = $('#erro-remover').textContent;
         $('#fechar-remover').click();
         await p;
-        diz(`ui apagar conversa: catch-visivel=${!!erroVisivel} erro="${erroVisivel}" ${recusaConversa}`);
+        diz(`ui apagar conversa: catch-visivel=${!!erroVisivel} erro="${erroVisivel}"`);
         modo = antes.modo; conversaAtual = antes.conv;
         escolherServidor(antes.srv || alvo.id);
         if (antes.cnl) escolherCanal(antes.cnl);
@@ -10079,6 +10250,12 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const enviou = await avisar('Bruma', 'x', destino);
       const chegou = await Promise.race([chegada, new Promise(r => setTimeout(() => r(null), 1500))]);
       if (!chegou) desligar();
+      // POR ONDE SAIU o aviso: «sozinho» (a bandeira do clique), «directo» (o toast com
+      // clique) ou «plugin» (o recurso, quando o AUMID não está registado — o caso que só
+      // acontece numa instalação a sério e que não pode acabar em silêncio).
+      const via = await invoke('avisar_do_sistema', { titulo: 'Bruma', corpo: 'por onde saiu', destino })
+        .catch(e => `ERRO ${e}`);
+      diz(`ui aviso via: ${via}`);
       diz(`ui aviso clicado (rust): enviou=${enviou} chegou=${!!chegou}`
         + ` destino-certo=${!!chegou && chegou.servidor === destino.servidor && chegou.canal === destino.canal}`
         + ` foco=${document.hasFocus()}`);
@@ -10174,6 +10351,23 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       escolherServidor(antes.srv || primeiro.id);
       if (antes.cnl) escolherCanal(antes.cnl);
       await pausa(400);
+      // O ouvinte existe antes da primeira vista: um par que se ligue nessa janela nao pode
+      // rebentar o tratador a meio.
+      let semVista = 'nao medido';
+      {
+        const guardada = vista;
+        const ligadosAntes = [...paresLigados];
+        try {
+          vista = null;
+          aplicarLigados(['aa'.repeat(32)]);
+          semVista = 'aguentou';
+        } catch (e) {
+          semVista = `REBENTOU ${e && e.name ? e.name : e}`;
+        }
+        vista = guardada;
+        aplicarLigados(ligadosAntes);
+      }
+      diz(`ui ligados sem vista: ${semVista} set-ficou=${paresLigados.size >= 0}`);
       diz(`ui ligados na lista: off-sem-ligacao=${offSem} eu-nunca-off=${!euOff}`
         + ` chip-sem-ninguem="${chipNinguem}"`
         + ` off-com-ligacao=${offCom} chip-com-membro="${chipMembro}" ponto=${pontoMembro}`
