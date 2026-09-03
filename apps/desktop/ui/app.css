@@ -1530,3 +1530,14 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .endereco:hover { color: var(--text); }
 .endereco:focus-visible { outline: 1px solid var(--mist); outline-offset: 1px; border-radius: 3px; }
 
+/* --- o número de segurança (#89) e a conversa estranha (#145) --------------------------- */
+.verificar__quem { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font: 600 14px/1.3 var(--ui); }
+.verificar__palavras { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 12px; }
+/* 6 numa linha, em mono e em verde: para NUNCA parecerem as 24 da semente. */
+.verificar__palavras b {
+  font: 600 17px/1.2 var(--mono); color: var(--mint);
+  padding: 7px 11px; background: var(--raise); border: 1px solid var(--line); border-radius: var(--r);
+}
+.member--estranho i { color: var(--amber); }
+.chip--verificado { color: var(--mint); }
+

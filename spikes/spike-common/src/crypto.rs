@@ -12,6 +12,7 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
 const CTX_CONVERSA: &[u8] = b"bruma/conversa/v1";
+const CTX_VERIFICACAO: &[u8] = b"bruma/verificacao/v1";
 const CTX_X25519: &[u8] = b"bruma/spike1/x25519/v1";
 const CTX_SESSION: &[u8] = b"bruma/spike1/session/v1";
 const CTX_BIND: &[u8] = b"bruma/spike1/prekey-binding/v1";
@@ -99,6 +100,37 @@ pub fn id_da_conversa(a: &[u8; 32], b: &[u8; 32]) -> [u8; 16] {
     let mut id = [0u8; 16];
     id.copy_from_slice(&h.finalize().as_bytes()[..16]);
     id
+}
+
+/// O NÚMERO DE SEGURANÇA (#89): 6 palavras derivadas das DUAS chaves, iguais dos dois lados,
+/// para se lerem em voz alta a quem se quer verificar. Não é a semente: são 6 e não 24, e não
+/// abrem nada — só provam que as duas chaves são as que cada um julga. 66 bits (2^66 para
+/// imitar contra um par fixo) é o mínimo defensável; o desenho do identicon (2^22) e a chave
+/// curta que se compara de cabeça (16 bits) não o são, por muito que se troque o hash.
+///
+/// Índices de 11 bits lidos MSB-first dos primeiros 9 bytes do digest, sobre a lista inglesa
+/// do BIP39 — SEM `Mnemonic::from_entropy`, que exige 16..32 bytes e mete checksum: isso são
+/// as 24 palavras, não estas.
+pub fn numero_de_seguranca(a: &[u8; 32], b: &[u8; 32]) -> [&'static str; 6] {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = blake3::Hasher::new();
+    h.update(CTX_VERIFICACAO);
+    h.update(lo);
+    h.update(hi);
+    let digest = h.finalize();
+    let bytes = digest.as_bytes();
+    let lista = bip39::Language::English.word_list();
+    let mut palavras = [""; 6];
+    for (k, palavra) in palavras.iter_mut().enumerate() {
+        let mut v: usize = 0;
+        for i in 0..11 {
+            let bit = 11 * k + i;
+            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+            v = (v << 1) | b as usize;
+        }
+        *palavra = lista[v];
+    }
+    palavras
 }
 
 /// ECDH + HKDF. O sal ordena as duas identidades para os dois lados derivarem a MESMA chave.
@@ -374,6 +406,30 @@ mod testes_palavras {
     ///
     /// Se contasse, cada um abria a sua conversa, escrevia no seu log, e nenhum via o do
     /// outro -- dois monologos em vez de uma conversa, sem um unico erro pelo caminho.
+    /// As 6 palavras (#89): iguais dos dois lados, todas no dicionário, diferentes para pares
+    /// diferentes — e um VECTOR FIXO, que prende o contexto e a ordem dos bits: uma «melhoria»
+    /// que trocasse o endianness deixava os dois lados com palavras diferentes sem ninguém
+    /// reparar.
+    #[test]
+    fn o_numero_de_seguranca_e_o_mesmo_dos_dois_lados() {
+        let a = [7u8; 32];
+        let b = [200u8; 32];
+        let c = [9u8; 32];
+        assert_eq!(
+            numero_de_seguranca(&a, &b),
+            numero_de_seguranca(&b, &a),
+            "a ordem contou"
+        );
+        let lista = bip39::Language::English.word_list();
+        for p in numero_de_seguranca(&a, &b) {
+            assert!(lista.contains(&p), "{p} não está no dicionário");
+        }
+        assert_ne!(numero_de_seguranca(&a, &b), numero_de_seguranca(&a, &c));
+        assert_ne!(numero_de_seguranca(&a, &b), numero_de_seguranca(&b, &c));
+        const ESPERADO: [&str; 6] = ["aim", "seed", "please", "fox", "replace", "found"];
+        assert_eq!(numero_de_seguranca(&a, &b), ESPERADO, "o vector fixo");
+    }
+
     #[test]
     fn o_id_da_conversa_e_o_mesmo_dos_dois_lados() {
         let a = [7u8; 32];

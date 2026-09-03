@@ -308,12 +308,19 @@ function desenharConversas() {
     const ligado = estaLigado(c.com);
     l.classList.toggle('is-off', !ligado);
     l.title = ligado ? 'ligado a ti agora' : 'não está ligado a ti agora — o que escreveres fica aqui até abrir o Bruma';
+    // ESTRANHO (#145): não é amigo e não é membro de nenhuma sala minha — a única coisa que
+    // sei dele é o que ele diz de si. Diz-se, e a chave fica por verificar até se lerem as
+    // 6 palavras.
+    const conhecido = (amigos || []).some(a => a.chave === c.com)
+      || (vista.servidores || []).some(sv => sv.membros.some(m => m.chave === c.com));
+    l.classList.toggle('member--estranho', !conhecido);
     const av = elemento('span', 'ident');
     pintar(av, c.com);
     const txt = elemento('span');
     txt.append(rotuloDePessoa(c.com, c.nome));
     const avisoC = avisoDeVersao(c.com);
-    txt.append(elemento('i', avisoC ? 'versao-diferente' : null, avisoC || chaveCurta(c.com)));
+    txt.append(elemento('i', avisoC && conhecido ? 'versao-diferente' : null,
+      !conhecido ? 'nunca falaste com esta pessoa — chave por verificar' : (avisoC || chaveCurta(c.com))));
     l.append(av, txt);
     if (c.nao_lidos) {
       l.classList.add('tem-novas');
@@ -332,6 +339,7 @@ function desenharConversas() {
       ev.stopPropagation();
       abrirMenu(ev.clientX, ev.clientY, [
         { rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(c.com) },
+        { rotulo: 'Verificar a chave…', accao: () => abrirVerificacao(c.com) },
         '-',
         {
           rotulo: 'Apagar esta conversa',
@@ -996,8 +1004,11 @@ async function desenharAmigos(stream) {
     pintar(av, a.chave);
     const txt = elemento('span');
     txt.append(elemento('b', null, a.nome));
+    // As 6 palavras em pequeno (#89): a pessoa vê-as sem abrir nada, e abre para as ler.
+    const palavras = await invoke('numero_de_seguranca', { peer: a.chave }).catch(() => '');
     txt.append(elemento('i', null,
-      chaveCurta(a.chave) + (a.verificado ? ' · chave verificada' : ' · chave por verificar')));
+      chaveCurta(a.chave) + (a.verificado ? ' · chave verificada' : ' · chave por verificar')
+      + (palavras ? ` · ${palavras}` : '')));
     linha.append(av, txt);
 
     const acoes = elemento('span', 'caixa__acoes');
@@ -1012,9 +1023,11 @@ async function desenharAmigos(stream) {
     };
     // A verificação é o que substitui «o servidor garante que este é o João». Sem
     // directório, é a única forma de saber que a chave é de quem julgas.
-    const ver = elemento('button', 'btn', a.verificado ? 'Desmarcar' : 'Verifiquei a chave');
+    const ver = elemento('button', 'btn', a.verificado ? 'Desmarcar' : 'Verificar a chave…');
     ver.onclick = async () => {
-      await invoke('marcar_verificado', { chave: a.chave, verificado: !a.verificado })
+      // Verificar é ler as 6 palavras (#89); desmarcar é directo.
+      if (!a.verificado) { abrirVerificacao(a.chave); return; }
+      await invoke('marcar_verificado', { chave: a.chave, verificado: false })
         .catch(e => alert(String(e)));
       await desenharTudo();
     };
@@ -1059,6 +1072,16 @@ function desenharTopo() {
     // Não há convite para uma conversa, e é de propósito: o que a abre são as duas chaves,
     // e não um segredo que se possa reencaminhar a um terceiro.
     $('#btn-convite').style.display = 'none';
+    // A chave desta pessoa, verificada ou por verificar (#89): um clique abre as 6 palavras.
+    const chipV = $('#chip-verificado');
+    chipV.hidden = !c;
+    if (c) {
+      const amigoV = (amigos || []).find(a => a.chave === c.com);
+      const verificada = !!(amigoV && amigoV.verificado);
+      $('#rotulo-verificado').textContent = verificada ? 'chave verificada ✓' : 'chave por verificar';
+      chipV.classList.toggle('chip--verificado', verificada);
+      chipV.onclick = () => abrirVerificacao(c.com);
+    }
     if (c) {
       const on = paresLigados.has(c.com);
       const quem = nomeDoPeer(c.com);
@@ -1077,6 +1100,7 @@ function desenharTopo() {
     }
     return;
   }
+  $('#chip-verificado').hidden = true;
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
   $('#nome-servidor').textContent = s ? s.nome : '—';
@@ -1162,6 +1186,61 @@ $('#ir-ao-fim').onclick = () => {
 
 $('#btn-novo').onclick = () => { erroEm('erro-novo', ''); abrir('veu-novo'); };
 $('#fechar-novo').onclick = () => fechar('veu-novo');
+
+/* O NÚMERO DE SEGURANÇA (#89, #145).
+   Sem directório, «este é o João» é uma coisa que só a pessoa pode decidir — e decide-a com
+   6 palavras derivadas das DUAS chaves inteiras, lidas em voz alta; do outro lado aparecem as
+   mesmas 6. É a única defesa a sério: o identicon imita-se em segundos e a chave curta que se
+   compara de cabeça em minutos. Uma caixa só, com três entradas: a ficha do amigo, o menu de
+   quem tem chave, e o chip no topo de uma conversa. */
+let verificacaoAberta = null;
+
+async function abrirVerificacao(chave) {
+  const nome = nomeComOrigem(chave, '');
+  $('#verificar-nome').textContent = '';
+  $('#verificar-nome').append(rotuloDePessoa(chave, ''));
+  pintar($('#verificar-avatar'), chave);
+  const zona = $('#verificar-palavras');
+  zona.textContent = '';
+  $('#erro-verificar').textContent = '';
+  let palavras = '';
+  try {
+    palavras = await invoke('numero_de_seguranca', { peer: chave });
+  } catch (e) {
+    $('#erro-verificar').textContent = String(e);
+  }
+  for (const p of palavras.split(' ').filter(Boolean)) zona.append(elemento('b', null, p));
+  // `marcar_verificado` exige estar na lista: quem não está, entra ao marcar.
+  const amigo = (amigos || []).find(a => a.chave === chave);
+  $('#verificar-rotulo-nome').hidden = !!amigo;
+  $('#in-verificar-nome').hidden = !!amigo;
+  if (!amigo) $('#in-verificar-nome').value = nome.origem === 'declarado' ? nome.texto : '';
+  $('#ok-verificar').textContent = amigo
+    ? 'Li-lhe as palavras e batem certo'
+    : 'Adicionar aos amigos e marcar a chave como verificada';
+  verificacaoAberta = chave;
+  abrir('veu-verificar');
+  return palavras;
+}
+
+$('#fechar-verificar').onclick = () => { fechar('veu-verificar'); verificacaoAberta = null; };
+$('#ok-verificar').onclick = async () => {
+  const chave = verificacaoAberta;
+  if (!chave) return;
+  try {
+    if (!(amigos || []).some(a => a.chave === chave)) {
+      const nome = $('#in-verificar-nome').value.trim();
+      if (!nome) { $('#erro-verificar').textContent = 'dá-lhe um nome primeiro'; return; }
+      await invoke('adicionar_amigo', { chave, nome });
+    }
+    await invoke('marcar_verificado', { chave, verificado: true });
+    fechar('veu-verificar');
+    verificacaoAberta = null;
+    await desenharTudo();
+  } catch (e) {
+    $('#erro-verificar').textContent = String(e);
+  }
+};
 
 $('#ok-servidor').onclick = async () => {
   const nome = $('#in-servidor').value.trim();
@@ -4100,6 +4179,7 @@ const EXPLICACOES = {
     corpo: [
       'Foi criada neste computador na primeira vez que abriste a app. É uma chave, e é ao mesmo tempo o teu ID e o teu endereço na rede.',
       'Não existe conta nem registo. Mas existem <b>24 palavras</b> que a recuperam noutra máquina — se as guardares antes de precisares delas.',
+      'Para teres a certeza de que uma chave é de quem julgas, lês-lhe <b>6 palavras</b> — não as 24 — e ele confirma as dele. É isso que substitui «o servidor garante que este é o João».',
     ],
     accao: { rotulo: 'Ver as minhas 24 palavras', abre: 'veu-definicoes' },
   },
@@ -4358,6 +4438,9 @@ document.addEventListener('contextmenu', ev => {
   if (membro && membro.dataset.chave) {
     const chave = membro.dataset.chave;
     itens.push({ rotulo: 'Copiar chave', accao: () => navigator.clipboard.writeText(chave) });
+    if (vista && chave !== vista.chave) {
+      itens.push({ rotulo: `Verificar a chave de ${nomeDoPeer(chave)}…`, accao: () => abrirVerificacao(chave) });
+    }
     // O volume só faz sentido de quem se está a ouvir agora (#164).
     if (chave !== vista.chave && voz.audio.has(chave)) {
       itens.push({ tipo: 'volume', chave });
@@ -7224,6 +7307,16 @@ function pararDeAssistir() {
 
 /* ---------- arranque ---------- */
 
+// Um erro de JS que rebenta fora de um `try` ia morrer na consola da WebView2, que ninguém
+// vê: os guiões (`--par`, `--medir-ui`) ficavam mudos sem se saber porquê. Vai para o registo.
+window.addEventListener('error', ev => {
+  invoke('capacidades', { linha: `JS ERRO ${ev.message} (${ev.filename}:${ev.lineno})` }).catch(() => {});
+});
+window.addEventListener('unhandledrejection', ev => {
+  const r = ev.reason;
+  invoke('capacidades', { linha: `JS PROMESSA REJEITADA ${r && r.message ? r.message : r}` }).catch(() => {});
+});
+
 // O carimbo de «já se pode escrever» (#99), visto do DOM: o atributo `hidden` do composer.
 {
   const c = $('#composer');
@@ -7906,6 +7999,8 @@ async function segundoCanalDeTexto(servidorId) {
               amigos = await invoke('amigos').catch(() => amigos);
             }
             const id = await invoke('abrir_conversa', { peer: outro });
+            // As 6 palavras (#89): as DUAS instancias tem de imprimir a mesma string.
+            diz(`par verificacao: com=${outro.slice(0, 6)} palavras="${await invoke('numero_de_seguranca', { peer: outro }).catch(e => 'ERRO ' + e)}"`);
             const st = await invoke('estado');
             const c = st.conversas.find(x => x.id === id);
             conversa = c || { id, canal: 'conversa', nome: '?' };
@@ -7955,7 +8050,7 @@ async function segundoCanalDeTexto(servidorId) {
             + ` entregue-ate=${cv.entregue_ate || 0}`
             + ` ultima-razao=${ultimaEntregaDe.get(conversa.id) || 'nada'}`);
         }
-        diz(`par conversa mensagens: ${msgs.length}/2`
+        diz(`par conversa mensagens: ${msgs.length}/3`
           + ` [${msgs.map(m => `${m.autor_nome} (mostrado=${nomeDoPeer(m.autor)}): ${m.texto}`).join(' | ')}]`
           + ` conversas-na-vista=${st.conversas.length}`
           + ` servidores-na-vista=${st.servidores.length}`);
@@ -8615,6 +8710,68 @@ async function segundoCanalDeTexto(servidorId) {
         linhasDosNomes.push(`ui nomes: REBENTOU ${e && e.message ? e.message : e}`);
       }
       for (const l of linhasDosNomes) diz(l);
+
+      // O NUMERO DE SEGURANCA (#89): 6 palavras, que nao sao a semente, e o botao que marca.
+      try {
+        // O bloco dos nomes removeu o `falso` da lista: volta a entrar, por verificar.
+        await invoke('adicionar_amigo', { chave: falso, nome: 'Outro nome' }).catch(() => {});
+        await invoke('marcar_verificado', { chave: falso, verificado: false }).catch(() => {});
+        amigos = await invoke('amigos');
+        const palavras = await abrirVerificacao(falso);
+        const noDom = [...document.querySelectorAll('#verificar-palavras b')].map(b => b.textContent);
+        const semente = String(await invoke('palavras_da_identidade').catch(() => '')).trim().split(/[^a-z]+/).filter(Boolean);
+        let janela = false;
+        for (let i = 0; i + 6 <= semente.length; i++) {
+          if (semente.slice(i, i + 6).join(' ') === noDom.join(' ')) janela = true;
+        }
+        const texto = $('#veu-verificar').textContent;
+        const outra = await invoke('numero_de_seguranca', { peer: 'bb'.repeat(32) }).catch(() => '');
+        let recusaMinha = 'aceitou';
+        try { await invoke('numero_de_seguranca', { peer: vista.chave }); } catch (e) { recusaMinha = 'recusou'; }
+        $('#ok-verificar').click();
+        await new Promise(r => setTimeout(r, 600));
+        const guardado = ((await invoke('amigos')).find(x => x.chave === falso) || {}).verificado === true;
+        const fechou = $('#veu-verificar').hidden;
+        // E quem NAO esta na lista: a caixa pede um nome, adiciona e marca.
+        await invoke('remover_amigo', { chave: falso }).catch(() => {});
+        amigos = await invoke('amigos');
+        await abrirVerificacao(falso);
+        const pedeNome = !$('#in-verificar-nome').hidden;
+        $('#in-verificar-nome').value = 'Novo amigo';
+        $('#ok-verificar').click();
+        await new Promise(r => setTimeout(r, 600));
+        const novo = (await invoke('amigos')).find(x => x.chave === falso) || {};
+        amigos = await invoke('amigos');
+        diz(`ui verificacao: palavras=${noDom.length} iguais-ao-comando=${noDom.join(' ') === palavras}`
+          + ` so-letras=${noDom.every(w => /^[a-z]+$/.test(w))} frase-nao-e-semente=${/não é a tua semente/.test(texto)}`
+          + ` janela-de-6-nas-24=${janela} outra-chave-difere=${outra !== palavras && outra.split(' ').length === 6}`
+          + ` a-minha=${recusaMinha} verificado-pelo-botao=${guardado} veu-fechou=${fechou}`
+          + ` sem-amigo: pede-nome=${pedeNome} adicionado-e-verificado=${novo.nome === 'Novo amigo' && novo.verificado === true}`);
+      } catch (e) {
+        diz(`ui verificacao: REBENTOU ${e && e.message ? e.message : e}`);
+      }
+
+      // A CONVERSA ESTRANHA (#145): sem amigo e sem sala comum, a lista di-lo.
+      try {
+        const DD = 'dd'.repeat(32);
+        vista.conversas = vista.conversas || [];
+        vista.conversas.push({ id: 'conversa-estranha', com: DD, nome: 'dddddd', canal: 'conversa', nao_lidos: 0, entregue_ate: 0 });
+        const redesenha = () => { $('#lista-canais').textContent = ''; desenharConversas(); };
+        redesenha();
+        const marcada = !!$(`#lista-canais .member[data-chave="${DD}"].member--estranho`);
+        const textoI = ($(`#lista-canais .member[data-chave="${DD}"] i`) || {}).textContent;
+        await invoke('adicionar_amigo', { chave: DD, nome: 'ja conhecido' }).catch(() => {});
+        amigos = await invoke('amigos');
+        redesenha();
+        const marcadaComAmigo = !!$(`#lista-canais .member[data-chave="${DD}"].member--estranho`);
+        await invoke('remover_amigo', { chave: DD }).catch(() => {});
+        amigos = await invoke('amigos');
+        vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-estranha');
+        redesenha();
+        diz(`ui conversa estranha: marcada=${marcada} texto="${textoI}" com-amigo-marcada=${marcadaComAmigo}`);
+      } catch (e) {
+        diz(`ui conversa estranha: REBENTOU ${e && e.message ? e.message : e}`);
+      }
 
       await invoke('remover_amigo', { chave: falso }).catch(() => {});
       const sobrou = (await invoke('amigos')).some(x => x.chave === falso);

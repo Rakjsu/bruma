@@ -225,6 +225,20 @@ pub fn marcar_verificado(chave: String, verificado: bool, app: State<Arc<App>>) 
         .map_err(erro)
 }
 
+/// As 6 palavras entre mim e `peer` (#89), para ler em voz alta. Recusa a minha própria chave,
+/// como `abrir_conversa`.
+#[tauri::command]
+pub fn numero_de_seguranca(peer: String, app: State<Arc<App>>) -> R<String> {
+    let peer = peer.trim();
+    let minha = app.minha_chave();
+    if peer == minha {
+        return Err("isso é a tua própria chave".into());
+    }
+    let a = estado::hex32(&minha).map_err(erro)?;
+    let b = estado::hex32(peer).map_err(erro)?;
+    Ok(spike_common::crypto::numero_de_seguranca(&a, &b).join(" "))
+}
+
 /// Quem eu recuso, e a política de quem me pode escrever.
 #[tauri::command]
 pub fn permissoes(app: State<Arc<App>>) -> R<serde_json::Value> {

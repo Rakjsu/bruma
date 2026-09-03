@@ -107,6 +107,7 @@ macro_rules! handler_com {
             comandos::adicionar_amigo,
             comandos::remover_amigo,
             comandos::marcar_verificado,
+            comandos::numero_de_seguranca,
             comandos::permissoes,
             comandos::bloquear,
             comandos::definir_quem_escreve,

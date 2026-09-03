@@ -155,6 +155,9 @@
         <span class="chip" id="chip-peers" data-explica="caminho" role="button" tabindex="0">
           <i class="dot"></i><span id="rotulo-peers">0 ligados</span>
         </span>
+        <span class="chip" id="chip-verificado" role="button" tabindex="0" title="Verificar a chave desta pessoa" hidden>
+          <span id="rotulo-verificado">chave por verificar</span>
+        </span>
         <button class="chip chip--btn" id="btn-convite" title="Criar um convite para este servidor">Convidar</button>
       </div>
     </header>
@@ -256,6 +259,23 @@
     <div class="caixa__acoes">
       <button class="btn" id="fechar-novo">Cancelar</button>
       <button class="btn btn--primary" id="ok-convite">Entrar</button>
+    </div>
+  </div>
+</div>
+
+<div class="veu" id="veu-verificar" hidden>
+  <div class="caixa caixa--verificar">
+    <h2>Verificar uma chave</h2>
+    <div class="verificar__quem"><span class="ident ident--lg" id="verificar-avatar"></span><span id="verificar-nome"></span></div>
+    <p>Lê-lhe estas <b>6 palavras</b> em voz alta — ao telefone, numa chamada, ao vivo. Do lado dele aparecem as mesmas 6. Se baterem certo, a chave é dele.</p>
+    <div class="verificar__palavras" id="verificar-palavras"></div>
+    <p class="nota">Isto <b>não é a tua semente</b>: são 6 palavras, não 24, e podes dizê-las a quem quiseres. Não abrem nada — só provam que as duas chaves são as que julgas.</p>
+    <label for="in-verificar-nome" id="verificar-rotulo-nome" hidden>Como lhe chamas</label>
+    <input id="in-verificar-nome" placeholder="nome" maxlength="40" autocomplete="off" hidden>
+    <div class="caixa__erro" id="erro-verificar"></div>
+    <div class="caixa__acoes">
+      <button class="btn" id="fechar-verificar">Fechar</button>
+      <button class="btn btn--primary" id="ok-verificar">Li-lhe as palavras e batem certo</button>
     </div>
   </div>
 </div>
