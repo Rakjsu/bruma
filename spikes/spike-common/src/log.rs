@@ -400,6 +400,15 @@ impl Log {
             .max()
     }
 
+    /// O carimbo mais antigo e o mais recente (#21). O `ts_ms` está em CLARO na entrada:
+    /// zero decifragem e zero clone — ao contrário de `ordered()`. É o relógio de quem
+    /// escreveu, e é o que se MOSTRA (#198).
+    pub fn extremos_ts(&self) -> Option<(u64, u64)> {
+        let mut it = self.entries.values().map(|e| e.ts_ms);
+        let primeiro = it.next()?;
+        Some(it.fold((primeiro, primeiro), |(lo, hi), t| (lo.min(t), hi.max(t))))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -859,6 +868,17 @@ mod tests {
         let esperado: Vec<String> = [&a, &b, &c].iter().map(|e| e.hash_hex().unwrap()).collect();
         assert_eq!(ordem, esperado);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Os extremos (#21): o mínimo e o máximo dos carimbos, e nada num log vazio.
+    #[test]
+    fn extremos_ts_e_o_minimo_e_o_maximo() {
+        let mut log = Log::load(tmp("extremos")).unwrap();
+        assert_eq!(log.extremos_ts(), None, "vazio");
+        log.append_local(&key(1), [0u8; 24], vec![1], 20).unwrap();
+        log.append_local(&key(1), [1u8; 24], vec![2], 10).unwrap();
+        log.append_local(&key(1), [2u8; 24], vec![3], 30).unwrap();
+        assert_eq!(log.extremos_ts(), Some((10, 30)));
     }
 
     #[test]

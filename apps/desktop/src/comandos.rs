@@ -359,6 +359,10 @@ pub fn escapou_alguma_coisa(app: State<Arc<App>>) -> R<String> {
     if let Ok(rd) = std::fs::read_dir(raiz.join("servidores")) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
+            // A quarentena é nossa, não é fuga (#21): `.estragado-`, `.rejeitadas`, `.apagado`.
+            if estado::e_quarentena(&n) {
+                continue;
+            }
             let base = n.trim_end_matches(".json");
             if !estado::id_de_servidor_valido(base) {
                 achados.push(format!("ficheiro:{n}"));
@@ -942,16 +946,55 @@ pub fn meu_endereco(rede: State<Arc<Rede>>) -> R<String> {
 
 /// Diagnóstico honesto: quantas entradas há e quantas estão sem pai.
 /// Enquanto houver órfãs, o histórico tem buracos e a interface deve dizê-lo.
+/// «O QUE ESTÁ GUARDADO» (#21, #148). Por sala, o que está em memória — entradas, órfãs
+/// (mensagens cujo pai nunca chegou), linhas ilegíveis, os extremos dos carimbos, pares — e,
+/// já FORA do lock, o que está no disco: bytes por log, a pasta inteira, a quarentena. Os
+/// nomes das salas ficam para a `vista`: vivem no log cifrado. Era o `saude`, que ninguém
+/// chamava.
+struct SalaEmMemoria {
+    id: String,
+    com: Option<String>,
+    entradas: usize,
+    orfas: usize,
+    ilegiveis: usize,
+    extremos: Option<(u64, u64)>,
+    peers: usize,
+}
+
 #[tauri::command]
-pub fn saude(servidor: String, app: State<Arc<App>>) -> R<serde_json::Value> {
-    let servidores = app.servidores.lock().map_err(erro)?;
-    let srv = servidores
-        .get(&servidor)
-        .ok_or("esse servidor não existe aqui")?;
+pub fn inventario(app: State<Arc<App>>) -> R<serde_json::Value> {
+    let em_memoria: Vec<SalaEmMemoria> = {
+        let s = app.servidores.lock().map_err(erro)?;
+        s.values()
+            .map(|srv| SalaEmMemoria {
+                id: srv.id.clone(),
+                com: srv.com.clone(),
+                entradas: srv.log.len(),
+                orfas: srv.log.orfas().len(),
+                ilegiveis: srv.log.ilegiveis(),
+                extremos: srv.log.extremos_ts(),
+                peers: srv.peers.len(),
+            })
+            .collect()
+    };
+    let salas: Vec<serde_json::Value> = em_memoria
+        .into_iter()
+        .map(|m| {
+            let bytes = std::fs::metadata(estado::caminho_do_log(&m.id))
+                .map(|md| md.len())
+                .unwrap_or(0);
+            serde_json::json!({
+                "id": m.id, "com": m.com, "entradas": m.entradas, "orfas": m.orfas,
+                "ilegiveis": m.ilegiveis, "extremos": m.extremos, "peers": m.peers, "bytes": bytes,
+            })
+        })
+        .collect();
+    let pasta = estado::inventario_da_pasta(&estado::raiz());
     Ok(serde_json::json!({
-        "entradas": srv.log.len(),
-        "orfas": srv.log.orfas().len(),
-        "peers": srv.peers.len(),
+        "salas": salas,
+        "total": pasta.total,
+        "indice_bytes": pasta.indice_bytes,
+        "quarentena": pasta.quarentena,
     }))
 }
 

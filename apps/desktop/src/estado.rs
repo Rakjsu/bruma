@@ -1424,6 +1424,51 @@ fn escrever_atomico(destino: &std::path::Path, bytes: &[u8]) -> Result<()> {
 /// — e em Windows o `rename` substitui sem avisar. O segundo ficheiro a falhar apagava a cópia
 /// do primeiro, e um problema de disco raramente atinge um ficheiro só: o caso em que isto
 /// interessa era precisamente o caso em que destruía a prova.
+/// Os sufixos de QUARENTENA: ficheiros postos de lado, nunca apagados. `pos_de_lado` põe
+/// `.estragado-<ms>`, o log põe `.rejeitadas` (linhas que não conferiram), `apagar_conversa`
+/// põe `.apagado`. É a convenção que o inventário lista e que `escapou_alguma_coisa` deixa
+/// de acusar como fuga.
+pub fn e_quarentena(nome: &str) -> bool {
+    nome.contains(".estragado-") || nome.ends_with(".rejeitadas") || nome.contains(".apagado")
+}
+
+/// O que está no disco (#21): a pasta inteira em bytes, o índice, e a quarentena — sem lock
+/// nenhum e sem abrir um log. Só `metadata()`.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InventarioDaPasta {
+    pub total: u64,
+    pub indice_bytes: u64,
+    pub quarentena: Vec<(String, u64)>,
+}
+
+fn somar_pasta(dir: &std::path::Path, inv: &mut InventarioDaPasta) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        inv.total += md.len();
+        let nome = e.file_name().to_string_lossy().to_string();
+        if e_quarentena(&nome) {
+            inv.quarentena.push((nome, md.len()));
+        }
+    }
+}
+
+pub fn inventario_da_pasta(raiz: &std::path::Path) -> InventarioDaPasta {
+    let mut inv = InventarioDaPasta::default();
+    somar_pasta(&raiz.join("servidores"), &mut inv);
+    somar_pasta(raiz, &mut inv);
+    inv.indice_bytes = std::fs::metadata(raiz.join("indice.json"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    inv.quarentena.sort();
+    inv
+}
+
 fn pos_de_lado(p: &std::path::Path) {
     let etiqueta = format!(
         "{}.estragado-{}",
@@ -2320,6 +2365,44 @@ mod testes {
     }
 
     /// Pôr dois ficheiros de lado não apaga a cópia do primeiro.
+    /// O inventário lê o que está lá (#21): a soma dos bytes, os três sufixos de quarentena
+    /// e o índice — e distingue quarentena de fuga.
+    #[test]
+    fn inventario_da_pasta_le_o_que_esta_la() {
+        let dir = std::env::temp_dir().join(format!("bruma-inv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("servidores")).unwrap();
+        let ficheiros: [(&str, &[u8]); 5] = [
+            ("servidores/a.json", b"um\ndois\ntres\n"),
+            ("servidores/a.json.estragado-1", b"estragado"),
+            ("servidores/b.rejeitadas", b"rej"),
+            ("servidores/c.apagado", b"apagado!"),
+            ("indice.json", b"{\"indice\":1}"),
+        ];
+        let mut esperado = 0u64;
+        for (nome, conteudo) in ficheiros {
+            std::fs::write(dir.join(nome), conteudo).unwrap();
+            esperado += conteudo.len() as u64;
+        }
+        let inv = inventario_da_pasta(&dir);
+        assert_eq!(inv.total, esperado, "a soma dos bytes");
+        assert_eq!(
+            inv.quarentena
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.json.estragado-1", "b.rejeitadas", "c.apagado"],
+            "os três sufixos, e só eles"
+        );
+        assert_eq!(inv.indice_bytes, 12, "o índice");
+        assert!(e_quarentena("x.json.estragado-1700000000000-2"));
+        assert!(
+            !e_quarentena("x.json") && !e_quarentena("x.txt"),
+            "fuga não é quarentena"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn quarentena_nao_sobrescreve() {
         let dir = std::env::temp_dir().join(format!("bruma-quar-{}", std::process::id()));

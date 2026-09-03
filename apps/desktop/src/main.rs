@@ -119,7 +119,7 @@ macro_rules! handler_com {
             comandos::presenca_de_voz,
             comandos::enviar_sinal,
             comandos::meu_endereco,
-            comandos::saude,
+            comandos::inventario,
             comandos::capacidades,
             comandos::autoteste_fps,
             comandos::autoteste_altura,

@@ -1541,3 +1541,8 @@ body.ghost .app { transition: filter .8s var(--ease); }
 .member--estranho i { color: var(--amber); }
 .chip--verificado { color: var(--mint); }
 
+/* --- «o que está guardado» (#21, #148) --------------------------------------------------- */
+.def__inv { margin: 6px 0 8px; }
+.def__inv b { font: 600 13.5px/1.3 var(--ui); color: var(--text); }
+.nota--aviso { color: var(--amber); }
+

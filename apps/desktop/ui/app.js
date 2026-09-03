@@ -129,6 +129,15 @@ function chaveCurta(k) {
   return k ? `${k.slice(0, 4)}·${k.slice(4, 8)}·${k.slice(8, 12)}` : '';
 }
 
+function kb(bytes) {
+  const n = Number(bytes) || 0;
+  return n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function dataCurta(ms) {
+  return new Date(Number(ms)).toLocaleDateString();
+}
+
 /* ENDEREÇOS NAS MENSAGENS (#96).
    O corpo de uma mensagem é texto de OUTRA máquina: nós de texto e, para cada endereço, um
    <a> SEM `href`, de propósito — a janela não tem `on_navigation`, e um `<a href>` clicado
@@ -1642,6 +1651,58 @@ const PAINEIS = {
       a1.append(abrir, nota1);
       s1.append(a1);
       painel.append(s1);
+
+      // O QUE ESTÁ GUARDADO (#21, #148): um instantâneo do disco, sob demanda — sem gráficos
+      // nem promessas, só o que se leu naquele instante. As órfãs (mensagens cujo pai nunca
+      // chegou) eram invisíveis: agora dizem se é sincronização a meio ou material em falta.
+      const sInv = seccao('O que está guardado');
+      const corpoInv = elemento('div');
+      sInv.append(corpoInv);
+      const lerInventario = async () => {
+        corpoInv.textContent = '';
+        const inv = await invoke('inventario').catch(e => ({ erro: String(e) }));
+        if (inv.erro) {
+          corpoInv.append(elemento('p', 'nota', `não consegui ler: ${inv.erro}`));
+          return;
+        }
+        for (const sala of inv.salas) {
+          const nome = sala.com
+            ? `conversa com ${nomeDoPeer(sala.com)}`
+            : (((vista && vista.servidores) || []).find(x => x.id === sala.id) || {}).nome || chaveCurta(sala.id);
+          const partes = [`${sala.entradas} ${sala.entradas === 1 ? 'entrada' : 'entradas'}`, kb(sala.bytes)];
+          if (sala.extremos) partes.push(`de ${dataCurta(sala.extremos[0])} a ${dataCurta(sala.extremos[1])}`);
+          partes.push(`${sala.peers} ${sala.peers === 1 ? 'par' : 'pares'}`);
+          const linha = elemento('div', 'def__inv');
+          linha.append(elemento('b', null, nome), elemento('span', 'nota', ` · ${partes.join(' · ')}`));
+          if (sala.orfas > 0) {
+            linha.append(elemento('p', 'nota nota--aviso', paresLigados.size > 0
+              ? `${sala.orfas} a sincronizar — volta a ler daqui a uns segundos`
+              : `faltam-me ${sala.orfas} mensagens do meio do histórico — chegam quando o par que as tem se ligar`));
+          }
+          if (sala.ilegiveis > 0) {
+            linha.append(elemento('p', 'nota', `${sala.ilegiveis} linhas deste ficheiro não conferiram e estão em .rejeitadas`));
+          }
+          corpoInv.append(linha);
+        }
+        if (!inv.salas.length) corpoInv.append(elemento('p', 'nota', 'Ainda não há salas nem conversas guardadas.'));
+        corpoInv.append(elemento('p', 'nota',
+          `Pasta inteira: ${kb(inv.total)} · índice: ${kb(inv.indice_bytes)}. As datas são a hora do relógio de quem escreveu.`));
+        for (const [nomeF, bytes] of inv.quarentena) {
+          const porque = nomeF.includes('.estragado-') ? 'não abriu e ficou de lado'
+            : nomeF.endsWith('.rejeitadas') ? 'linhas que não conferem'
+              : 'uma conversa que apagaste — ainda está aqui';
+          corpoInv.append(elemento('p', 'nota', `${nomeF} (${kb(bytes)}): ${porque}`));
+        }
+        if (!inv.quarentena.length) corpoInv.append(elemento('p', 'nota', 'Nada posto de lado.'));
+      };
+      const reler = elemento('button', 'btn', 'Voltar a ler');
+      reler.onclick = lerInventario;
+      const acInv = elemento('div', 'caixa__acoes');
+      acInv.style.justifyContent = 'flex-start';
+      acInv.append(reler);
+      sInv.append(acInv);
+      painel.append(sInv);
+      await lerInventario();
 
       const s2 = seccao('O que a cifra protege — e o que não protege');
       const lista = elemento('div', 'aviso');
@@ -9547,6 +9608,24 @@ async function segundoCanalDeTexto(servidorId) {
         + ` espaco=${await tenta('https://a b')} ftp=${await tenta('ftp://x')}`);
     } catch (e) {
       diz(`ui ligacoes: REBENTOU ${e && e.message ? e.message : e}`);
+    }
+
+    // ---- O QUE ESTA GUARDADO (#21, #148) ----
+    try {
+      const inv = await invoke('inventario');
+      const entradas = inv.salas.reduce((a, x) => a + x.entradas, 0);
+      const orfas = inv.salas.reduce((a, x) => a + x.orfas, 0);
+      await abrirDefinicoes('dados');
+      await new Promise(r => setTimeout(r, 500));
+      const texto = $('#defs').textContent;
+      fecharDefinicoes();
+      diz(`ui dados guardados: salas=${inv.salas.length} entradas=${entradas} bytes=${inv.total} orfas=${orfas}`
+        + ` quarentena=${inv.quarentena.length} painel-tem-bytes=${texto.includes(kb(inv.total))}`
+        + ` painel-tem-entradas=${inv.salas.every(x => texto.includes(`${x.entradas} entrada`))}`
+        + ` bytes-por-sala>0=${inv.salas.every(x => x.bytes > 0)} indice>0=${inv.indice_bytes > 0}`
+        + ` painel-diz-quarentena=${/Nada posto de lado|ficou de lado|não conferem|apagaste/.test(texto)}`);
+    } catch (e) {
+      diz(`ui dados guardados: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------
