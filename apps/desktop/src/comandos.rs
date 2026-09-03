@@ -981,7 +981,10 @@ pub fn camara_recebida(peer: &str, dados: Vec<u8>) {
 // Oito argumentos porque um comando Tauri recebe os campos do invoke um a um; agrupar
 // em struct só empurrava a contagem para outro sítio sem tornar nada mais claro.
 #[allow(clippy::too_many_arguments)]
-pub fn comecar_a_partilhar(
+// `async` para sair da thread do event loop (revisão): desde o lote 4 este comando espera
+// até 6 s pelo formato do som, e antes disso já abria o dispositivo de som de forma
+// síncrona sem prazo. Não há `await` lá dentro — o que muda é a thread em que corre.
+pub async fn comecar_a_partilhar(
     servidor: String,
     canal_voz: String,
     fonte: String,
@@ -990,8 +993,8 @@ pub fn comecar_a_partilhar(
     debito: u32,
     com_som: bool,
     saida: Channel<InvokeResponseBody>,
-    ecra: State<Arc<Ecra>>,
-    rede: State<Arc<Rede>>,
+    ecra: State<'_, Arc<Ecra>>,
+    rede: State<'_, Arc<Rede>>,
     app: tauri::AppHandle,
 ) -> R<serde_json::Value> {
     let ecra = ecra.inner().clone();

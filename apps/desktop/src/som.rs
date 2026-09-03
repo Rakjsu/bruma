@@ -360,6 +360,10 @@ mod win {
         } else {
             match tentar_sem_eco(deve_parar) {
                 Ok(a) => return Ok(a),
+                // Uma activação interrompida pela PARAGEM não é «este Windows não sabe»
+                // (revisão): sem isto abria-se um cliente de endpoint para nada e saía um
+                // aviso de eco falso.
+                Err(e) if deve_parar() => return Err(e),
                 Err(e) => eprintln!(
                     "[som] este Windows não sabe captar só o som dos outros processos ({e}); \
                  a partilha vai levar a voz da chamada de volta"
@@ -479,15 +483,22 @@ mod win {
         };
         // O loopback de processo EXIGE o modo por evento; sem ele o `Initialize` recusa.
         let evento = CreateEventW(None, false, false, None)?;
-        cliente.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            2_000_000,
-            0,
-            &wfx,
-            None,
-        )?;
-        cliente.SetEventHandle(evento)?;
+        // Se o `Initialize` ou o `SetEventHandle` recusarem, o evento fecha-se aqui
+        // (revisão): na reabertura isto corre até cinco vezes por avaria.
+        let iniciado = cliente
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                2_000_000,
+                0,
+                &wfx,
+                None,
+            )
+            .and_then(|_| cliente.SetEventHandle(evento));
+        if let Err(e) = iniciado {
+            let _ = CloseHandle(evento);
+            return Err(e.into());
+        }
 
         Ok(Aberto {
             cliente,
@@ -529,6 +540,9 @@ mod win {
         // morrer de vez, o silêncio de recurso TEM de continuar deste ponto: recomeçar em
         // zero mandava amostras para trás no tempo e partia a linha de quem recebe.
         cursor: &std::sync::atomic::AtomicU64,
+        // Chamado com o formato de cada REABERTURA (#109): é por aqui que se fica a saber
+        // que o som voltou com eco.
+        reaberto_com: &dyn Fn(Formato),
     ) -> Result<()> {
         unsafe {
             // O `loopback` é COM puro; sem isto o CoCreateInstance falha na thread nova.
@@ -597,10 +611,16 @@ mod win {
             // O dispositivo de som não morre a pedido, e um ramo que nunca corre é um
             // ramo por verificar — sobretudo este, que durante versões transformou uma
             // avaria em silêncio perfeito. `BRUMA_SOM_MORRE=N` mata-o UMA vez ao fim de N
-            // segundos; `BRUMA_SOM_NAO_VOLTA=k` recusa as primeiras k reaberturas.
+            // segundos; `BRUMA_SOM_NAO_VOLTA=k` recusa as primeiras k reaberturas (zero
+            // sem a bandeira — a release reabre sempre).
             let morre_aos = crate::bandeiras::som_morre_aos();
             let mut morreu = false;
             let mut recusar = crate::bandeiras::som_nao_volta();
+            // AS CINCO TENTATIVAS SÃO POR AVARIA, não por reabertura (revisão): um
+            // dispositivo que abre e morre logo a seguir não pode girar para sempre. O
+            // contador só volta a zero quando o cliente reaberto viveu cinco segundos.
+            let mut tentativa = 0u32;
+            let mut reabriu_em: Option<std::time::Instant> = None;
 
             while !deve_parar() {
                 let volta = if morre_aos.is_some_and(|s| !morreu && inicio.elapsed().as_secs() >= s)
@@ -631,7 +651,9 @@ mod win {
                     let _ = CloseHandle(h);
                 }
                 let mut reaberto = None;
-                let mut tentativa = 0u32;
+                if reabriu_em.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+                    tentativa = 0;
+                }
                 while tentativa < 5 && !deve_parar() {
                     tentativa += 1;
                     let espera = 250u64 << (tentativa - 1);
@@ -642,8 +664,11 @@ mod win {
                         break;
                     }
                     if recusar > 0 {
+                        // Só com a bandeira de teste; sem ela `recusar` é zero. O nome da
+                        // bandeira não entra nesta linha: ela é código VIVO na release, e o
+                        // portão dos andaimes procura os nomes no binário.
                         recusar -= 1;
-                        eprintln!("[som] reabertura recusada, a pedido (BRUMA_SOM_NAO_VOLTA)");
+                        eprintln!("[som] reabertura recusada, a pedido (bandeira de teste)");
                         continue;
                     }
                     match abrir_cliente(deve_parar) {
@@ -664,6 +689,11 @@ mod win {
                     }
                 }
                 let Some(a) = reaberto else {
+                    // A paragem foi PEDIDA a meio da reabertura (revisão): não é uma
+                    // avaria, e não se avisa «vai sem som» sobre uma partilha que acabou.
+                    if deve_parar() {
+                        break;
+                    }
                     return Err(anyhow!(
                         "o som não voltou ao fim de {tentativa} tentativas: {erro}"
                     ));
@@ -672,8 +702,24 @@ mod win {
                 forma = a.forma;
                 canais_crus = a.canais_crus;
                 evento = a.evento;
-                captura = cliente.GetService()?;
-                cliente.Start()?;
+                // Se o cliente reaberto não arranca, o evento dele não fica a fugir (revisão).
+                let pronto = cliente
+                    .GetService::<IAudioCaptureClient>()
+                    .and_then(|c| cliente.Start().map(|_| c));
+                captura = match pronto {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if let Some(h) = evento.take() {
+                            let _ = CloseHandle(h);
+                        }
+                        return Err(e.into());
+                    }
+                };
+                reabriu_em = Some(std::time::Instant::now());
+                // Se voltou pelo caminho COM eco (o loopback de processo falhou e o de
+                // endpoint abriu), quem chama tem de o saber — o aviso do eco só tinha
+                // saído na primeira abertura.
+                reaberto_com(a.formato);
                 // O buraco da reabertura enche-se AGORA, para o som que vem a seguir cair
                 // no instante certo e não adiantado.
                 encher_ate_agora(inicio, ritmo, &mut entregues, cursor, &mut entrega);
@@ -948,6 +994,7 @@ mod win {
                 }
             },
             &std::sync::atomic::AtomicU64::new(0),
+            &|_| {},
         )?;
         Ok((
             if n > 0 { (soma / n as f64).sqrt() } else { 0.0 },
@@ -987,6 +1034,7 @@ mod win {
                 }
             },
             &std::sync::atomic::AtomicU64::new(0),
+            &|_| {},
         )?;
         let s = inicio.elapsed().as_secs_f64().max(0.001);
         let f = formato.ok_or_else(|| anyhow!("o dispositivo não disse o formato"))?;
@@ -1030,6 +1078,7 @@ mod win {
         _anunciar: impl FnOnce(Formato),
         _entrega: impl FnMut(Bocado),
         _cursor: &std::sync::atomic::AtomicU64,
+        _reaberto_com: &dyn Fn(Formato),
     ) -> Result<()> {
         Err(anyhow!(
             "o som do sistema por enquanto só existe no Windows"
@@ -1060,6 +1109,9 @@ mod win {
 }
 
 pub use win::{captar, medir, medir_curto, quem_toca, sessoes};
+
+/// O que se diz quando o som vai COM eco — na primeira abertura e em cada reabertura.
+const AVISO_DO_ECO: &str = "Esta versão do Windows não deixa separar o som da app do resto,                          por isso a partilha vai levar de volta a voz de quem está na                          chamada. Podes desligar o som da transmissão na engrenagem.";
 
 /// Lança a captura numa thread própria, ancorada em `origem`.
 ///
@@ -1092,7 +1144,7 @@ pub fn arrancar(
             |f: Formato| {
                 anunciado = Some(f);
                 if !f.sem_eco {
-                    avisa_eco("Esta versão do Windows não deixa separar o som da app do resto,                          por isso a partilha vai levar de volta a voz de quem está na                          chamada. Podes desligar o som da transmissão na engrenagem.".into());
+                    avisa_eco(AVISO_DO_ECO.into());
                 }
                 if let Some(a) = anunciar.take() {
                     a(Some(f));
@@ -1100,6 +1152,11 @@ pub fn arrancar(
             },
             &mut entrega,
             &cursor,
+            &|f: Formato| {
+                if !f.sem_eco {
+                    avisa_eco(AVISO_DO_ECO.into());
+                }
+            },
         );
         match (resultado, anunciado) {
             (Ok(()), _) => {}
@@ -1110,6 +1167,11 @@ pub fn arrancar(
                 if let Some(a) = anunciar.take() {
                     a(None);
                 }
+            }
+            (Err(_), Some(_)) if deve_parar() => {
+                // A partilha parou enquanto o som se reabria (revisão): não há aviso nem
+                // silêncio a fabricar para uma partilha que já não existe.
+                eprintln!("[som] a captura acabou com a partilha, a meio de uma reabertura");
             }
             (Err(e), Some(formato)) => {
                 eprintln!("[som] a captura do som falhou: {e:#}; a faixa segue em silêncio");

@@ -2750,14 +2750,22 @@ function imagemDaCamaraParada(chave) {
 
 /* O relógio da câmara parada: um tique por segundo, a mexer SÓ nas etiquetas — redesenhar
  * o painel todo a cada segundo mataria a pré-visualização. O modelo é o `medirFala`. */
+let desenhosDeVoz = 0;   // medição: quantas vezes o painel foi redesenhado
 setInterval(() => {
   if (!voz.canal) return;
+  // SÓ os cartões e as fotinhas (revisão): o `data-chave` também está nas linhas de
+  // membros, de conversas e de amigos, que nunca levam a classe — e a comparação dava
+  // «mudou» em todas, ou seja, um `desenharVoz()` por segundo enquanto durasse a paragem.
+  // Redesenha-se UMA vez por tique, e só quando um cartão mudou de estado.
+  let mudou = false;
   for (const chave of voz.comCamara) {
     if (chave === voz.eu) continue;
     const agora = imagemDaCamaraParada(chave);
-    document.querySelectorAll(`[data-chave="${chave}"]`).forEach(el => {
-      const tinha = el.classList.contains('tile--sem-imagem');
-      if (!!agora !== tinha) { desenharVoz(); return; }
+    document.querySelectorAll(`.tile[data-chave="${chave}"], .mini[data-chave="${chave}"]`).forEach(el => {
+      const marca = el.querySelector('.tile__sem-imagem, .mini__vivo');
+      const tinha = el.classList.contains('tile--sem-imagem')
+        || (!!marca && /sem imagem/i.test(marca.textContent));
+      if (!!agora !== tinha) { mudou = true; return; }
       if (agora) {
         el.querySelectorAll('.tile__sem-imagem, .mini__vivo').forEach(sp => {
           if (/sem imagem/i.test(sp.textContent)) {
@@ -2768,6 +2776,7 @@ setInterval(() => {
       }
     });
   }
+  if (mudou) desenharVoz();
 }, 1000);
 
 /** Se este pedaço traz um SPS — ou seja, se é um frame que se descodifica sozinho.
@@ -4062,7 +4071,7 @@ async function sairDeVoz(anunciar = true) {
   voz.entendeSom.clear();
   voz.jaFalou.clear();
   voz.aVer = null;
-  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
+  voz.micro = null; voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear(); partilhaAvisos.clear();
   voz.canal = null;
   // O CONTEXTO DE SAÍDA FECHA-SE E ESQUECE-SE (#38).
   //
@@ -4813,7 +4822,7 @@ async function alternarEcra() {
     await invoke('parar_de_partilhar').catch(() => {});
     if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
     if (voz.aVer === voz.eu) voz.aVer = null;
-    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
+    voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear(); partilhaAvisos.clear();
     voz.aSerVistoPor.clear();   // parar de transmitir acaba com os pedidos de assistir
     anunciarEstado();
     desenharVoz();
@@ -4837,7 +4846,7 @@ function separarErroDePartilha(e) {
 function partilhaMorreu(razao) {
   if (voz.vejoMeuEcra) { voz.vejoMeuEcra.fechar(); voz.vejoMeuEcra = null; }
   if (voz.aVer === voz.eu) voz.aVer = null;
-  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear();
+  voz.ecra = null; voz.ecraTamanho = null; voz.qualidadeEmUso = null; voz.ritmoMedido = null; voz.relatorios.clear(); partilhaAvisos.clear();
   voz.aSerVistoPor.clear();   // a partilha caiu: os pedidos de assistir caem com ela
   partilhaFalhou = razao;
   invoke('capacidades', { linha: `partilha-falhou chegou a UI: ${razao}` }).catch(() => {});
@@ -5485,6 +5494,7 @@ function accoesDoPainel(chave, { transmite, aVer, temVideo }) {
 }
 
 function desenharVoz() {
+  desenhosDeVoz += 1;
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
   // A vista de voz vive no modo servidor. Sem esta condição ela lia o `canalAtual` velho —
@@ -5801,6 +5811,9 @@ function receberAvisoDaPartilha(payload) {
   const objecto = payload && typeof payload === 'object';
   const chave = objecto ? String(payload.chave || 'geral') : 'geral';
   const texto = objecto ? String(payload.texto || '') : String(payload || '');
+  // Um aviso NOVO sem partilha em curso é de uma partilha que já acabou (a thread do som
+  // a queixar-se depois do parar, revisão): ignora-se. Retirar, retira-se sempre.
+  if (texto && !voz.ecra) return;
   if (texto) partilhaAvisos.set(chave, texto); else partilhaAvisos.delete(chave);
   console.warn('aviso da partilha:', chave, texto || '(retirado)');
   desenharRodape();
@@ -5814,11 +5827,23 @@ listen('partilha-aviso', ev => receberAvisoDaPartilha(ev.payload));
 
 /** O ritmo medido da captura (#113): frames por segundo que saem MESMO, não os pedidos. */
 let ritmosRegistados = null;   // o autoteste liga isto para os guardar
+let ultimoIpsAnunciado = null;
+let ultimoAnuncioDeRitmoEm = 0;
 listen('partilha-ritmo', ev => {
   const r = ev.payload && typeof ev.payload === 'object' ? ev.payload : null;
   if (!r) return;
   voz.ritmoMedido = { ips: Number(r.ips) || 0, largados: Number(r.largados) || 0, s: Number(r.s) || 0 };
   if (ritmosRegistados) ritmosRegistados.push(voz.ritmoMedido.ips);
+  // Quem assiste vê o rótulo que o `estado` lhe mandou (revisão): sem isto ficava com a
+  // fotografia do ritmo do momento em que a partilha começou. Anuncia-se de novo quando o
+  // número arredondado muda, no máximo de 5 em 5 s.
+  const arredondado = Math.round(voz.ritmoMedido.ips);
+  if (voz.ecra && arredondado !== ultimoIpsAnunciado
+      && performance.now() - ultimoAnuncioDeRitmoEm > 5000) {
+    ultimoIpsAnunciado = arredondado;
+    ultimoAnuncioDeRitmoEm = performance.now();
+    anunciarEstado();
+  }
   // O selo da qualidade muda NO SÍTIO, sem redesenhar o palco.
   const selo = document.querySelector('.palco__selo[data-qualidade]');
   if (selo && voz.aVer === voz.eu) {
@@ -5844,6 +5869,12 @@ let partilhaFalhou = null;
  *  descodificador de vídeo dele aberto para sempre a segurar memória.
  */
 function esquecerOQueEleMandava(peer) {
+  // Se era ele que estávamos a ver, o palco não fica num fantasma (revisão).
+  if (voz.aVer === peer) {
+    voz.aVer = null;
+    pausaPorEscondida = null;
+    recusaDe.delete(peer);
+  }
   fecharFluxoRecebido(peer);
   // A câmara também. Quem cai da rede não chega a anunciar que a desligou, e sem isto o
   // descodificador dele ficava aberto para sempre a segurar memória de vídeo — numa sala
@@ -6408,6 +6439,12 @@ function assistir(peer) {
     invoke('ver_meu_ecra').catch(() => {});
     return;
   }
+  // Um fluxo AVARIADO desta pessoa não se reaproveita (revisão): o `empurrar` dele
+  // deita fora tudo, cabeçalho novo incluído, e «Voltar à sala → Assistir» nunca mais
+  // dava imagem. Fecha-se e nasce outro com o cabeçalho que vem a seguir.
+  const velho = fluxosRecebidos.get(peer);
+  if (velho && velho.estado && velho.estado().avaria) fecharFluxoRecebido(peer);
+  recusaDe.delete(peer);
   // Quem transmite tem de saber que estou a ver: é essa lista que decide o que sai da
   // máquina dele. Sem isto o ecrã era codificado para ninguém.
   sinalizar(peer, { tipo: 'assistir', ligado: true });
@@ -6417,7 +6454,13 @@ function assistir(peer) {
 function pararDeAssistir() {
   pausaPorEscondida = null;
   if (voz.aVer === voz.eu) deixarDeVerOMeu();
-  else if (voz.aVer) sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+  else if (voz.aVer) {
+    sinalizar(voz.aVer, { tipo: 'assistir', ligado: false });
+    // O fluxo fecha-se com o pedido: quem partilha deixa de mandar, e voltar a assistir
+    // traz um cabeçalho novo para um fluxo novo — um segundo `moov` num MediaSource
+    // aberto não é coisa que se queira em produção.
+    fecharFluxoRecebido(voz.aVer);
+  }
   voz.aVer = null;
   desenharVoz();
 }
@@ -8468,6 +8511,38 @@ function pararDeAssistir() {
     desenharVoz();
   } catch (e) {
     diz(`ui relatorio de volta: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O RELOGIO DA CAMARA PARADA NAO REDESENHA O PAINEL (revisao da fase 7) ----
+  try {
+    const CH = 'outro1';
+    const antes = { canal: voz.canal, eu: voz.eu, servidor: voz.servidor, srv: servidorAtual, cnl: canalAtual };
+    let srv = vista.servidores.find(x => x.canais.some(c => c.tipo === 'voz'));
+    if (!srv) {
+      const id = await invoke('criar_servidor', { nome: 'medicao' });
+      await invoke('criar_canal', { servidor: id, nome: 'palco', tipo: 'voz' });
+      await desenharTudo();
+      srv = vista.servidores.find(x => x.id === id);
+    }
+    const cv = srv.canais.find(c => c.tipo === 'voz');
+    servidorAtual = srv.id; canalAtual = cv.id;
+    voz.eu = voz.eu || 'eueueu'; voz.canal = cv.id; voz.servidor = srv.id;
+    voz.presentes.set(CH, cv.id);
+    voz.comCamara.add(CH);
+    const c = camaraDe(CH);
+    c.ultimoFrameEm = performance.now() - (CAMARA_PARADA_MS + 1500);
+    desenharVoz();   // a transicao: o cartao passa a «sem imagem»
+    const n0 = desenhosDeVoz;
+    await new Promise(r => setTimeout(r, 2600));   // dois a tres tiques do relogio
+    const redesenhos = desenhosDeVoz - n0;
+    const rotulo = (document.querySelector(`.tile[data-chave="${CH}"] .tile__sem-imagem`) || {}).textContent || '';
+    voz.comCamara.delete(CH); fecharCamaraRecebida(CH); voz.presentes.delete(CH);
+    Object.assign(voz, { eu: antes.eu, canal: antes.canal, servidor: antes.servidor });
+    servidorAtual = antes.srv; canalAtual = antes.cnl;
+    desenharVoz();
+    diz(`ui camara parada sem redesenhar: redesenhos-em-2.6s=${redesenhos} rotulo="${rotulo}"`);
+  } catch (e) {
+    diz(`ui camara parada sem redesenhar: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----

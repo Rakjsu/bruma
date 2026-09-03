@@ -321,6 +321,8 @@ pub struct Contagem {
     /// «sem espectadores não sai um byte de ecrã» (#71) não se conseguia medir com a câmara
     /// ligada.
     pub camara_env: u64,
+    /// Frames de câmara cortados por atraso, à parte dos de ecrã (`video_cortado`).
+    pub camara_cortada: u64,
     /// A fotografia da ligação de há um segundo, para os ritmos do caminho (#115): quando,
     /// bytes UDP enviados, pacotes perdidos.
     amostra_do_caminho: Option<(std::time::Instant, u64, u64)>,
@@ -337,6 +339,14 @@ impl Contagem {
     /// `stats`: só se lê deles, nunca se constrói nenhum.
     pub fn recalcular_caminho(&mut self, agora: std::time::Instant, tx_bytes: u64, perdidos: u64) {
         match self.amostra_do_caminho {
+            // Os contadores são da LIGAÇÃO e recomeçam em zero numa religação; a fotografia
+            // é da `Contagem`, que sobrevive. Um total mais pequeno do que a fotografia é
+            // uma ligação nova: recomeça-se a medir em vez de dizer «0 kbit/s» (revisão).
+            Some((_, tx0, p0)) if tx_bytes < tx0 || perdidos < p0 => {
+                self.amostra_do_caminho = Some((agora, tx_bytes, perdidos));
+                self.tx_kbps = None;
+                self.perdidos_s = None;
+            }
             Some((quando, tx0, p0)) => {
                 let dt = agora.duration_since(quando).as_secs_f64();
                 if dt >= 1.0 {
@@ -2470,7 +2480,16 @@ async fn sessao(
                                 .unwrap_or(false);
                             if atrasado {
                                 if let Ok(mut n) = rede.contagem.lock() {
-                                    n.entry(peer.clone()).or_default().video_cortado += 1;
+                                    // O corte conta-se por tipo (revisão): o `video_cortado`
+                                    // somava ecrã e câmara enquanto o `ecra_env` já era só
+                                    // ecrã, e a percentagem do aviso de rede inflacionava
+                                    // com a câmara ligada.
+                                    let e = n.entry(peer.clone()).or_default();
+                                    if tipo == "ecra" {
+                                        e.video_cortado += 1;
+                                    } else {
+                                        e.camara_cortada += 1;
+                                    }
                                 }
                                 None
                             } else {

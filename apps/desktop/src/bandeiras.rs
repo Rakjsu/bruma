@@ -284,19 +284,20 @@ pub fn sem_chave_a_pedido() -> bool {
     false
 }
 
-/// Quantas reaberturas do som são recusadas de propósito (#109), depois de uma morte
-/// pedida com `BRUMA_SOM_MORRE`. Sem a bandeira, TODAS — é o que faz «vai sem som» sair,
-/// como antes. Com `0`, a primeira tentativa já volta; com `2`, a terceira.
+/// Quantas reaberturas do som são recusadas de propósito (#109). Sem a bandeira, NENHUMA:
+/// o valor neutro é zero. A primeira versão devolvia `u64::MAX` como neutro — e com isso a
+/// release recusava as cinco reaberturas «a pedido» sem ninguém ter pedido, e o som nunca
+/// voltava: a revisão da Fase 7 apanhou-o. Com `5`, as cinco falham e sai «vai sem som».
 #[cfg(debug_assertions)]
 pub fn som_nao_volta() -> u64 {
     std::env::var("BRUMA_SOM_NAO_VOLTA")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(u64::MAX)
+        .unwrap_or(0)
 }
 #[cfg(not(debug_assertions))]
 pub fn som_nao_volta() -> u64 {
-    u64::MAX
+    0
 }
 
 /// O `moof` segue CRU, sem a tradução para o dialecto do MSE (#43): é o que acontecia a

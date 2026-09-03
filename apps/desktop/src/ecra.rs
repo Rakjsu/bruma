@@ -1068,6 +1068,15 @@ mod win {
                     ritmo(ips, largados, s);
                 }
             }
+            // Ao sair, os avisos que ficaram de pé retiram-se (revisão): «ainda não chegou
+            // imagem nenhuma» colado ao botão depois de parar era o aviso de uma partilha
+            // que já não existe.
+            if avisou_imagem {
+                aviso("imagem", String::new());
+            }
+            if avisou_codificador {
+                aviso("codificador", String::new());
+            }
             // AS DUAS SAÍDAS DESTE LAÇO NÃO SÃO A MESMA COISA (#39).
             //
             // `vigia` a `true` é uma paragem PEDIDA — a pessoa carregou no botão, ou uma
