@@ -57,6 +57,14 @@ let canalAtual = null;
 let modo = 'servidor';
 let conversaAtual = null;
 let ligados = 0;
+/** QUEM ESTÁ LIGADO A MIM, por chave (#97). O Rust manda a lista inteira a cada mudança do
+ *  mapa de ligações (`peers-ligados`) e, no arranque e ao voltar à janela, pede-se-lhe a
+ *  verdade (`ligacoes`) em vez de se inferir. «Ligado» é «há uma ligação QUIC de pé com
+ *  esta pessoa» — não «está a ver a sala», e nunca «online». */
+const paresLigados = new Set();
+function estaLigado(chave) {
+  return !!vista && (chave === vista.chave || paresLigados.has(chave));
+}
 
 /* ---------- identicons: a chave pública desenhada ---------- */
 
@@ -239,6 +247,9 @@ function desenharConversas() {
     const l = elemento('div', 'member');
     if (c.id === conversaAtual) l.classList.add('is-active');
     l.dataset.chave = c.com;
+    const ligado = estaLigado(c.com);
+    l.classList.toggle('is-off', !ligado);
+    l.title = ligado ? 'ligado a ti agora' : 'não está ligado a ti agora — o que escreveres fica aqui até abrir o Bruma';
     const av = elemento('span', 'ident');
     pintar(av, c.com);
     const txt = elemento('span');
@@ -352,9 +363,14 @@ function desenharMembros() {
   if (!s) return;
   $('#contagem-membros').textContent =
     s.membros.length === 1 ? '1 membro' : `${s.membros.length} membros`;
-  for (const m of s.membros) {
+  // Os ligados primeiro, em ordem estável; os outros a meia-luz, com o porquê no `title`.
+  const membros = [...s.membros].sort((a, b) => Number(estaLigado(b.chave)) - Number(estaLigado(a.chave)));
+  for (const m of membros) {
     const linha = elemento('div', 'member');
     linha.dataset.chave = m.chave;
+    const ligado = estaLigado(m.chave);
+    linha.classList.toggle('is-off', !ligado);
+    linha.title = ligado ? 'ligado a ti agora' : 'não está ligado a ti agora';
     if (voz.falando.has(m.chave)) linha.classList.add('a-falar');
     const av = elemento('span', 'ident');
     pintar(av, m.chave);
@@ -863,6 +879,25 @@ async function desenharAmigos(stream) {
   }
 }
 
+/** Quem DESTA sala está ligado a mim (#97) — e não «quantas ligações tenho», que somava
+ *  gente de outras salas e da lista de amigos e dava «1 ligado» numa sala onde não estava
+ *  ninguém. Devolve os membros ligados e o texto do chip. */
+function ligadosDaSala(s) {
+  const k = (s ? s.membros : []).filter(m => m.chave !== vista.chave && paresLigados.has(m.chave));
+  const nomes = k.map(m => nomeDoPeer(m.chave));
+  const texto = k.length === 0 ? 'ninguém desta sala'
+    : k.length === 1 ? `${nomes[0]} está ligado`
+      : `${k.length} desta sala ligados`;
+  const title = k.length ? `Ligados a ti agora: ${nomes.join(', ')}` : 'Ninguém desta sala está ligado a ti agora';
+  return { membros: k, texto, title };
+}
+
+function pintarChipDosLigados(texto, title, aceso) {
+  $('#rotulo-peers').textContent = texto;
+  $('#chip-peers').title = title;
+  $('#chip-peers').querySelector('.dot').className = aceso ? 'dot dot--ok' : 'dot';
+}
+
 function desenharTopo() {
   if (modo === 'privado') {
     const c = conversa();
@@ -874,8 +909,21 @@ function desenharTopo() {
     // Não há convite para uma conversa, e é de propósito: o que a abre são as duas chaves,
     // e não um segredo que se possa reencaminhar a um terceiro.
     $('#btn-convite').style.display = 'none';
-    $('#rotulo-peers').textContent = ligados === 1 ? '1 ligado' : `${ligados} ligados`;
-    $('#chip-peers').querySelector('.dot').className = ligados > 0 ? 'dot dot--ok' : 'dot';
+    if (c) {
+      const on = paresLigados.has(c.com);
+      pintarChipDosLigados(
+        on ? `${c.nome} está ligado` : `${c.nome} não está ligado`,
+        on ? 'Ligado a ti agora.' : 'O que escreveres fica aqui até ele abrir o Bruma.',
+        on,
+      );
+    } else {
+      const n = paresLigados.size;
+      pintarChipDosLigados(
+        n === 0 ? 'ninguém ligado' : n === 1 ? '1 ligado a ti' : `${n} ligados a ti`,
+        'Ligações abertas neste momento, por qualquer sala ou conversa.',
+        n > 0,
+      );
+    }
     return;
   }
   const s = servidor();
@@ -884,8 +932,8 @@ function desenharTopo() {
   $('#nome-canal').textContent = canal ? canal.nome : '—';
   $('#glifo-canal').textContent = canal && canal.tipo === 'voz' ? '♪' : '#';
   $('#btn-convite').style.display = s ? '' : 'none';
-  $('#rotulo-peers').textContent = ligados === 1 ? '1 ligado' : `${ligados} ligados`;
-  $('#chip-peers').querySelector('.dot').className = ligados > 0 ? 'dot dot--ok' : 'dot';
+  const l = ligadosDaSala(s);
+  pintarChipDosLigados(l.texto, l.title, l.membros.length > 0);
 }
 
 async function desenharTudo() {
@@ -3641,6 +3689,9 @@ const paresPerdidos = new Set();
  * numa substituicao de ligacao chegava a soma sem a subtraccao. Numa sala de duas pessoas o
  * maximo tem de ser 1; qualquer coisa acima disso e o saldo a mentir. */
 let ligadosMax = 0;
+// Para o `--par` (#97): o pior que a lista de membros mostrou, e cada texto que o chip teve.
+let offVistoMax = 0;
+const chipsVistos = new Set();
 let jaSePerdeu = false;
 let jaVoltou = false;
 
@@ -3680,8 +3731,10 @@ function quedaDe(chave) {
  * sempre no painel, com o microfone a codificar para uma chave que já não existia e o ecrã
  * a ser enviado para ninguém. O `peer-desligado` só mexia no contador.
  */
-listen('peers-ligados', ev => {
-  const vivos = new Set(Array.isArray(ev.payload) ? ev.payload : []);
+function aplicarLigados(lista) {
+  const vivos = new Set(lista);
+  paresLigados.clear();
+  for (const chave of vivos) paresLigados.add(chave);
   ligados = vivos.size;
   if (ligados > ligadosMax) ligadosMax = ligados;
 
@@ -3714,6 +3767,11 @@ listen('peers-ligados', ev => {
   }
 
   desenharTopo();
+  // A lista de membros (e, no modo privado, a de conversas) diz quem está ligado (#97).
+  desenharMembros();
+  if (modo === 'privado') desenharCanais();
+  offVistoMax = Math.max(offVistoMax, document.querySelectorAll('#lista-membros .member.is-off').length);
+  chipsVistos.add($('#rotulo-peers').textContent);
   if (mexeu) {
     // Quem voltou é ESPECTADOR NOVO outra vez (#52): o `definir_espectadores` só manda o
     // cabeçalho a quem não estava na lista, e sem isto quem religasse ficava com o ecrã
@@ -3722,7 +3780,17 @@ listen('peers-ligados', ev => {
     desenharVoz();
     desenharRodape();
   }
-});
+}
+
+listen('peers-ligados', ev => aplicarLigados(Array.isArray(ev.payload) ? ev.payload : []));
+
+/** A verdade do Rust em vez da inferência (#97): a rede arranca ANTES de a webview
+ *  registar o ouvinte, e uma sessão que suba nessa janela anunciava para ninguém. No
+ *  arranque e ao voltar à janela pede-se o mapa — e SUBSTITUI-SE, não se acrescenta. */
+async function semearLigados() {
+  const l = await invoke('ligacoes').catch(() => null);
+  if (Array.isArray(l)) aplicarLigados(l.map(x => x.peer));
+}
 
 /* ---------- explicações: o porquê vive na app ---------- */
 
@@ -3745,7 +3813,7 @@ const EXPLICACOES = {
   caminho: {
     titulo: 'Quem está ligado',
     corpo: [
-      'Não há servidor. Isto conta quantos membros estão ligados a ti <b>neste momento</b>, diretamente.',
+      'Não há servidor. Isto conta os membros <b>desta sala</b> que estão ligados a ti <b>neste momento</b>, diretamente. Podes estar ligado a mais gente por outras salas ou pela lista de amigos — vê em «Como isto se liga».',
       'É com eles que o teu histórico sincroniza. Se não houver ninguém ligado, nada de novo chega — e nada do que escreveres sai daqui até alguém aparecer.',
     ],
   },
@@ -3774,6 +3842,21 @@ const EXPLICACOES = {
 };
 
 const painelExplica = $('#explica');
+/** Um instantâneo, não um monitor (#97): ao abrir a explicação do chip pergunta-se ao Rust
+ *  o caminho e a latência de cada pessoa desta sala (ou da conversa) — sem temporizador. */
+async function juntarLatencias(corpo) {
+  const c = modo === 'privado' ? conversa() : null;
+  const gente = c ? (paresLigados.has(c.com) ? [c.com] : []) : ligadosDaSala(servidor()).membros.map(m => m.chave);
+  if (!gente.length) return;
+  const q = await invoke('qualidade', { peers: gente }).catch(() => []);
+  if (painelExplica.hidden || painelExplica.dataset.chave !== 'caminho') return;
+  for (const e of Array.isArray(q) ? q : []) {
+    const via = e.morta ? 'ligação a cair' : e.caminho === 'relay' ? 'por um relay' : e.caminho === 'directa' ? 'directa' : 'caminho por confirmar';
+    const ms = typeof e.ms === 'number' ? ` · ${Math.round(e.ms)} ms` : '';
+    corpo.append(elemento('p', 'nota', `${nomeDoPeer(e.peer)} — ${via}${ms} (agora)`));
+  }
+}
+
 function mostrarExplicacao(chave, ancora) {
   const e = EXPLICACOES[chave];
   if (!e) return;
@@ -3790,6 +3873,7 @@ function mostrarExplicacao(chave, ancora) {
     b.onclick = () => { esconderExplicacao(); abrirDefinicoes(); };
     corpo.append(b);
   }
+  if (chave === 'caminho') juntarLatencias(corpo);
   painelExplica.hidden = false;
   const r = ancora.getBoundingClientRect();
   const largura = painelExplica.offsetWidth;
@@ -5450,6 +5534,9 @@ let gentePorBaixoOculta = false;
 window.addEventListener('focus', () => {
   janelaComFoco = true;
   if (voz.aVer) desenharVoz();
+  // O que o Rust sabe das ligações, ao voltar (#97): uma sessão que caiu e voltou enquanto a
+  // janela esteve atrás já foi anunciada; isto só garante que a lista e o Rust batem certo.
+  semearLigados();
   // Voltar à janela é ver o canal que lá está (#27).
   const d = destinoDeLeitura();
   if (d) darPorLido(d.servidor, d.canal);
@@ -6777,6 +6864,8 @@ function pararDeAssistir() {
   arranque.contadoresAntes = await invoke('contadores').catch(() => null);
   voz.eu = await invoke('meu_endereco').catch(() => null);
   await desenharTudo();
+  // Quem já está ligado, pela verdade do Rust (#97): a rede arrancou antes desta linha.
+  semearLigados();
   // A fotografia do que JÁ estava por ler, agora e não na primeira mensagem que chegar.
   // Estava a ser tirada dentro do `talvezAvisar`, que só corre no `servidor-mudou` — logo a
   // primeira mensagem de cada sessão servia de base e nunca avisava. Numa app de mensagens,
@@ -7549,6 +7638,9 @@ async function segundoCanalDeTexto(servidorId) {
         // ser 1: acima disso e o contador a somar eventos que nao se anulam.
         + ` | ligados=${ligados} max=${ligadosMax} perdidos=${paresPerdidos.size}`
         + ` caiu=${jaSePerdeu} voltou=${jaVoltou}`
+        + ` off-na-lista=${document.querySelectorAll('#lista-membros .member.is-off').length}`
+        + ` chip="${$('#rotulo-peers').textContent}" off-max=${offVistoMax}`
+        + ` chips=${JSON.stringify([...chipsVistos])}`
         + [...relogioDaQueda.entries()]
           .filter(([, q]) => q.caiuEm)
           .map(([k, q]) => ` religou ${k.slice(0, 6)}: presenca=${q.voltouEm || '?'}ms`
@@ -8594,6 +8686,76 @@ async function segundoCanalDeTexto(servidorId) {
     diz('ui seletor: NAO ABRIU');
   }
   fechar('veu-fontes');
+
+  // ---- QUEM ESTA LIGADO: por sala, na lista, e com a verdade do Rust (#97) ----
+  try {
+    const pausa = ms => new Promise(r => setTimeout(r, ms));
+    const primeiro = (vista.servidores || [])[0];
+    if (!primeiro) {
+      diz('ui ligados na lista: sem servidor para medir');
+    } else {
+      const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual };
+      fecharDefinicoes();
+      escolherServidor(primeiro.id);
+      await pausa(500);
+      // Depois do redesenho, para o servidor fabricado ser o que a `vista` tem AGORA.
+      const s = vista.servidores.find(x => x.id === servidorAtual);
+      const FAB = 'ab'.repeat(32), ESTRANHO = 'cd'.repeat(32);
+      s.membros.push({ chave: FAB, nome: 'fabricado' });
+      vista.conversas = vista.conversas || [];
+      vista.conversas.push({ id: 'conversa-fabricada', com: ESTRANHO, nome: 'outro', canal: 'conversa', nao_lidos: 0 });
+
+      aplicarLigados([]);
+      const offSem = document.querySelectorAll('#lista-membros .member.is-off').length;
+      const euOff = !!document.querySelector(`#lista-membros .member[data-chave="${vista.chave}"].is-off`);
+      const chipNinguem = $('#rotulo-peers').textContent;
+      aplicarLigados([FAB]);
+      const offCom = document.querySelectorAll('#lista-membros .member.is-off').length;
+      const chipMembro = $('#rotulo-peers').textContent;
+      const pontoMembro = $('#chip-peers').querySelector('.dot').classList.contains('dot--ok');
+      // Os ligados (eu incluido) antes de qualquer `.is-off`: nenhum apagado seguido de um aceso.
+      const classes = [...document.querySelectorAll('#lista-membros .member')].map(n => n.classList.contains('is-off'));
+      const ligadosPrimeiro = !classes.some((off, i) => off && classes.slice(i).includes(false));
+      // Uma chave ligada que NAO e membro desta sala: o chip de hoje dizia «1 ligado».
+      aplicarLigados([ESTRANHO]);
+      const chipEstranho = $('#rotulo-peers').textContent;
+      const pontoEstranho = $('#chip-peers').querySelector('.dot').classList.contains('dot--ok');
+      const noSet = paresLigados.size;
+
+      // Modo privado, com a conversa fabricada.
+      modo = 'privado'; conversaAtual = 'conversa-fabricada';
+      desenharCanais(); desenharTopo();
+      const convOn = !document.querySelector(`#lista-canais .member[data-chave="${ESTRANHO}"].is-off`);
+      const chipConvOn = $('#rotulo-peers').textContent;
+      aplicarLigados([]);
+      const convOff = !!document.querySelector(`#lista-canais .member[data-chave="${ESTRANHO}"].is-off`);
+      const chipConvOff = $('#rotulo-peers').textContent;
+      modo = antes.modo; conversaAtual = antes.conv;
+
+      // A semente do Rust SUBSTITUI o que ca estava.
+      paresLigados.add('fabricada');
+      await semearLigados();
+      const sobreviveu = paresLigados.has('fabricada');
+      const doRust = (await invoke('ligacoes').catch(() => [])).map(l => l.peer).sort().join(',');
+      const iguais = [...paresLigados].sort().join(',') === doRust;
+
+      s.membros = s.membros.filter(m => m.chave !== FAB);
+      vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-fabricada');
+      escolherServidor(antes.srv || primeiro.id);
+      if (antes.cnl) escolherCanal(antes.cnl);
+      await pausa(400);
+      diz(`ui ligados na lista: off-sem-ligacao=${offSem} eu-nunca-off=${!euOff}`
+        + ` chip-sem-ninguem="${chipNinguem}"`
+        + ` off-com-ligacao=${offCom} chip-com-membro="${chipMembro}" ponto=${pontoMembro}`
+        + ` ligados-primeiro=${ligadosPrimeiro}`
+        + ` chip-com-estranho="${chipEstranho}" ponto-estranho=${pontoEstranho} no-set=${noSet}`
+        + ` conversa-on=${convOn} chip-conversa-on="${chipConvOn}"`
+        + ` conversa-off=${convOff} chip-conversa-off="${chipConvOff}"`
+        + ` semente-substitui=${!sobreviveu} iguais-ao-rust=${iguais}`);
+    }
+  } catch (e) {
+    diz(`ui ligados na lista: REBENTOU ${e && e.message ? e.message : e}`);
+  }
 
   // ---- A CAMARA: a chave que nao se larga e a imagem que para (#169, #170) ----
   //
