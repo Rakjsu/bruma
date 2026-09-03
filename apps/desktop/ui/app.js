@@ -90,8 +90,12 @@ function marcaDaChave(chave) {
 }
 
 function pintar(el, chave) {
-  el.style.backgroundImage = marcaDaChave(chave || 'anon');
-  el.style.backgroundSize = 'cover';
+  // Sem chave não se inventa uma cara (#161): o `'anon'` desenhava uma marca qualquer e
+  // escondia o erro de quem chamava com a chave errada — foi assim que o avatar das
+  // Definições ficou a ser o de ninguém sem ninguém reparar.
+  el.classList.toggle('ident--vazio', !chave);
+  el.style.backgroundImage = chave ? marcaDaChave(chave) : '';
+  el.style.backgroundSize = chave ? 'cover' : '';
 }
 
 /* ---------- ajudas de UI ---------- */
@@ -253,7 +257,7 @@ function desenharConversas() {
     const av = elemento('span', 'ident');
     pintar(av, c.com);
     const txt = elemento('span');
-    txt.append(elemento('b', null, c.nome));
+    txt.append(rotuloDePessoa(c.com, c.nome));
     const avisoC = avisoDeVersao(c.com);
     txt.append(elemento('i', avisoC ? 'versao-diferente' : null, avisoC || chaveCurta(c.com)));
     l.append(av, txt);
@@ -365,6 +369,7 @@ function desenharMembros() {
     s.membros.length === 1 ? '1 membro' : `${s.membros.length} membros`;
   // Os ligados primeiro, em ordem estável; os outros a meia-luz, com o porquê no `title`.
   const membros = [...s.membros].sort((a, b) => Number(estaLigado(b.chave)) - Number(estaLigado(a.chave)));
+  const repetidos = nomesRepetidos(s);
   for (const m of membros) {
     const linha = elemento('div', 'member');
     linha.dataset.chave = m.chave;
@@ -375,14 +380,21 @@ function desenharMembros() {
     const av = elemento('span', 'ident');
     pintar(av, m.chave);
     const bloco = elemento('span');
-    bloco.append(elemento('b', null, m.nome));
+    const rotulo = rotuloDePessoa(m.chave, m.nome);
+    const repetido = repetidos.get(rotulo.textContent);
+    if (repetido) {
+      linha.classList.add('nome-repetido');
+      rotulo.title = `há ${repetido} pessoas com este nome nesta sala — compara a chave`;
+    }
+    bloco.append(rotulo);
     const aviso = avisoDeVersao(m.chave);
     bloco.append(elemento(
       'i',
-      aviso ? 'versao-diferente' : null,
+      aviso && !repetido ? 'versao-diferente' : null,
       // O «fundou este servidor» saiu (#144): era forjável por qualquer membro da sala, e
-      // não há substituto honesto. A chave curta é verdade e chega.
-      aviso || chaveCurta(m.chave),
+      // não há substituto honesto. A chave curta é verdade e chega — e com o nome repetido
+      // é a chave que manda, mesmo por cima do aviso de versão.
+      repetido ? chaveCurta(m.chave) : (aviso || chaveCurta(m.chave)),
     ));
     linha.append(av, bloco);
     lista.append(linha);
@@ -663,6 +675,9 @@ async function escreverMensagens(stream, aberto, servidorId, canalId, minhaVez =
     onde, ids: msgs.map(m => m.id), ultima: msgs.length ? msgs[msgs.length - 1] : null,
     linhaPosta, linha,
   };
+  // Quem tem o nome repetido nesta sala, em TODAS as mensagens desenhadas (#31) — também
+  // nas que já cá estavam, porque o repetido pode ter chegado agora.
+  aplicarRepetidos(stream, modo === 'privado' ? new Map() : nomesRepetidos(servidor()));
 
   // O SCROLL. Incremental: só segue se se estava no fim. Completo: a linha das novas ao
   // centro quando acaba de aparecer (#29), o fim quando se abriu o canal ou se estava no
@@ -744,6 +759,7 @@ function umaMensagem(m, anterior) {
   // não mostram hora nenhuma, e com o `title` toda a mensagem diz de que dia é.
   art.dataset.id = m.id;
   art.dataset.ts = m.ts_ms;
+  art.dataset.autor = m.autor;
   art.title = dataCompleta(m.ts_ms);
   nosDeMensagem += 1;
   if (!seguida) {
@@ -754,7 +770,9 @@ function umaMensagem(m, anterior) {
   const corpo = elemento('div', 'msg__body');
   if (!seguida) {
     const cab = elemento('div', 'msg__head');
-    cab.append(elemento('b', null, m.autor_nome));
+    // O nome com origem (#81), e a chave curta que só aparece com o nome repetido (#31).
+    cab.append(rotuloDePessoa(m.autor, m.autor_nome));
+    cab.append(elemento('span', 'msg__chave', chaveCurta(m.autor)));
     cab.append(elemento('time', null, horaCurta(m.ts_ms)));
     corpo.append(cab);
   }
@@ -778,7 +796,7 @@ async function desenharMensagensPrivadas() {
   }
 
   $('#composer').hidden = false;
-  $('#entrada').placeholder = `Mensagem para ${c.nome}`;
+  $('#entrada').placeholder = `Mensagem para ${nomeDoPeer(c.com)}`;
   // A conversa deixa de ficar em BRANCO durante a chamada ao Rust: limpava-se antes do
   // `await` e a selecção morria a cada mensagem que chegasse. Limpa-se quando há o que
   // escrever — e só se ninguém navegou entretanto (#162).
@@ -902,7 +920,7 @@ function desenharTopo() {
   if (modo === 'privado') {
     const c = conversa();
     $('#nome-servidor').textContent = 'Mensagens privadas';
-    $('#nome-canal').textContent = c ? c.nome : '—';
+    $('#nome-canal').textContent = c ? nomeDoPeer(c.com) : '—';
     // Uma conversa não é um canal: a arroba diz que do outro lado está uma pessoa, e não
     // uma sala onde qualquer um entra.
     $('#glifo-canal').textContent = '@';
@@ -911,8 +929,9 @@ function desenharTopo() {
     $('#btn-convite').style.display = 'none';
     if (c) {
       const on = paresLigados.has(c.com);
+      const quem = nomeDoPeer(c.com);
       pintarChipDosLigados(
-        on ? `${c.nome} está ligado` : `${c.nome} não está ligado`,
+        on ? `${quem} está ligado` : `${quem} não está ligado`,
         on ? 'Ligado a ti agora.' : 'O que escreveres fica aqui até ele abrir o Bruma.',
         on,
       );
@@ -1543,7 +1562,9 @@ const PAINEIS = {
       s3.append(elemento('p', 'nota',
         'Ninguém garante que uma chave é de quem julgas — não há servidor a dizer «este é o '
         + 'João». Compara a chave com a pessoa por outro caminho, e marca-a como verificada '
-        + 'na lista de amigos.'));
+        + 'na lista de amigos. O nome que dás a alguém aparece-te a ti em todo o lado — os '
+        + 'outros continuam a ver o que ele escolheu; um nome que a pessoa escolheu para si '
+        + 'aparece em itálico, e dois nomes iguais na mesma sala mostram a chave.'));
       const a3 = elemento('div', 'caixa__acoes');
       a3.style.justifyContent = 'flex-start';
       const ir = elemento('button', 'btn', 'Ver a lista de amigos');
@@ -1989,7 +2010,8 @@ async function abrirDefinicoes(qual) {
   const d = $('#defs');
   d.hidden = false;
   $('#defs-nome').textContent = vista.nome || '—';
-  pintar($('#defs-avatar'), vista.eu || '');
+  // `Vista` não tem `eu`: tem `chave` (#161). Era o identicon de ninguém.
+  pintar($('#defs-avatar'), vista.chave);
   $('#defs-buscar').value = '';
   await mostrarPainel(qual || 'conta');
 }
@@ -3507,7 +3529,7 @@ function fotoDoPorLer(v) {
   for (const c of (v && v.conversas) || []) {
     if (c.nao_lidos) {
       m.set(`c:${c.id}`,
-        { n: c.nao_lidos, onde: 'mensagem privada', quem: c.nome, servidor: c.id, canal: c.canal });
+        { n: c.nao_lidos, onde: 'mensagem privada', quem: nomeDoPeer(c.com), servidor: c.id, canal: c.canal });
     }
   }
   return m;
@@ -5332,6 +5354,69 @@ function actualizarEspectadores() {
  *  chamada, aparecia o nome que a OUTRA pessoa escreveu — que é exactamente o campo que um
  *  impostor controla. A defesa existia e não se via onde é precisa.
  */
+/** O nome DECLARADO por uma pessoa — o que ela escreveu no log de uma sala ou de uma
+ *  conversa — ou '' se não a conheço de lado nenhum. */
+function nomeDeclarado(peer) {
+  for (const s of (vista && vista.servidores) || []) {
+    const m = s.membros.find(x => x.chave === peer);
+    if (m && m.nome) return m.nome;
+  }
+  const c = ((vista && vista.conversas) || []).find(x => x.com === peer);
+  return c && c.nome ? c.nome : '';
+}
+
+/** O nome de uma pessoa E DE ONDE VEM (#81): 'eu' (o meu), 'local' (o que EU lhe chamo, na
+ *  lista de amigos), 'declarado' (o que ELA diz chamar-se) ou 'chave' (só a chave). Nas
+ *  mensagens e nas listas o meu nome é o meu nome, e não «tu» — o «tu» é dos painéis da
+ *  voz (`nomeDoPeer`). O que eu chamo a alguém aparece-me a mim em todo o lado; os outros
+ *  continuam a ver o que ele escolheu. */
+function nomeComOrigem(peer, declarado) {
+  const dito = declarado || nomeDeclarado(peer);
+  if (vista && peer === vista.chave) return { texto: vista.nome || dito || chaveCurta(peer), origem: 'eu', declarado: dito };
+  const amigo = (amigos || []).find(a => a.chave === peer);
+  if (amigo && amigo.nome) return { texto: amigo.nome, origem: 'local', declarado: dito };
+  if (dito) return { texto: dito, origem: 'declarado', declarado: dito };
+  return { texto: chaveCurta(peer), origem: 'chave', declarado: '' };
+}
+
+/** O nome desenhado, com a origem à vista (#81): a direito se é meu ou se fui eu que lho
+ *  dei; em itálico apagado se é o que a pessoa declarou ou só a chave — e o porquê no
+ *  `title`, para ninguém tomar um nome escolhido pelo outro por uma identidade. */
+function rotuloDePessoa(peer, declarado) {
+  const n = nomeComOrigem(peer, declarado);
+  const b = elemento('b', n.origem === 'declarado' || n.origem === 'chave' ? 'nome--declarado' : null, n.texto);
+  if (n.origem === 'local' && n.declarado && n.declarado !== n.texto) {
+    b.title = `chamas-lhe ${n.texto}; apresenta-se como ${n.declarado}`;
+  } else if (n.origem === 'declarado') {
+    b.title = `diz chamar-se ${n.texto} — não está na tua lista de amigos`;
+  } else if (n.origem === 'chave') {
+    b.title = 'não sabes o nome desta pessoa — só a chave';
+  }
+  return b;
+}
+
+/** Os nomes MOSTRADOS que se repetem numa sala, com a contagem (#31). Cada um escolhe o
+ *  seu nome, e um impostor escolhe o teu: quando há dois iguais, a chave curta fica à
+ *  vista nos dois, e não só no `title`. */
+function nomesRepetidos(s) {
+  const contagem = new Map();
+  for (const m of (s ? s.membros : [])) {
+    const t = nomeComOrigem(m.chave, m.nome).texto;
+    contagem.set(t, (contagem.get(t) || 0) + 1);
+  }
+  return new Map([...contagem].filter(([, n]) => n >= 2));
+}
+
+/** Marca (ou desmarca) IN-PLACE as mensagens de quem tem o nome repetido: um segundo
+ *  «Bruno» que chega depois tem de marcar as mensagens já desenhadas do primeiro, e o
+ *  stream é incremental (#98) — não se reconstrói para isto. */
+function aplicarRepetidos(stream, repetidos) {
+  for (const art of stream.querySelectorAll('.msg[data-autor]')) {
+    const b = art.querySelector('.msg__head b');
+    art.classList.toggle('nome-repetido', !!b && repetidos.has(b.textContent));
+  }
+}
+
 function nomeDoPeer(peer) {
   if (peer === voz.eu) return 'tu';
   const amigo = (amigos || []).find(a => a.chave === peer);
@@ -5948,7 +6033,9 @@ async function desenharChatDaSala() {
   }
   for (const m of msgs) {
     const linha = elemento('div', 'salachat__msg');
-    linha.append(elemento('span', 'salachat__quem', m.autor_nome));
+    const quem = elemento('span', 'salachat__quem');
+    quem.append(rotuloDePessoa(m.autor, m.autor_nome));
+    linha.append(quem);
     linha.append(elemento('span', 'salachat__txt', m.texto));
     fluxo.append(linha);
   }
@@ -6083,7 +6170,7 @@ function pintarAvisos() {
 listen('conversa-recusada', ev => {
   const id = String(ev.payload || '');
   const c = (vista.conversas || []).find(x => x.id === id);
-  const quem = c ? c.nome : 'Esta pessoa';
+  const quem = c ? nomeDoPeer(c.com) : 'Esta pessoa';
   avisoNaConversa(id, `${quem} só aceita conversas de quem já a conhece — o que escreveres `
     + 'aqui não lhe chega.');
 });
@@ -6095,11 +6182,7 @@ listen('conversa-recusada', ev => {
 listen('membros-novos', ev => {
   const [servidor, chaves] = ev.payload || [];
   if (!servidor || !chaves || !chaves.length) return;
-  const s = (vista.servidores || []).find(x => x.id === servidor);
-  const nomeDe = k => {
-    const m = s && (s.membros || []).find(x => x.chave === k);
-    return m ? m.nome : chaveCurta(k);
-  };
+  const nomeDe = k => nomeComOrigem(k, '').texto;
   const texto = chaves.length === 1
     ? `${nomeDe(chaves[0])} apareceu nesta sala.`
     : `${chaves.length} pessoas apareceram nesta sala.`;
@@ -7517,6 +7600,12 @@ async function segundoCanalDeTexto(servidorId) {
         const outro = [...voz.presentes.keys()].find(k => k !== voz.eu);
         if (outro) {
           try {
+            // O convidado da uma ALCUNHA ao anfitriao (#31/#81): na volta 6 a mensagem dele
+            // tem de aparecer com a alcunha (o meu nome para ele) e o declarado ao lado.
+            if (modo !== '') {
+              await invoke('adicionar_amigo', { chave: outro, nome: 'Alcunha' }).catch(() => {});
+              amigos = await invoke('amigos').catch(() => amigos);
+            }
             const id = await invoke('abrir_conversa', { peer: outro });
             const st = await invoke('estado');
             const c = st.conversas.find(x => x.id === id);
@@ -7542,7 +7631,7 @@ async function segundoCanalDeTexto(servidorId) {
         }).catch(e => { diz(`par conversa FALHOU a ler: ${e}`); return []; });
         const st = await invoke('estado');
         diz(`par conversa mensagens: ${msgs.length}/2`
-          + ` [${msgs.map(m => `${m.autor_nome}: ${m.texto}`).join(' | ')}]`
+          + ` [${msgs.map(m => `${m.autor_nome} (mostrado=${nomeDoPeer(m.autor)}): ${m.texto}`).join(' | ')}]`
           + ` conversas-na-vista=${st.conversas.length}`
           + ` servidores-na-vista=${st.servidores.length}`);
 
@@ -8126,6 +8215,81 @@ async function segundoCanalDeTexto(servidorId) {
         } catch (e) { /* recusou, como deve */ }
       }
 
+      // OS NOMES COM ORIGEM (#31, #81): o `falso` chama-se «Outro nome» na minha lista e
+      // «Bruno» no que declara -- em todo o lado tem de aparecer o MEU nome para ele; sem
+      // o amigo, o declarado em italico; com dois «Bruno» na sala, a chave a vista.
+      const linhasDosNomes = [];
+      try {
+        amigos = await invoke('amigos');
+        const guardadoFoco = janelaComFoco;
+        janelaComFoco = false;   // o `escreverMensagens` a serio nao pode marcar nada como lido
+        const antesN = { srv: servidorAtual, cnl: canalAtual, modo, conv: conversaAtual };
+        const srv = (vista.servidores || []).find(x => x.canais.some(c => c.tipo === 'texto'));
+        const texto = srv && srv.canais.find(c => c.tipo === 'texto');
+        if (!srv || !texto) {
+          linhasDosNomes.push('ui nomes: sem servidor com canal de texto');
+        } else {
+          modo = 'servidor'; servidorAtual = srv.id; canalAtual = texto.id;
+          srv.membros.push({ chave: falso, nome: 'Bruno' });
+          vista.conversas = vista.conversas || [];
+          vista.conversas.push({ id: 'conversa-nomes', com: falso, nome: 'Bruno', canal: 'conversa', nao_lidos: 0 });
+          const stream = $('#stream');
+          const desenharTres = async () => {
+            desenharMembros();
+            limparStream(stream);
+            await escreverMensagens(stream, [{
+              id: 'nome-1', autor: falso, autor_nome: 'Bruno', canal: texto.id,
+              ts_ms: Date.now(), instante: Date.now(), texto: 'ola',
+            }], srv.id, texto.id);
+            $('#lista-canais').textContent = '';
+            desenharConversas();
+            return {
+              membro: $(`#lista-membros .member[data-chave="${falso}"] b`),
+              msg: $('#stream .msg[data-autor] .msg__head b'),
+              conv: $(`#lista-canais .member[data-chave="${falso}"] b`),
+            };
+          };
+          const txt = b => (b ? b.textContent : null);
+          const com = await desenharTres();
+          linhasDosNomes.push(`ui nomes: membro="${txt(com.membro)}" msg="${txt(com.msg)}" conversa="${txt(com.conv)}"`
+            + ` title-diz-bruno=${!!com.msg && /Bruno/.test(com.msg.title)}`
+            + ` declarado-em-italico=${[com.membro, com.msg, com.conv].filter(b => b && b.classList.contains('nome--declarado')).length}`);
+          await invoke('remover_amigo', { chave: falso }).catch(() => {});
+          amigos = await invoke('amigos');
+          const sem = await desenharTres();
+          linhasDosNomes.push(`ui nomes sem amigo: msg="${txt(sem.msg)}"`
+            + ` italico=${[sem.membro, sem.msg, sem.conv].filter(b => b && b.classList.contains('nome--declarado')).length}`
+            + ` title-diz-nao-e-amigo=${!!sem.msg && /amigos/.test(sem.msg.title)}`);
+          srv.membros.push({ chave: 'bb'.repeat(32), nome: 'Bruno' });
+          await desenharTres();
+          const marcados = document.querySelectorAll('#lista-membros .member.nome-repetido').length;
+          const sufixo = $('#stream .msg.nome-repetido .msg__chave');
+          const sufixoVisivel = !!sufixo && getComputedStyle(sufixo).display !== 'none';
+          const chaveNaLista = [...document.querySelectorAll('#lista-membros .member.nome-repetido i')]
+            .every(i => i.textContent === chaveCurta(i.closest('.member').dataset.chave));
+          // A marca in-place: o segundo «Bruno» chega com o stream JA desenhado.
+          srv.membros = srv.membros.filter(m => m.chave !== 'bb'.repeat(32));
+          await desenharTres();
+          const antesDoSegundo = document.querySelectorAll('#stream .msg.nome-repetido').length;
+          srv.membros.push({ chave: 'bb'.repeat(32), nome: 'Bruno' });
+          aplicarRepetidos(stream, nomesRepetidos(srv));
+          const depoisDoSegundo = document.querySelectorAll('#stream .msg.nome-repetido').length;
+          srv.membros = srv.membros.filter(m => m.chave !== 'bb'.repeat(32));
+          await desenharTres();
+          const soUm = document.querySelectorAll('#lista-membros .member.nome-repetido').length;
+          linhasDosNomes.push(`ui nomes repetidos: marcados=${marcados} sufixo-visivel=${sufixoVisivel}`
+            + ` chave-na-lista=${chaveNaLista} in-place=${antesDoSegundo}->${depoisDoSegundo} so-um=${soUm}`);
+          srv.membros = srv.membros.filter(m => m.chave !== falso);
+          vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-nomes');
+          limparStream(stream);
+        }
+        servidorAtual = antesN.srv; canalAtual = antesN.cnl; modo = antesN.modo; conversaAtual = antesN.conv;
+        janelaComFoco = guardadoFoco;
+      } catch (e) {
+        linhasDosNomes.push(`ui nomes: REBENTOU ${e && e.message ? e.message : e}`);
+      }
+      for (const l of linhasDosNomes) diz(l);
+
       await invoke('remover_amigo', { chave: falso }).catch(() => {});
       const sobrou = (await invoke('amigos')).some(x => x.chave === falso);
 
@@ -8223,7 +8387,9 @@ async function segundoCanalDeTexto(servidorId) {
       const itens = [...document.querySelectorAll('.defs__item')].map(b => b.textContent.trim());
       const grupos = [...document.querySelectorAll('.defs__grupo')].map(b => b.textContent.trim());
       diz(`ui defs: aberto=${!lado.hidden} seccoes=${itens.length} grupos=${JSON.stringify(grupos)}`
-        + ` avatar=${!!$('#defs-avatar').style.backgroundImage}`
+        + ` avatar-igual-a-barra=${$('#defs-avatar').style.backgroundImage === $('#meu-avatar').style.backgroundImage}`
+        + ` avatar-nao-e-anon=${(() => { const t = document.createElement('i'); pintar(t, 'anon'); return t.style.backgroundImage !== $('#defs-avatar').style.backgroundImage; })()}`
+        + ` ident-vazio=${(() => { const t = document.createElement('i'); pintar(t, ''); return `sem-imagem=${!t.style.backgroundImage} classe=${t.classList.contains('ident--vazio')}`; })()}`
         + ` busca=${!!$('#defs-buscar')}`);
 
       // "Editar perfil" tem de LEVAR a algum lado, e o nome tem de mudar mesmo. Verificar
