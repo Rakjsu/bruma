@@ -446,6 +446,8 @@ async function desenharMensagens() {
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para #${canal.nome}`;
   actualizarNotaDaCaixa();
+  // ANTES do `await`: a troca do rascunho é síncrona com a decisão de destino (#28, #162).
+  prepararCaixa(`${s.id}/${canal.id}`);
 
   // UMA passagem pelo log (#90): as mensagens e as marcas vêm juntas.
   const aberto = await invoke('abrir_canal', { servidor: s.id, canal: canal.id }).catch(() => null);
@@ -872,6 +874,7 @@ async function desenharMensagensPrivadas() {
   $('#composer').hidden = false;
   $('#entrada').placeholder = `Mensagem para ${nomeDoPeer(c.com)}`;
   actualizarNotaDaCaixa();
+  prepararCaixa(`${c.id}/${c.canal}`);
   // A conversa deixa de ficar em BRANCO durante a chamada ao Rust: limpava-se antes do
   // `await` e a selecção morria a cada mensagem que chegasse. Limpa-se quando há o que
   // escrever — e só se ninguém navegou entretanto (#162).
@@ -2255,10 +2258,53 @@ $('#sala-entrada').addEventListener('input', () => { $('#sala-erro').textContent
  *  dois falhavam em silêncio, para a consola. Aqui o campo só se esvazia quando há para
  *  onde mandar e o texto cabe; um erro repõe o texto — à frente do que entretanto se
  *  escreveu, se o campo já não estava vazio — e diz-se por baixo do campo, não na consola. */
+/* A CAIXA COMPORTA-SE COMO UMA CAIXA (#28, #159).
+   Trocar de canal a meio de uma frase levava a frase para o canal novo — e uma frase
+   privada podia ir parar a uma sala. Agora cada destino tem o seu rascunho, só em memória
+   (nem `localStorage` nem disco: um rascunho em claro no disco era o que o item recusava), e
+   a caixa recebe o foco quando o destino MUDA — nunca num redesenho sem troca, que acontece
+   a cada mensagem que chega e roubaria o cursor às Definições ou ao chat da sala. */
+const rascunhos = new Map();   // «servidor/canal» → o que ficou por enviar
+let rascunhoDe = null;         // o destino a que o texto do campo pertence agora
+
+function podeFocarACaixa() {
+  return $('#defs').hidden
+    && !document.querySelector('.veu:not([hidden])')
+    && $('#menu').hidden
+    && $('#menu-transmissao').hidden;
+}
+
+/** Chama-se quando a caixa fica visível para um destino. Devolve se o destino mudou. */
+function prepararCaixa(chave) {
+  if (rascunhoDe === chave) return false;
+  const el = $('#entrada');
+  if (rascunhoDe !== null) rascunhos.set(rascunhoDe, el.value);
+  el.value = rascunhos.get(chave) || '';
+  rascunhoDe = chave;
+  ajustarEntrada(el);
+  atualizarConta(el);
+  $('#composer-erro').textContent = '';
+  if (podeFocarACaixa()) el.focus();
+  return true;
+}
+
+// Escrever sem clicar (#159): uma tecla solta, sem campo focado, vai para a caixa à vista.
+// Sem `preventDefault`: o carácter entra depois, no elemento que ficou focado. Modificadores,
+// composição (IME) e teclas que não são um carácter ficam de fora.
+document.addEventListener('keydown', ev => {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing || ev.key.length !== 1) return;
+  const a = document.activeElement;
+  if (a && a.closest && a.closest('input, textarea, [contenteditable="true"]')) return;
+  if (!podeFocarACaixa()) return;
+  const alvo = !$('#composer').hidden ? $('#entrada') : (!$('#sala-chat').hidden ? $('#sala-entrada') : null);
+  if (alvo) alvo.focus();
+});
+
 let ultimoEnvioSaiuPara = null;   // para quantas ligações vivas saiu o último envio (#94)
 async function enviarDoCampo(campo, destino, erro, depois) {
   const texto = campo.value;
   if (!texto.trim()) return false;
+  const chaveDoDestino = destino ? `${destino.servidor}/${destino.canal}` : null;
   // ANTES de tocar no campo: sem destino (o composer já é visível antes do estado), o
   // texto ficava perdido em silêncio.
   if (!destino) {
@@ -2281,10 +2327,17 @@ async function enviarDoCampo(campo, destino, erro, depois) {
     return true;
   } catch (e) {
     // O texto volta para o campo: perder o que se escreveu por causa de um erro de rede é
-    // pior do que o erro. Se entretanto já se escreveu mais, o perdido vai à frente.
-    campo.value = campo.value ? texto + campo.value : texto;
-    if (campo.tagName === 'TEXTAREA') { ajustarEntrada(campo); atualizarConta(campo); }
-    erro.textContent = String(e);
+    // pior do que o erro. Se entretanto já se escreveu mais, o perdido vai à frente. E se
+    // entretanto se TROCOU de destino (#28), volta para o rascunho desse destino, não para
+    // o campo do destino novo.
+    if (campo.id === 'entrada' && rascunhoDe !== chaveDoDestino) {
+      rascunhos.set(chaveDoDestino, texto + (rascunhos.get(chaveDoDestino) || ''));
+      erro.textContent = `${e} — o texto ficou guardado nesse canal`;
+    } else {
+      campo.value = campo.value ? texto + campo.value : texto;
+      if (campo.tagName === 'TEXTAREA') { ajustarEntrada(campo); atualizarConta(campo); }
+      erro.textContent = String(e);
+    }
     console.error(e);
     return false;
   }
@@ -4200,6 +4253,9 @@ function abrirMenu(x, y, itens) {
       continue;
     }
     const b = elemento('button', it.perigo ? 'perigo' : null, it.rotulo);
+    // Sem roubar o foco nem a selecção ao que está por baixo (#25): o `Copiar` da selecção
+    // precisa de a selecção ainda existir quando o botão é clicado.
+    b.onmousedown = ev => ev.preventDefault();
     b.onclick = () => { menu.hidden = true; it.accao(); };
     menu.append(b);
   }
@@ -4212,6 +4268,12 @@ function abrirMenu(x, y, itens) {
 }
 
 document.addEventListener('contextmenu', ev => {
+  // Dentro de um campo é o menu NATIVO da WebView2 que manda (#25): Anular, Cortar, Copiar,
+  // Colar, Seleccionar tudo — na língua do Windows, sem permissão nenhuma. O menu da app não
+  // tinha Colar, e não pode ter: ler a área de transferência exige um acesso que a janela
+  // não pede. Um campo só de leitura (`#out-convite`) fica com o da app, que copia.
+  const campo = ev.target.closest('input, textarea');
+  if (campo && !campo.readOnly) return;
   ev.preventDefault();          // <- é isto que mata o menu do browser
   const itens = [];
 
@@ -8915,6 +8977,7 @@ async function segundoCanalDeTexto(servidorId) {
       // (a) Um servidor que nao existe: o texto fica, o erro diz porque, e ve-se.
       modo = 'servidor'; servidorAtual = 'nao-existe'; canalAtual = 'x';
       $('#composer').hidden = false;
+      prepararCaixa('nao-existe/x');   // como a interface faz ao mostrar a caixa (#28)
       entrada.value = 'isto nao vai sair'; erro.textContent = '';
       const devolveu = await enviarDoCampo(entrada, destinoDeEscrita(), erro, async () => {});
       const directo = { devolveu, campo: entrada.value, erro: erro.textContent, visivel: erro.getBoundingClientRect().height > 0 };
@@ -8929,6 +8992,7 @@ async function segundoCanalDeTexto(servidorId) {
       const semDestino = { campo: entrada.value, erro: erro.textContent };
       // Escrever durante a espera: o texto perdido vai a FRENTE do novo, nao por cima.
       servidorAtual = 'nao-existe'; canalAtual = 'x';
+      prepararCaixa('nao-existe/x');
       entrada.value = 'perdido '; erro.textContent = '';
       const emCurso = enviarDoCampo(entrada, destinoDeEscrita(), erro, async () => {});
       entrada.value = 'novo';
@@ -9081,6 +9145,143 @@ async function segundoCanalDeTexto(servidorId) {
       }
     } catch (e) {
       diz(`ui entregas: REBENTOU ${e && e.message ? e.message : e}`);
+    }
+
+    // ---- A CAIXA COMPORTA-SE COMO UMA CAIXA (#28, #159, #25) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual };
+      const alvo = (vista.servidores || [])[0];
+      const A = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
+      const B = alvo ? await segundoCanalDeTexto(alvo.id) : null;
+      if (!alvo || !A || !B) {
+        diz('ui rascunho por destino: sem dois canais de texto para medir');
+      } else {
+        fecharDefinicoes();
+        const entrada = $('#entrada');
+        const chavesAntes = Object.keys(localStorage).length;
+        escolherServidor(alvo.id);
+        escolherCanal(A.id);
+        await pausa(400);
+        entrada.value = 'meio escrito';
+        escolherCanal(B.id);
+        await pausa(400);
+        const emB = entrada.value;
+        const focoEmB = document.activeElement === entrada;
+        escolherCanal(A.id);
+        await pausa(400);
+        const emA = entrada.value;
+        // Numa conversa privada (fabricada na vista: o caminho e o mesmo, sem servidor).
+        vista.conversas = vista.conversas || [];
+        vista.conversas.push({ id: 'conversa-rascunho', com: 'ninguem1', nome: 'x', canal: 'conversa', nao_lidos: 0, entregue_ate: 0 });
+        modo = 'privado'; conversaAtual = 'conversa-rascunho';
+        await desenharMensagensPrivadas();
+        const emConversa = entrada.value;
+        modo = 'servidor'; conversaAtual = antes.conv;
+        vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-rascunho');
+        escolherCanal(A.id);
+        await pausa(400);
+        const emADepoisDaConversa = entrada.value;
+        // O enviado nao volta: enviar em A, ir a B, voltar a A.
+        entrada.value = 'vai mesmo (#28)';
+        await enviarDoCampo(entrada, destinoDeEscrita(), $('#composer-erro'), desenharMensagens);
+        escolherCanal(B.id);
+        await pausa(400);
+        escolherCanal(A.id);
+        await pausa(400);
+        const emADepoisDeEnviar = entrada.value;
+        diz(`ui rascunho por destino: em-B="${emB}" em-A="${emA}" separado=${emB === '' && emA === 'meio escrito'}`
+          + ` em-conversa="${emConversa}" em-A-depois-da-conversa="${emADepoisDaConversa}"`
+          + ` em-A-depois-de-enviar="${emADepoisDeEnviar}"`
+          + ` local-storage-novo=${Object.keys(localStorage).length - chavesAntes}`);
+
+        // A troca de destino DURANTE a espera pelo Rust: o texto vai para o rascunho do
+        // destino antigo, e o campo fica com o do novo.
+        entrada.value = 'vai falhar (#28)';
+        const emCurso = enviarDoCampo(entrada, { servidor: 'nao-existe', canal: 'x' }, $('#composer-erro'), async () => {});
+        prepararCaixa('outro-destino/x');
+        await emCurso;
+        const guardouNoAntigo = rascunhos.get('nao-existe/x') === 'vai falhar (#28)';
+        const campoDoNovo = entrada.value;
+        const erroDizOnde = /ficou guardado/.test($('#composer-erro').textContent);
+        rascunhos.delete('nao-existe/x'); rascunhos.delete('outro-destino/x');
+        escolherCanal(A.id);
+        await pausa(400);
+        diz(`ui rascunho durante a espera: guardou-no-antigo=${guardouNoAntigo} campo-do-novo="${campoDoNovo}"`
+          + ` erro-diz-onde=${erroDizOnde}`);
+        $('#composer-erro').textContent = '';
+
+        // O FOCO: ao trocar sim, com um veu nao, e nunca num redesenho sem troca. Num perfil
+        // sem nome o veu de boas-vindas esta aberto: fecha-se para medir, e repoe-se.
+        const veusAbertos = [...document.querySelectorAll('.veu:not([hidden])')];
+        veusAbertos.forEach(v => { v.hidden = true; });
+        // E o menu de transmissao, que o bloco `ui menu` deixa aberto: um menu aberto e
+        // razao para a caixa NAO roubar o foco -- mede-se do fechado.
+        const transAberto = !$('#menu-transmissao').hidden;
+        $('#menu-transmissao').hidden = true;
+        $('#btn-qualidade').classList.remove('is-on');
+        entrada.blur();
+        escolherCanal(B.id);
+        await pausa(400);
+        const focoEmB2 = document.activeElement === entrada;
+        abrir('veu-novo');
+        entrada.blur();
+        escolherCanal(A.id);
+        await pausa(400);
+        const focoComVeu = document.activeElement === entrada;
+        fechar('veu-novo');
+        const solto = document.createElement('input');
+        document.body.append(solto);
+        solto.focus();
+        await desenharMensagens();
+        await pausa(100);
+        const roubou = document.activeElement !== solto;
+        solto.remove();
+        diz(`ui foco ao trocar: foco=${focoEmB2} foco-com-veu=${focoComVeu} roubou-sem-trocar=${roubou}`
+          + ` (com-veu-de-boas-vindas: foco=${focoEmB}; veus-fechados=${veusAbertos.map(v => v.id).join(',') || 'nenhum'}; menu-transmissao-estava-aberto=${transAberto})`);
+
+        // ESCREVER SEM CLICAR.
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+        const foca = document.activeElement === entrada;
+        entrada.blur();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+        const naoFocaCtrl = document.activeElement !== entrada;
+        abrir('veu-novo');
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+        const naoFocaVeu = document.activeElement !== entrada;
+        fechar('veu-novo');
+        veusAbertos.forEach(v => { v.hidden = false; });
+        diz(`ui escrever sem clicar: foca=${foca} nao-foca-ctrl=${naoFocaCtrl} nao-foca-veu=${naoFocaVeu}`);
+
+        // O MENU NO CAMPO: nativo dentro, o da app fora; e o da app nao rouba o foco.
+        const clique = el => {
+          const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 });
+          el.dispatchEvent(ev);
+          const r = { nativo: !ev.defaultPrevented, app: !$('#menu').hidden };
+          $('#menu').hidden = true;
+          return r;
+        };
+        const noCampo = clique(entrada);
+        const noStream = clique($('#stream'));
+        const soLeitura = $('#out-convite') ? clique($('#out-convite')) : null;
+        abrirMenu(10, 10, [{ rotulo: 'x', accao() {} }]);
+        const botao = $('#menu button');
+        const md = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+        if (botao) botao.dispatchEvent(md);
+        $('#menu').hidden = true;
+        diz(`ui menu no campo: nativo-passa=${noCampo.nativo} menu-da-app=${noCampo.app}`
+          + ` no-stream: nativo-passa=${noStream.nativo} menu-da-app=${noStream.app}`
+          + ` so-leitura: menu-da-app=${soLeitura ? soLeitura.app : 'n/a'}`
+          + ` botao-nao-rouba-foco=${md.defaultPrevented}`);
+        entrada.value = '';
+        modo = antes.modo; conversaAtual = antes.conv;
+        escolherServidor(antes.srv || alvo.id);
+        if (antes.cnl) escolherCanal(antes.cnl);
+        await pausa(400);
+      }
+    } catch (e) {
+      diz(`ui rascunho: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------
