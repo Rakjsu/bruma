@@ -154,6 +154,19 @@ pub struct EstadoDoServidor {
     pub nome: String,
     pub canais: Vec<Canal>,
     pub membros: Vec<Membro>,
+    /// Os canais ARQUIVADOS (#22, #88): um `ApagarCanal` tira o canal da barra, mas o log fica
+    /// e continua a ler-se; um `CriarCanal` posterior com o mesmo id reabre-o. Quem o arquivou
+    /// vai junto, para a faixa «arquivado por X».
+    #[serde(default)]
+    pub arquivados: Vec<CanalArquivado>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanalArquivado {
+    pub id: String,
+    pub nome: String,
+    pub tipo: TipoCanal,
+    pub apagado_por: Option<String>,
 }
 
 /// Reconstrói o estado visível a partir das entradas, já pela ordem definida pelo log.
@@ -174,7 +187,9 @@ fn nome_de(estado: &EstadoDoServidor, autor: &str) -> String {
 pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
     let mut nome = String::new();
     let mut canais: Vec<Canal> = Vec::new();
-    let mut apagados: Vec<String> = Vec::new();
+    // O que já se viu criar, e quem apagou o quê: é daqui que sai a lista de arquivados.
+    let mut vistos: BTreeMap<String, Canal> = BTreeMap::new();
+    let mut apagado_por: BTreeMap<String, String> = BTreeMap::new();
     let mut nomes: BTreeMap<String, String> = BTreeMap::new();
     let mut ordem_de_chegada: Vec<String> = Vec::new();
 
@@ -186,15 +201,24 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
         match &e.carga {
             Carga::NomeDoServidor { nome: n } => nome = n.clone(),
             Carga::CriarCanal { id, nome: n, tipo } => {
+                let canal = Canal {
+                    id: id.clone(),
+                    nome: n.clone(),
+                    tipo: *tipo,
+                };
+                // Um `CriarCanal` com o id de um canal arquivado REABRE-O (#88): a lista é
+                // percorrida pela ordem do relógio lógico, igual em todos os pares, portanto
+                // «o último a escrever por id ganha» converge sem negociar.
                 if !canais.iter().any(|c| &c.id == id) {
-                    canais.push(Canal {
-                        id: id.clone(),
-                        nome: n.clone(),
-                        tipo: *tipo,
-                    });
+                    canais.push(canal.clone());
                 }
+                vistos.insert(id.clone(), canal);
             }
-            Carga::ApagarCanal { id } => apagados.push(id.clone()),
+            // ARQUIVAR, não apagar (#22): sai da barra AGORA, e o log fica.
+            Carga::ApagarCanal { id } => {
+                canais.retain(|c| &c.id != id);
+                apagado_por.insert(id.clone(), e.autor.clone());
+            }
             Carga::Apresentar { nome: n } => {
                 nomes.insert(e.autor.clone(), n.clone());
             }
@@ -206,7 +230,16 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
         }
     }
 
-    canais.retain(|c| !apagados.contains(&c.id));
+    let arquivados: Vec<CanalArquivado> = vistos
+        .into_values()
+        .filter(|c| !canais.iter().any(|x| x.id == c.id))
+        .map(|c| CanalArquivado {
+            apagado_por: apagado_por.get(&c.id).cloned(),
+            id: c.id,
+            nome: c.nome,
+            tipo: c.tipo,
+        })
+        .collect();
 
     let membros = ordem_de_chegada
         .iter()
@@ -225,6 +258,7 @@ pub fn reconstruir(entradas: &[Aplicavel]) -> EstadoDoServidor {
         nome,
         canais,
         membros,
+        arquivados,
     }
 }
 
@@ -461,6 +495,71 @@ mod tests {
             },
         )]);
         assert_eq!(s.membros[0].nome, "abcdef…");
+    }
+
+    /// Criar DEPOIS de apagar reabre (#88): o `retain` no fim dava 0 canais; agora o
+    /// `ApagarCanal` tira na hora e o `CriarCanal` seguinte volta a pôr.
+    #[test]
+    fn criar_depois_de_apagar_reabre() {
+        let c1 = |ts| {
+            ap(
+                "aaa",
+                ts,
+                Carga::CriarCanal {
+                    id: "c1".into(),
+                    nome: "geral".into(),
+                    tipo: TipoCanal::Texto,
+                },
+            )
+        };
+        let e = vec![
+            c1(1),
+            ap("aaa", 2, Carga::ApagarCanal { id: "c1".into() }),
+            c1(3),
+        ];
+        let s = reconstruir(&e);
+        assert_eq!(s.canais.len(), 1, "reaberto");
+        assert!(s.arquivados.is_empty(), "e já não está arquivado");
+    }
+
+    /// Apagar ARQUIVA (#22): o canal sai da barra, mas fica com nome, tipo e quem o apagou.
+    #[test]
+    fn apagar_arquiva_com_nome_tipo_e_autor() {
+        let e = vec![
+            ap(
+                "aaa",
+                1,
+                Carga::CriarCanal {
+                    id: "c1".into(),
+                    nome: "geral".into(),
+                    tipo: TipoCanal::Texto,
+                },
+            ),
+            ap(
+                "aaa",
+                2,
+                Carga::CriarCanal {
+                    id: "c2".into(),
+                    nome: "voz".into(),
+                    tipo: TipoCanal::Voz,
+                },
+            ),
+            ap("bbb", 3, Carga::ApagarCanal { id: "c1".into() }),
+        ];
+        let s = reconstruir(&e);
+        assert_eq!(
+            s.canais.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c2"]
+        );
+        assert_eq!(
+            s.arquivados,
+            vec![CanalArquivado {
+                id: "c1".into(),
+                nome: "geral".into(),
+                tipo: TipoCanal::Texto,
+                apagado_por: Some("bbb".into())
+            }]
+        );
     }
 
     #[test]

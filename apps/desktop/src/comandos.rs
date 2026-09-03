@@ -21,6 +21,8 @@ pub struct VistaServidor {
     pub nao_lidos: std::collections::BTreeMap<String, usize>,
     /// Até que instante cada par (chave → instante) provou ter as minhas mensagens (#94).
     pub entregue: std::collections::BTreeMap<String, i64>,
+    /// Os canais arquivados (#22): fora da barra, com o log a ler-se, reabríveis.
+    pub arquivados: Vec<modelo::CanalArquivado>,
 }
 
 #[derive(Serialize)]
@@ -148,6 +150,7 @@ pub fn estado(app: State<Arc<App>>) -> R<Vista> {
                     e.nome
                 },
                 canais: e.canais,
+                arquivados: e.arquivados,
                 membros: e.membros,
                 nao_lidos: por_ler.into_iter().map(|(c, (n, _))| (c, n)).collect(),
                 entregue: {
@@ -627,6 +630,48 @@ pub fn criar_canal(
 pub fn apagar_conversa(id: String, app: State<Arc<App>>, janela: AppHandle) -> R<()> {
     app.apagar_conversa(&id).map_err(erro)?;
     let _ = janela.emit("servidor-mudou", &id);
+    Ok(())
+}
+
+/// Sair de uma sala nesta máquina (#149). Ver `App::sair_do_servidor`. O `servidor-mudou`
+/// com o id de uma sala que já não existe é o que faz a barra saltar para outra.
+#[tauri::command]
+pub fn sair_do_servidor(id: String, app: State<Arc<App>>, janela: AppHandle) -> R<()> {
+    app.sair_do_servidor(&id).map_err(erro)?;
+    let _ = janela.emit("servidor-mudou", &id);
+    Ok(())
+}
+
+/// Reabrir um canal arquivado, para TODOS (#88): um `CriarCanal` com o MESMO id, nome e tipo
+/// — o `criar_canal` gera id novo e por isso não serve. Qualquer membro pode.
+#[tauri::command]
+pub fn reabrir_canal(
+    servidor: String,
+    canal: String,
+    app: State<Arc<App>>,
+    rede: State<Arc<Rede>>,
+    janela: AppHandle,
+) -> R<()> {
+    let entrada = {
+        let mut servidores = app.servidores.lock().map_err(erro)?;
+        let srv = servidores
+            .get_mut(&servidor)
+            .ok_or("esse servidor não existe aqui")?;
+        let arquivado = srv
+            .estado()
+            .arquivados
+            .into_iter()
+            .find(|c| c.id == canal)
+            .ok_or("esse canal não está arquivado")?;
+        let carga = Carga::CriarCanal {
+            id: arquivado.id,
+            nome: arquivado.nome,
+            tipo: arquivado.tipo,
+        };
+        srv.escrever(&app.ident.signing, &carga).map_err(erro)?
+    };
+    rede.difundir(&servidor, entrada);
+    let _ = janela.emit("servidor-mudou", &servidor);
     Ok(())
 }
 

@@ -1141,16 +1141,35 @@ impl App {
     /// capaz de destruir o único sítio onde uma conversa existe. Quem quiser mesmo perdê-la
     /// apaga o ficheiro à mão, e aí sabe o que está a fazer.
     pub fn apagar_conversa(&self, id: &str) -> Result<()> {
+        self.esquecer(id, true)
+    }
+
+    /// SAIR DE UMA SALA (#149), nesta máquina: o mesmo caminho de apagar uma conversa. O
+    /// histórico fica posto de lado, a barra deixa de a mostrar. Quem lá está continua a ter
+    /// tudo, continua a poder discar-me e vê-me ligado — não há «recusa» por sala, e um
+    /// `Sync` dessa sala vindo do outro passa a ser lixo no porteiro. Não é uma expulsão.
+    pub fn sair_do_servidor(&self, id: &str) -> Result<()> {
+        self.esquecer(id, false)
+    }
+
+    fn esquecer(&self, id: &str, so_conversa: bool) -> Result<()> {
         {
             let mut s = self
                 .servidores
                 .lock()
                 .map_err(|_| anyhow!("estado partido"))?;
             let Some(srv) = s.get(id) else {
-                bail!("essa conversa não existe aqui");
+                bail!(if so_conversa {
+                    "essa conversa não existe aqui"
+                } else {
+                    "essa sala não existe aqui"
+                });
             };
-            if srv.com.is_none() {
+            if so_conversa && srv.com.is_none() {
                 bail!("isso é um servidor, não uma conversa");
+            }
+            if !so_conversa && srv.com.is_some() {
+                bail!("isso é uma conversa: apaga-a");
             }
             s.remove(id);
         }
@@ -1175,7 +1194,10 @@ impl App {
         self.gravar_indice()?;
         let caminho = caminho_do_log(id);
         if caminho.exists() {
-            let _ = std::fs::rename(&caminho, caminho.with_extension("apagado"));
+            // `<id>.json.apagado-<ms>` pelo padrão de `pos_de_lado`: o `.apagado` a seco
+            // sobrescrevia a cópia anterior quando a mesma conversa nascia e era apagada
+            // duas vezes — o Windows substitui no `rename`.
+            pos_de_lado_como(&caminho, "apagado");
         }
         Ok(())
     }
@@ -1470,8 +1492,12 @@ pub fn inventario_da_pasta(raiz: &std::path::Path) -> InventarioDaPasta {
 }
 
 fn pos_de_lado(p: &std::path::Path) {
+    pos_de_lado_como(p, "estragado");
+}
+
+fn pos_de_lado_como(p: &std::path::Path, razao: &str) {
     let etiqueta = format!(
-        "{}.estragado-{}",
+        "{}.{razao}-{}",
         p.file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default(),
@@ -2400,6 +2426,95 @@ mod testes {
             !e_quarentena("x.json") && !e_quarentena("x.txt"),
             "fuga não é quarentena"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sair de uma sala (#149) põe o log de lado com `.apagado-<ms>`, limpa as marcas de
+    /// leitura DESSA sala (e só dessa — `sx/c1` fica), não volta no arranque seguinte, recusa
+    /// uma conversa, e apagar a mesma conversa duas vezes deixa DUAS cópias.
+    #[test]
+    fn sair_do_servidor_poe_de_lado_e_nao_volta() {
+        let _guarda_dados = trava_dados();
+        let dir = std::env::temp_dir().join(format!("bruma-sair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("BRUMA_DADOS", &dir) };
+        let app = App::arrancar().expect("arrancar");
+        let cria = |id: &str, com: Option<&str>| {
+            let log = blog::Log::load(caminho_do_log(id)).unwrap();
+            let srv = Servidor::novo(
+                id.to_string(),
+                [5u8; 32],
+                log,
+                vec![],
+                None,
+                com.map(str::to_string),
+            );
+            app.servidores.lock().unwrap().insert(id.to_string(), srv);
+        };
+        let s = "aa".repeat(16);
+        let sx = "ab".repeat(16);
+        let t = "cc".repeat(16);
+        cria(&s, None);
+        cria(&t, None);
+        app.gravar_indice().unwrap();
+        std::fs::write(caminho_do_log(&s), b"{}\n").unwrap();
+        app.marcar_lido(&s, "c1", 5);
+        app.marcar_lido(&sx, "c1", 5);
+
+        app.sair_do_servidor(&s).expect("sair");
+        assert!(
+            !app.servidores.lock().unwrap().contains_key(&s),
+            "saiu do mapa"
+        );
+        assert_eq!(app.lido_ate(&s, "c1"), 0, "as marcas dessa sala foram");
+        assert_eq!(
+            app.lido_ate(&sx, "c1"),
+            5,
+            "as de outra sala com o mesmo prefixo ficam"
+        );
+        assert!(!caminho_do_log(&s).exists(), "o log já não está no sítio");
+        let de_lado = |id: &str| {
+            std::fs::read_dir(dir.join("servidores"))
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{id}.json.apagado-"))
+                })
+                .count()
+        };
+        assert_eq!(de_lado(&s), 1, "exactamente uma cópia posta de lado");
+
+        let app2 = App::arrancar().expect("arrancar de novo");
+        let ids: Vec<String> = app2.servidores.lock().unwrap().keys().cloned().collect();
+        assert_eq!(ids, vec![t.clone()], "só o outro volta");
+
+        // Uma conversa não se «sai»: apaga-se. E apagar duas vezes deixa duas cópias.
+        let c = "dd".repeat(16);
+        let cria2 = |id: &str| {
+            let log = blog::Log::load(caminho_do_log(id)).unwrap();
+            let srv = Servidor::novo(
+                id.to_string(),
+                [6u8; 32],
+                log,
+                vec![],
+                None,
+                Some("ee".repeat(32)),
+            );
+            app2.servidores.lock().unwrap().insert(id.to_string(), srv);
+        };
+        cria2(&c);
+        assert!(
+            app2.sair_do_servidor(&c).is_err(),
+            "sair de uma conversa é recusado"
+        );
+        std::fs::write(caminho_do_log(&c), b"{}\n").unwrap();
+        app2.apagar_conversa(&c).expect("apagar");
+        cria2(&c);
+        std::fs::write(caminho_do_log(&c), b"{}\n").unwrap();
+        app2.apagar_conversa(&c).expect("apagar outra vez");
+        assert_eq!(de_lado(&c), 2, "duas cópias, nenhuma sobrescrita");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

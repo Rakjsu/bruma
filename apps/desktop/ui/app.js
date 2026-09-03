@@ -214,6 +214,7 @@ function desenharRail() {
   for (const s of vista.servidores) {
     const b = elemento('button', 'rail__pill', s.nome.slice(0, 2).toUpperCase());
     b.dataset.tip = s.nome;
+    b.dataset.servidor = s.id;
     if (modo === 'servidor' && s.id === servidorAtual) b.classList.add('is-active');
     b.onclick = () => escolherServidor(s.id);
     const n = porLerNoServidor(s);
@@ -354,9 +355,15 @@ function desenharConversas() {
           rotulo: 'Apagar esta conversa',
           perigo: true,
           accao: async () => {
-            await invoke('apagar_conversa', { id: c.id }).catch(e => {
-              console.warn('não consegui apagar a conversa:', e);
-            });
+            const quem = nomeDoPeer(c.com);
+            const ok = await confirmarRemocao({
+              titulo: `Apagar a conversa com ${quem}`,
+              texto: `Isto apaga a conversa DESTA máquina. ${quem} continua a ter a cópia dele e não há `
+                + 'forma de a tirar de lá. Se te escrever outra vez, a conversa volta — para isso não '
+                + 'acontecer, bloqueia-o.',
+              botao: 'Apagar aqui',
+            }, () => invoke('apagar_conversa', { id: c.id }));
+            if (!ok) return;
             if (conversaAtual === c.id) conversaAtual = null;
             await desenharTudo();
           },
@@ -395,10 +402,10 @@ function desenharCanais() {
       const glifo = elemento('span', 'chan__glyph', tipo === 'voz' ? '♪' : '#');
       b.append(glifo, document.createTextNode(c.nome));
       const x = elemento('button', 'chan__x', '×');
-      x.title = 'Apagar canal';
-      x.onclick = async ev => {
+      x.title = 'Arquivar canal';
+      x.onclick = ev => {
         ev.stopPropagation();
-        await invoke('apagar_canal', { servidor: s.id, canal: c.id }).catch(alertar);
+        arquivarCanal(s.id, c);
       };
       b.append(x);
       const porLer = (s.nao_lidos || {})[c.id] || 0;
@@ -423,6 +430,22 @@ function desenharCanais() {
           g.append(lista);
         }
       }
+    }
+    lista.append(g);
+  }
+  // ARQUIVADOS (#22): fora da barra de todos os dias, mas a um clique, só de leitura.
+  const arquivados = s.arquivados || [];
+  if (arquivados.length) {
+    const g = elemento('div', 'group');
+    g.append(elemento('div', 'group__label', 'Arquivados'));
+    for (const c of arquivados) {
+      const b = elemento('button', 'chan chan--arquivado');
+      b.dataset.canal = c.id;
+      b.title = 'arquivado — só leitura';
+      if (c.id === canalAtual) b.classList.add('is-active');
+      b.append(elemento('span', 'chan__glyph', c.tipo === 'voz' ? '♪' : '#'), document.createTextNode(c.nome));
+      b.onclick = () => escolherCanal(c.id);
+      g.append(b);
     }
     lista.append(g);
   }
@@ -478,6 +501,29 @@ async function desenharMensagens() {
   const stream = $('#stream');
   const s = servidor();
   const canal = s && s.canais.find(c => c.id === canalAtual);
+  const arquivado = s && !canal && (s.arquivados || []).find(c => c.id === canalAtual);
+
+  if (arquivado) {
+    // SÓ LEITURA (#22, #88): o log continua a ler-se; não se escreve; e diz-se quem o
+    // arquivou, com o botão de o reabrir para todos.
+    stream.hidden = false;
+    $('#vista-voz').hidden = true;
+    $('#composer').hidden = true;
+    const msgs = await invoke('mensagens', { servidor: s.id, canal: arquivado.id }).catch(() => []);
+    if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
+    limparStream(stream);
+    if (msgs.length) await escreverMensagens(stream, msgs, s.id, arquivado.id, minhaVez);
+    const faixa = elemento('div', 'faixa-arquivado');
+    faixa.append(elemento('span', null,
+      `Este canal foi arquivado por ${arquivado.apagado_por ? nomeDoPeer(arquivado.apagado_por) : 'alguém'}. `
+      + 'Continua a ler-se; ninguém escreve aqui.'));
+    const reabrir = elemento('button', 'btn', 'Reabrir para todos');
+    reabrir.onclick = () => invoke('reabrir_canal', { servidor: s.id, canal: arquivado.id }).catch(alertar);
+    faixa.append(reabrir);
+    stream.append(faixa);
+    stream.scrollTop = stream.scrollHeight;
+    return;
+  }
 
   if (!s) {
     limparStream(stream);
@@ -1111,7 +1157,7 @@ function desenharTopo() {
   }
   $('#chip-verificado').hidden = true;
   const s = servidor();
-  const canal = s && s.canais.find(c => c.id === canalAtual);
+  const canal = s && (s.canais.find(c => c.id === canalAtual) || (s.arquivados || []).find(c => c.id === canalAtual));
   $('#nome-servidor').textContent = s ? s.nome : '—';
   $('#nome-canal').textContent = canal ? canal.nome : '—';
   $('#glifo-canal').textContent = canal && canal.tipo === 'voz' ? '♪' : '#';
@@ -1136,7 +1182,8 @@ async function desenharTudo() {
       canalAtual = null;
     }
     const s = servidor();
-    if (s && !s.canais.some(c => c.id === canalAtual)) {
+    // Um canal arquivado aberto de propósito não é razão para saltar para outro (#22).
+    if (s && !s.canais.some(c => c.id === canalAtual) && !(s.arquivados || []).some(c => c.id === canalAtual)) {
       const primeiro = s.canais.find(c => c.tipo === 'texto') || s.canais[0];
       canalAtual = primeiro ? primeiro.id : null;
     }
@@ -1195,6 +1242,61 @@ $('#ir-ao-fim').onclick = () => {
 
 $('#btn-novo').onclick = () => { erroEm('erro-novo', ''); abrir('veu-novo'); };
 $('#fechar-novo').onclick = () => fechar('veu-novo');
+
+/* TIRAR COISAS SEM MENTIR (#22, #88, #149).
+   Arquivar um canal, apagar uma conversa e sair de uma sala são «remover algo que tem log
+   atrás» — e os três passam por UM véu, com um texto honesto por caso: o que fica, o que o
+   outro lado continua a ter, o que se pode desfazer. A acção corre com o véu aberto; um erro
+   aparece nele, e não numa consola. */
+let remocaoEmCurso = null;
+function confirmarRemocao({ titulo, texto, botao }, accao) {
+  return new Promise(resolve => {
+    $('#remover-titulo').textContent = titulo;
+    $('#remover-texto').textContent = texto;
+    $('#ok-remover').textContent = botao || 'Confirmar';
+    $('#erro-remover').textContent = '';
+    remocaoEmCurso = { accao, resolve };
+    abrir('veu-remover');
+  });
+}
+$('#fechar-remover').onclick = () => {
+  fechar('veu-remover');
+  if (remocaoEmCurso) remocaoEmCurso.resolve(false);
+  remocaoEmCurso = null;
+};
+$('#ok-remover').onclick = async () => {
+  if (!remocaoEmCurso) return;
+  try {
+    await remocaoEmCurso.accao();
+    fechar('veu-remover');
+    remocaoEmCurso.resolve(true);
+    remocaoEmCurso = null;
+  } catch (e) {
+    $('#erro-remover').textContent = String(e);
+  }
+};
+
+/** Arquivar um canal (#22): para TODOS, com o número de mensagens que ficam. */
+async function arquivarCanal(servidorId, canal) {
+  const n = (await invoke('mensagens', { servidor: servidorId, canal: canal.id }).catch(() => [])).length;
+  return confirmarRemocao({
+    titulo: `Arquivar #${canal.nome}`,
+    texto: `Isto arquiva #${canal.nome} para TODOS os membros. As ${n} mensagens ficam no disco de `
+      + 'cada um e continuam a ler-se em «Arquivados»; qualquer membro pode reabrir o canal.',
+    botao: 'Arquivar',
+  }, () => invoke('apagar_canal', { servidor: servidorId, canal: canal.id }));
+}
+
+/** Sair de uma sala (#149): nesta máquina, e só nesta. */
+function sairDoServidor(s) {
+  return confirmarRemocao({
+    titulo: `Sair de ${s.nome}`,
+    texto: 'Sais desta sala nesta máquina: o histórico fica posto de lado (.apagado) e a barra deixa '
+      + 'de o mostrar. Quem lá está continua a ter tudo, continua a poder discar-te e vê-te ligado. '
+      + 'Se tiveres o convite, voltas a entrar — isto não é uma expulsão.',
+    botao: 'Sair da sala',
+  }, () => invoke('sair_do_servidor', { id: s.id }));
+}
 
 /* O NÚMERO DE SEGURANÇA (#89, #145).
    Sem directório, «este é o João» é uma coisa que só a pessoa pode decidir — e decide-a com
@@ -4539,15 +4641,24 @@ document.addEventListener('contextmenu', ev => {
   if (canal && canal.dataset.canal) {
     const id = canal.dataset.canal;
     if (itens.length) itens.push('-');
-    itens.push({
-      rotulo: 'Apagar canal', perigo: true,
-      accao: () => invoke('apagar_canal', { servidor: servidorAtual, canal: id }).catch(console.error),
-    });
+    const sv = servidor();
+    const c = sv && sv.canais.find(x => x.id === id);
+    if (c) {
+      itens.push({ rotulo: 'Arquivar canal', perigo: true, accao: () => arquivarCanal(sv.id, c) });
+    }
   }
   // Só no modo servidor: no modo privado o `servidorAtual` continua preenchido por baixo, e
   // isto oferecia "convidar alguém" para um servidor que não está no ecrã — e o que sairia
   // seria a chave que o decifra.
-  if (modo === 'servidor' && servidorAtual && !canal && !msg && !membro) {
+  const pill = ev.target.closest('.rail__pill');
+  if (pill && pill.dataset.servidor) {
+    const sv = (vista.servidores || []).find(x => x.id === pill.dataset.servidor);
+    if (sv) {
+      if (itens.length) itens.push('-');
+      itens.push({ rotulo: 'Sair deste servidor', perigo: true, accao: () => sairDoServidor(sv) });
+    }
+  }
+  if (modo === 'servidor' && servidorAtual && !canal && !msg && !membro && !pill) {
     itens.push({ rotulo: 'Convidar alguém', accao: () => $('#btn-convite').click() });
   }
   if (itens.length) itens.push('-');
@@ -8079,6 +8190,29 @@ async function segundoCanalDeTexto(servidorId) {
 
       // E no fim: os dois lados tem de ver as DUAS mensagens, com nome e nao com
       // "desconhecido" -- se so virem a propria, a sincronizacao da conversa nao anda.
+      // ARQUIVAR E REABRIR ENTRE DUAS MAQUINAS (#22, #88): o anfitriao cria «efemero» na
+      // volta 2 e arquiva na 3; o convidado ve-o arquivado na 4; o anfitriao reabre na 4 e o
+      // convidado ve-o de volta na 5. E a convergencia do `reconstruir` em dois logs.
+      if (servidorId && modo === '') {
+        const canalEfemero = async () => {
+          const st = await invoke('estado');
+          const sv = (st.servidores || []).find(x => x.id === servidorId) || { canais: [], arquivados: [] };
+          return [...sv.canais, ...(sv.arquivados || [])].find(c => c.nome === 'efemero') || null;
+        };
+        // As voltas das duas instancias estao desfasadas (o anfitriao demora mais a montar a
+        // chamada): cria-se cedo, arquiva-se cedo, reabre-se tarde, e o convidado imprime o
+        // que ve em cada volta -- e a SEQUENCIA que prova (arquivado a meio, de volta no fim).
+        if (volta === 1) await invoke('criar_canal', { servidor: servidorId, nome: 'efemero', tipo: 'texto' }).catch(() => {});
+        if (volta === 2) { const c = await canalEfemero(); if (c) await invoke('apagar_canal', { servidor: servidorId, canal: c.id }).catch(() => {}); }
+        if (volta === 5) { const c = await canalEfemero(); if (c) await invoke('reabrir_canal', { servidor: servidorId, canal: c.id }).catch(e => diz(`par reabrir FALHOU: ${e}`)); }
+      }
+      if (servidorId && modo !== '' && volta >= 2) {
+        const st = await invoke('estado');
+        const sv = (st.servidores || []).find(x => x.id === servidorId) || { canais: [], arquivados: [] };
+        const nosCanais = sv.canais.some(c => c.nome === 'efemero');
+        const nosArquivados = (sv.arquivados || []).some(c => c.nome === 'efemero');
+        diz(`par canal efemero v${volta}: nos-canais=${nosCanais} arquivado=${nosArquivados}`);
+      }
       // Uma segunda privada SEM resposta, na volta 5: na 6 tem de continuar por confirmar
       // — confirmar sem prova seria mentira (#94, direccao contraria).
       if (volta === 5 && conversa && modo === '') {
@@ -9626,6 +9760,90 @@ async function segundoCanalDeTexto(servidorId) {
         + ` painel-diz-quarentena=${/Nada posto de lado|ficou de lado|não conferem|apagaste/.test(texto)}`);
     } catch (e) {
       diz(`ui dados guardados: REBENTOU ${e && e.message ? e.message : e}`);
+    }
+
+    // ---- TIRAR COISAS SEM MENTIR (#22, #88, #149) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual };
+      const alvo = (vista.servidores || [])[0];
+      if (!alvo) {
+        diz('ui arquivar canal: sem servidor para medir');
+      } else {
+        fecharDefinicoes();
+        escolherServidor(alvo.id);
+        await pausa(400);
+        await invoke('criar_canal', { servidor: alvo.id, nome: 'efemero', tipo: 'texto' }).catch(() => {});
+        await desenharTudo();
+        const acha = () => (vista.servidores.find(x => x.id === alvo.id) || { canais: [], arquivados: [] });
+        const ef = acha().canais.find(c => c.nome === 'efemero');
+        if (!ef) throw new Error('nao consegui criar o canal efemero');
+        for (const t of ['uma', 'duas']) await invoke('enviar', { servidor: alvo.id, canal: ef.id, texto: t }).catch(() => {});
+        await pausa(700);
+        // O x pede confirmacao, com o numero e o «para todos»; ainda nao arquivou nada.
+        const x = $(`.chan[data-canal="${ef.id}"] .chan__x`);
+        if (x) x.click();
+        await pausa(400);
+        const veu = !$('#veu-remover').hidden;
+        const texto = $('#remover-texto').textContent;
+        const aindaExiste = acha().canais.some(c => c.id === ef.id);
+        diz(`ui arquivar canal: veu=${veu} diz-quantas=${/2 mensagens/.test(texto)} diz-para-todos=${/todos/i.test(texto)}`
+          + ` ainda-existe=${aindaExiste}`);
+        $('#ok-remover').click();
+        await pausa(900);
+        escolherCanal(ef.id);
+        await pausa(600);
+        const sv = acha();
+        const msgsArq = await invoke('mensagens', { servidor: alvo.id, canal: ef.id }).catch(() => []);
+        diz(`ui canal arquivado: em-arquivados=${(sv.arquivados || []).some(c => c.id === ef.id)}`
+          + ` nos-canais=${sv.canais.some(c => c.id === ef.id)}`
+          + ` na-barra=${!!$(`.chan--arquivado[data-canal="${ef.id}"]`)} mensagens=${msgsArq.length}`
+          + ` composer-escondido=${$('#composer').hidden} faixa-diz-quem=${/arquivado por/.test($('#stream').textContent)}`
+          + ` canal-actual-ficou=${canalAtual === ef.id}`);
+        await invoke('reabrir_canal', { servidor: alvo.id, canal: ef.id }).catch(e => diz(`ui reabrir FALHOU: ${e}`));
+        await pausa(900);
+        const sv2 = acha();
+        diz(`ui canal reaberto: nos-canais=${sv2.canais.some(c => c.id === ef.id)}`
+          + ` fora-dos-arquivados=${!(sv2.arquivados || []).some(c => c.id === ef.id)}`
+          + ` composer-visivel=${!$('#composer').hidden}`);
+
+        // Sair da sala: o menu do rail e o texto honesto (e cancela-se); e a saida a serio,
+        // numa sala descartavel.
+        const pill = $(`.rail__pill[data-servidor="${alvo.id}"]`);
+        pill.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 200 }));
+        const sair = [...document.querySelectorAll('#menu button')].find(b => /Sair deste servidor/.test(b.textContent));
+        const menuTemSair = !!sair;
+        if (sair) sair.click();
+        await pausa(200);
+        const veuSair = !$('#veu-remover').hidden;
+        const textoSair = $('#remover-texto').textContent;
+        $('#fechar-remover').click();
+        const descartavel = await invoke('criar_servidor', { nome: 'descartavel' }).catch(() => null);
+        let saiu = null;
+        if (descartavel) {
+          await invoke('sair_do_servidor', { id: descartavel }).catch(e => diz(`ui sair FALHOU: ${e}`));
+          const st = await invoke('estado');
+          saiu = !(st.servidores || []).some(x => x.id === descartavel);
+        }
+        let recusaConversa = 'sem conversa';
+        diz(`ui sair da sala: menu-tem-sair=${menuTemSair} veu=${veuSair} texto-honesto=${/continua a ter/.test(textoSair)}`
+          + ` cancelou=${$('#veu-remover').hidden && vista.servidores.some(x => x.id === alvo.id)} saiu-da-descartavel=${saiu}`);
+        // O erro de uma remocao aparece no veu, e nao na consola.
+        const p = confirmarRemocao({ titulo: 'x', texto: 'y', botao: 'z' }, () => invoke('apagar_conversa', { id: 'nao-existe' }));
+        await pausa(100);
+        $('#ok-remover').click();
+        await pausa(300);
+        const erroVisivel = $('#erro-remover').textContent;
+        $('#fechar-remover').click();
+        await p;
+        diz(`ui apagar conversa: catch-visivel=${!!erroVisivel} erro="${erroVisivel}" ${recusaConversa}`);
+        modo = antes.modo; conversaAtual = antes.conv;
+        escolherServidor(antes.srv || alvo.id);
+        if (antes.cnl) escolherCanal(antes.cnl);
+        await desenharTudo();
+      }
+    } catch (e) {
+      diz(`ui arquivar: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- voltar a janela da por lido o canal aberto (#27) -------------------------
