@@ -6,13 +6,14 @@ Sem e-mail, sem telefone, sem password. A tua identidade é um par de chaves ger
 PC, e **24 palavras recuperam-na** noutra máquina. Não há máquina central a guardar as tuas
 mensagens, nem sequer cifradas: quem tem o histórico é quem está online.
 
-> **Estado: v0.21.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
+> **Estado: v0.22.0 — texto, voz, partilha de ecrã com som, câmara, conversas privadas,
 > uma lista de amigos, permissões de mensagens e por-ler com avisos.**
 >
-> A religação deixou de mentir: quem cai da rede aparece «a religar» em vez de ficar
-> presente para sempre, o contador de ligados conta ligações e não eventos, e o texto
-> que se perdia quando o canal se atrasava volta sozinho. O registo passou a ter horas,
-> e o painel de rede diz por onde entras — incluindo o relay, que é um servidor.
+> A partilha de ecrã passou a dizer a verdade: a captura que morre queixa-se, o som que
+> cai volta a abrir-se, o codificador identifica-se, o selo «AO VIVO» só acende com imagem
+> a chegar, os avisos não se apagam uns aos outros, o ritmo no selo é o medido e não o
+> pedido, quem assiste com a janela escondida deixa de gastar o upload de quem partilha, e
+> quem partilha fica a saber como está a chegar do outro lado.
 >
 > Tudo isso vai pelo mesmo caminho (o iroh) e **não há nada para configurar**. Até à v0.5.2
 > a voz precisava de um servidor STUN ou TURN colado à mão nas duas máquinas; deixou de
