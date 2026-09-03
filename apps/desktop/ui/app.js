@@ -2016,9 +2016,9 @@ const PAINEIS = {
       const nota = elemento('span', 'nota');
       testar.onclick = async () => {
         nota.textContent = 'a pedir…';
-        const foi = await avisar('Bruma', 'É assim que um aviso aparece.');
+        const foi = await avisar('Bruma', 'Clica aqui: o Bruma vem para a frente e abre o canal onde estavas.', destinoActual());
         nota.textContent = foi
-          ? 'apareceu — se não viste, o Windows pode ter os avisos desligados para esta app'
+          ? 'apareceu — clica nele: deve trazer o Bruma à frente e abrir o canal. Se não viste, o Windows pode ter os avisos desligados para esta app'
           : 'não apareceu: ou os avisos estão desligados aqui em cima, ou o Windows recusou '
             + 'a permissão';
       };
@@ -2277,6 +2277,22 @@ const PAINEIS = {
       a1.append(proc, pasta, nota);
       s1.append(a1);
       painel.append(s1);
+
+      // AO FECHAR A JANELA (#100): fica na bandeja, ou sai mesmo — e o que isso custa.
+      const sF = seccao('Ao fechar a janela');
+      sF.append(interruptor(
+        'Ficar na bandeja ao fechar',
+        'Com a janela escondida a rede continua ligada: recebes mensagens e avisos, mas o teu '
+        + 'endereço fica visível na rede iroh e, num portátil, gasta bateria. Se não quiseres, '
+        + 'desliga isto e o X sai mesmo. Para sair de vez com isto ligado: clique direito no '
+        + 'ícone da bandeja, «Sair mesmo».',
+        fecharNaBandeja(),
+        v => {
+          localStorage.setItem(FECHAR, v ? 'bandeja' : 'sair');
+          invoke('fechar_na_bandeja', { ligado: v }).catch(() => {});
+        },
+      ));
+      painel.append(sF);
 
       const s2 = seccao('Como se actualiza');
       s2.append(elemento('p', 'nota',
@@ -3992,19 +4008,21 @@ function avisosComTexto() { return localStorage.getItem(AVISOS_TEXTO) === '1'; }
 
 let permissaoDeAviso = null;
 
-async function avisar(titulo, corpo) {
+/** Onde a pessoa está agora — o destino de um aviso experimental (#95). */
+function destinoActual() {
+  if (modo === 'privado' && conversaAtual) {
+    const c = conversa();
+    return { servidor: conversaAtual, canal: c ? c.canal : 'conversa', privado: true };
+  }
+  return { servidor: servidorAtual || '', canal: canalAtual || '', privado: false };
+}
+
+/** O aviso do sistema (#95): feito no Rust, com o clique a trazer a janela e a abrir o
+ *  destino. O plugin de notificações ficou de lado — no desktop o clique nunca chegava. */
+async function avisar(titulo, corpo, destino) {
   if (!avisosLigados()) return false;
-  const api = window.__TAURI__ && window.__TAURI__.notification;
-  if (!api) return false;
   try {
-    if (permissaoDeAviso === null) {
-      permissaoDeAviso = await api.isPermissionGranted();
-      if (!permissaoDeAviso) {
-        permissaoDeAviso = (await api.requestPermission()) === 'granted';
-      }
-    }
-    if (!permissaoDeAviso) return false;
-    await api.sendNotification({ title: titulo, body: corpo });
+    await invoke('avisar_do_sistema', { titulo, corpo, destino: destino || destinoActual() });
     return true;
   } catch (e) {
     // Um aviso que falha nao pode levar a app com ele: isto corre a cada mensagem.
@@ -4012,6 +4030,19 @@ async function avisar(titulo, corpo) {
     return false;
   }
 }
+
+/** Ir para onde o aviso apontava (#95): UM desenho, e não `escolherServidor`+`escolherCanal`
+ *  em sequência, que lançam dois em paralelo (a corrida do #162). */
+function irPara(destino) {
+  if (!destino || !destino.servidor) return;
+  if (destino.privado) { escolherConversa(destino.servidor); return; }
+  geracaoDaVista += 1;
+  modo = 'servidor';
+  servidorAtual = destino.servidor;
+  canalAtual = destino.canal || null;
+  desenharTudo();
+}
+listen('aviso-clicado', ev => irPara(ev.payload));
 
 /** O que ficou por ler, por sitio, para se saber o que e NOVO entre dois estados. */
 function fotoDoPorLer(v) {
@@ -4121,7 +4152,8 @@ async function talvezAvisar() {
     const antes = anterior.get(k);
     if (v.n <= (antes ? antes.n : 0) || focada) continue;
     const t = avisosComTexto() ? await ultimoTexto(v.servidor, v.canal) : null;
-    await avisar(umaLinha(v.quem, 40), corpoDoAviso(v.onde, t));
+    await avisar(umaLinha(v.quem, 40), corpoDoAviso(v.onde, t),
+      { servidor: v.servidor, canal: v.canal, privado: k.startsWith('c:') });
   }
 }
 
@@ -7507,6 +7539,8 @@ window.addEventListener('unhandledrejection', ev => {
   await desenharTudo();
   // Quem já está ligado, pela verdade do Rust (#97): a rede arrancou antes desta linha.
   semearLigados();
+  // O que o X faz (#100): só a partir daqui é que o Rust esconde em vez de fechar.
+  invoke('fechar_na_bandeja', { ligado: fecharNaBandeja() }).catch(() => {});
   // A fotografia do que JÁ estava por ler, agora e não na primeira mensagem que chegar.
   // Estava a ser tirada dentro do `talvezAvisar`, que só corre no `servidor-mudou` — logo a
   // primeira mensagem de cada sessão servia de base e nunca avisava. Numa app de mensagens,
@@ -8493,9 +8527,36 @@ async function segundoCanalDeTexto(servidorId) {
     const accao = bt.dataset.janela;
     if (accao === 'minimizar') janela.minimize();
     else if (accao === 'maximizar') janela.toggleMaximize();
-    else if (accao === 'fechar') janela.close();
+    else if (accao === 'fechar') pedirParaFechar();
   });
 })();
+
+/* FECHAR QUE NÃO MATA (#100).
+   O X deixa a app na bandeja, a receber mensagens e a avisar — e di-lo na primeira vez, com
+   «Sair mesmo» a um clique. Quem preferir que o X saia mesmo escolhe-o em Sistema. Enquanto
+   o JS não disser nada ao Rust, o X fecha como sempre: o default seguro é o antigo. */
+const FECHAR = 'bruma.fechar';                       // 'sair' sai mesmo; omissão: fica na bandeja
+const BANDEJA_EXPLICADA = 'bruma.bandeja-explicada';
+function fecharNaBandeja() { return localStorage.getItem(FECHAR) !== 'sair'; }
+
+async function pedirParaFechar() {
+  const jan = window.__TAURI__.window.getCurrentWindow();
+  if (!fecharNaBandeja()) {
+    await invoke('sair').catch(() => jan.close());
+    return;
+  }
+  if (localStorage.getItem(BANDEJA_EXPLICADA) !== '1') {
+    $('#faixa-bandeja').hidden = false;
+    return;
+  }
+  await jan.close();
+}
+$('#entendi-bandeja').onclick = () => {
+  localStorage.setItem(BANDEJA_EXPLICADA, '1');
+  $('#faixa-bandeja').hidden = true;
+  window.__TAURI__.window.getCurrentWindow().close();
+};
+$('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
 
 /* ---------- medir a interface, para se poder verificar sem olhos ----------- */
 
@@ -9960,6 +10021,69 @@ async function segundoCanalDeTexto(servidorId) {
         + ` desligado-esconde=${!desligado.includes(segredo)}`
         + ` ligado-mostra=${ligado === segredo}`
         + ` diz-onde=${porOmissao.includes('#geral')}`);
+    }
+
+    // ---- A BANDEJA E O AVISO QUE TRAZ A JANELA (#100, #95) ----
+    try {
+      const pausa = ms => new Promise(r => setTimeout(r, ms));
+      const jan = window.__TAURI__.window.getCurrentWindow();
+      await invoke('fechar_na_bandeja', { ligado: true });
+      localStorage.setItem(BANDEJA_EXPLICADA, '1');
+      // Se o prevent_close nao existir, o processo morre AQUI: o registo fica com «vou
+      // fechar» e nunca com «sobrevivi» -- e e isso que acusa.
+      diz('ui bandeja: vou fechar pelo X');
+      await pedirParaFechar();
+      await pausa(600);
+      diz(`ui bandeja: sobrevivi visivel=${await jan.isVisible()}`);
+      await invoke('mostrar_janela');
+      await pausa(400);
+      diz(`ui bandeja: voltou visivel=${await jan.isVisible()} foco=${document.hasFocus()}`);
+      diz('ui bandeja: vou fechar por CloseRequested');
+      await jan.close();
+      await pausa(600);
+      diz(`ui bandeja: sobrevivi outra vez visivel=${await jan.isVisible()}`);
+      await invoke('mostrar_janela');
+      await pausa(400);
+      // A primeira vez explica-se: sem a chave, o X mostra a faixa e NAO fecha.
+      localStorage.removeItem(BANDEJA_EXPLICADA);
+      await pedirParaFechar();
+      await pausa(200);
+      const faixa = !$('#faixa-bandeja').hidden;
+      const visivelComFaixa = await jan.isVisible();
+      $('#faixa-bandeja').hidden = true;
+      localStorage.setItem(BANDEJA_EXPLICADA, '1');
+      diz(`ui bandeja primeira vez: faixa=${faixa} janela-ficou=${visivelComFaixa}`);
+
+      // (a) O tratador do clique no aviso, pelo evento: outro canal a frente.
+      const alvo = (vista.servidores || [])[0];
+      const textos = alvo ? alvo.canais.filter(c => c.tipo === 'texto') : [];
+      let js = 'sem segundo canal';
+      if (alvo && textos.length > 1) {
+        escolherServidor(alvo.id);
+        escolherCanal(textos[0].id);
+        await pausa(400);
+        window.__TAURI__.event.emit('aviso-clicado', { servidor: alvo.id, canal: textos[1].id, privado: false });
+        await pausa(600);
+        const activo = $('.chan.is-active');
+        js = `canal=${canalAtual === textos[1].id} activo=${!!activo && activo.dataset.canal === textos[1].id}`;
+      }
+      diz(`ui aviso clicado (js): ${js}`);
+      // (b) A metade Rust, sem clique humano: com BRUMA_AVISO_CLICA_SOZINHO o fecho de
+      // activacao corre logo e o evento tem de voltar com o destino certo.
+      const destino = { servidor: alvo ? alvo.id : 'x', canal: textos[0] ? textos[0].id : 'x', privado: false };
+      // O `once` regista o ouvinte por IPC, de forma ASSINCRONA: sem o `await`, o emit do
+      // Rust chegava antes de haver ouvinte -- e a medicao dizia que nao chegou.
+      let resolver = null;
+      const chegada = new Promise(r => { resolver = r; });
+      const desligar = await window.__TAURI__.event.once('aviso-clicado', ev => resolver(ev.payload));
+      const enviou = await avisar('Bruma', 'x', destino);
+      const chegou = await Promise.race([chegada, new Promise(r => setTimeout(() => r(null), 1500))]);
+      if (!chegou) desligar();
+      diz(`ui aviso clicado (rust): enviou=${enviou} chegou=${!!chegou}`
+        + ` destino-certo=${!!chegou && chegou.servidor === destino.servidor && chegou.canal === destino.canal}`
+        + ` foco=${document.hasFocus()}`);
+    } catch (e) {
+      diz(`ui bandeja: REBENTOU ${e && e.message ? e.message : e}`);
     }
 
     // ---- convites com veneno lá dentro (NO FIM, e de propósito) -----------------

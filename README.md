@@ -134,8 +134,11 @@ projectos morrem.
   mensagem é escolhido por quem a escreve, e não há aqui relógio comum. Uma mensagem que diga
   vir de mais de um dia no futuro aparece no canal mas não acende a bolha — sem isso, uma só
   mensagem com uma data absurda marcava o canal como lido para sempre.
-- **Não há avisos com a app fechada.** Não há servidor a receber por ti: se o Bruma não está
-  a correr, a mensagem espera na máquina de quem a escreveu.
+- **Não há avisos com o Bruma a não correr.** Não há servidor a receber por ti: se o processo
+  não está vivo, a mensagem espera na máquina de quem a escreveu. Fechar a janela pelo X deixa
+  o Bruma na bandeja, a receber e a avisar — e clicar no aviso traz a janela e abre o canal.
+  Para sair de vez: clique direito no ícone da bandeja, «Sair mesmo» (ou, em Sistema, pedir
+  que o X saia mesmo).
 - **Uma mensagem tem no máximo 4000 caracteres.** Não é uma limitação técnica: é que uma
   mensagem entra no log dos dois lados, vai para o disco, e é sincronizada em cada ligação —
   para sempre, porque não há apagar. Sem tecto, uma colagem distraída ficava lá, e o custo era

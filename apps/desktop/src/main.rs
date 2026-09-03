@@ -131,6 +131,10 @@ macro_rules! handler_com {
             comandos::actualizacao_incompleta,
             comandos::abrir_pasta_de_dados,
             comandos::abrir_ligacao,
+            comandos::avisar_do_sistema,
+            comandos::fechar_na_bandeja,
+            comandos::mostrar_janela,
+            comandos::sair,
             comandos::palavras_da_identidade,
             comandos::restaurar_identidade,
             comandos::receber_ecra,
@@ -227,6 +231,9 @@ Os teus dados NÃO foram apagados.          Há mais detalhes em:
 /// janela criada mas sem pintar. Vai para o registo como `[arranque] …` e, em debug, para o
 /// comando `tempos_de_arranque` que o `--medir-ui` junta aos carimbos do JS.
 pub static ARRANQUE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// O X esconde na bandeja em vez de fechar (#100). Falso até o JS dizer o que a pessoa quer.
+pub static FECHAR_ESCONDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub static ARRANQUE_INICIO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARRANQUE_ATE_SETUP_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -299,6 +306,16 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        // O X, o Alt+F4 e o fecho pela barra passam TODOS por aqui (#100): uma decisão só.
+        .on_window_event(|janela, ev| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
+                if FECHAR_ESCONDE.load(std::sync::atomic::Ordering::Relaxed) {
+                    api.prevent_close();
+                    let _ = janela.hide();
+                    let _ = tauri::Emitter::emit(janela, "escondida-na-bandeja", ());
+                }
+            }
+        })
         .setup(|app| {
             // ARRANCAR SEM MORRER EM SILENCIO (#14).
             //
@@ -365,6 +382,39 @@ fn main() {
                 nucleo.servidores.lock().map(|s| s.len()).unwrap_or(0)
             );
             println!("  endereço   : {}", rede.id());
+
+            // A BANDEJA (#100): «Abrir» e «Sair mesmo» no menu; um clique no ícone traz a
+            // janela. O ícone é o da janela (icons/icon.ico).
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                let abrir = MenuItem::with_id(app, "abrir", "Abrir", true, None::<&str>)?;
+                let sair = MenuItem::with_id(app, "sair", "Sair mesmo", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&abrir, &sair])?;
+                let mut bandeja = TrayIconBuilder::with_id("bruma")
+                    .tooltip("Bruma")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, ev| match ev.id().as_ref() {
+                        "abrir" => comandos::trazer_a_janela(app),
+                        "sair" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|bandeja, ev| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = ev
+                        {
+                            comandos::trazer_a_janela(bandeja.app_handle());
+                        }
+                    });
+                if let Some(icone) = app.default_window_icon().cloned() {
+                    bandeja = bandeja.icon(icone);
+                }
+                bandeja.build(app)?;
+            }
 
             app.manage(nucleo);
             app.manage(rede);

@@ -26,6 +26,17 @@
 //! diagnóstico legítimo, estão documentados no README, e servem a quem instalou a app quando
 //! alguma coisa corre mal. Ficam onde estão.
 
+/// O aviso do sistema «clica-se sozinho» (#95): em vez de mostrar o toast, corre logo o fecho
+/// de activação — para o `--medir-ui` provar o caminho Rust sem um clique humano.
+#[cfg(debug_assertions)]
+pub fn aviso_clica_sozinho() -> bool {
+    std::env::var("BRUMA_AVISO_CLICA_SOZINHO").is_ok()
+}
+#[cfg(not(debug_assertions))]
+pub fn aviso_clica_sozinho() -> bool {
+    false
+}
+
 /// A sessão morre ENTRE o registo e o stream — o caminho que deixava um par inalcançável.
 #[cfg(debug_assertions)]
 pub fn sessao_morre() -> bool {

@@ -9,7 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 spike-common = { path = "../../spikes/spike-common" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 iroh = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 ed25519-dalek = "2"
@@ -25,6 +25,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # O aviso do sistema quando chega uma mensagem com a janela fora da frente.
 tauri-plugin-notification = "2"
+# O toast com clique (#95): o plugin deita fora o handle por onde a activação vinha.
+tauri-winrt-notification = "0.7"
 
 # Deteção do que está aberto, para a barra de "estás a jogar X".
 [target.'cfg(windows)'.dependencies]

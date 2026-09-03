@@ -1535,6 +1535,82 @@ pub fn abrir_pasta_de_dados() -> R<()> {
     Ok(())
 }
 
+/// O destino de um aviso do sistema (#95): o que se abre quando a pessoa clica nele.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Destino {
+    pub servidor: String,
+    pub canal: String,
+    pub privado: bool,
+}
+
+/// Trazer a janela à frente (#100, #95): mostrar, desminimizar, focar — por esta ordem, que o
+/// tao só força o foco numa janela visível e não minimizada. Se o foco falhar (o Windows não
+/// deixa uma app que não está à frente roubá-lo), pisca-se na barra e diz-se no registo.
+pub fn trazer_a_janela(app: &AppHandle) {
+    let Some(j) = tauri::Manager::get_webview_window(app, "main") else {
+        return;
+    };
+    let _ = j.show();
+    let _ = j.unminimize();
+    if let Err(e) = j.set_focus() {
+        eprintln!("[aviso] não consegui trazer a janela: {e}");
+        let _ = j.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    }
+}
+
+/// O aviso do sistema, com o clique a trazer a janela e a abrir o destino (#95). O plugin de
+/// notificações não serve: no desktop deita fora o handle por onde a activação vinha, e com o
+/// exe em `target/debug` nem punha o AUMID. Aqui o toast é feito directamente; o fecho de
+/// activação corre numa thread WinRT — o `AppHandle` é Send + Sync, e show/unminimize/
+/// set_focus despacham para a principal.
+#[tauri::command]
+pub fn avisar_do_sistema(titulo: String, corpo: String, destino: Destino, app: AppHandle) -> R<()> {
+    let ao_clicar = {
+        let app = app.clone();
+        move || {
+            trazer_a_janela(&app);
+            let _ = app.emit("aviso-clicado", &destino);
+        }
+    };
+    if crate::bandeiras::aviso_clica_sozinho() {
+        ao_clicar();
+        return Ok(());
+    }
+    let app_id = if cfg!(debug_assertions) {
+        tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+    } else {
+        app.config().identifier.clone()
+    };
+    tauri_winrt_notification::Toast::new(&app_id)
+        .title(&titulo)
+        .text1(&corpo)
+        .on_activated(move |_| {
+            ao_clicar();
+            Ok(())
+        })
+        .show()
+        .map_err(erro)?;
+    Ok(())
+}
+
+/// O X esconde em vez de matar (#100) — quando o JS o pedir. Enquanto não disser nada (arranque
+/// a meio, webview morta) o X fecha como sempre: o default seguro é o comportamento antigo.
+#[tauri::command]
+pub fn fechar_na_bandeja(ligado: bool) {
+    crate::FECHAR_ESCONDE.store(ligado, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub fn mostrar_janela(app: AppHandle) {
+    trazer_a_janela(&app);
+}
+
+/// Sair mesmo (#100): o `exit` não espera pela rede — o mesmo que o `close` de sempre.
+#[tauri::command]
+pub fn sair(app: AppHandle) {
+    app.exit(0);
+}
+
 /// Um endereço que se pode abrir no browser (#96): só `http`/`https`, sem espaços, aspas ou
 /// caracteres de controlo, com o nome do sítio, até 2048 caracteres. É a ÚNICA barreira antes
 /// do `ShellExecute` do Windows — que com `file:` executaria ficheiros locais — e por isso
@@ -1984,6 +2060,19 @@ pub fn medir_ui_pedido() -> bool {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// O destino de um aviso vai e volta intacto pelo IPC (#95).
+    #[test]
+    fn o_destino_do_aviso_vai_e_volta() {
+        let d = Destino {
+            servidor: "s".into(),
+            canal: "c".into(),
+            privado: true,
+        };
+        let j = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<Destino>(&j).unwrap(), d);
+        assert!(j.contains("\"privado\":true"));
+    }
 
     /// O que se abre e o que não se abre (#96): só http/https com sítio; tudo o resto é
     /// recusado antes de chegar ao `ShellExecute`.
