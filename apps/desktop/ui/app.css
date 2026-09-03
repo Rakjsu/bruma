@@ -322,10 +322,12 @@ html, body {
 .msg--cont { padding-top: 0; }
 .msg--cont .msg__body { margin-top: -4px; }
 @keyframes rise { from { opacity: 0; transform: translateY(7px); } }
-.stream .msg:nth-child(2) { animation-delay: .04s; }
-.stream .msg:nth-child(3) { animation-delay: .08s; }
-.stream .msg:nth-child(4) { animation-delay: .12s; }
-.stream .msg:nth-child(5) { animation-delay: .16s; }
+/* `nth-of-type` e não `nth-child`: os separadores de dia (#30) e a linha das novas são
+   irmãos e não podem roubar os atrasos às primeiras mensagens. */
+.stream .msg:nth-of-type(2) { animation-delay: .04s; }
+.stream .msg:nth-of-type(3) { animation-delay: .08s; }
+.stream .msg:nth-of-type(4) { animation-delay: .12s; }
+.stream .msg:nth-of-type(5) { animation-delay: .16s; }
 
 .msg__body { grid-column: 2; min-width: 0; }
 .msg__head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 1px; }
@@ -365,7 +367,16 @@ html, body {
 
 /* --- composer ------------------------------------------------------------ */
 
-.composer { padding: 4px 20px 14px; }
+.composer { padding: 4px 20px 14px; position: relative; }
+/* O botão «ir para o fim» (#29): encostado à caixa, sobe com ela quando o textarea cresce. */
+.composer__fim {
+  position: absolute; right: 28px; bottom: 100%; margin-bottom: 8px; z-index: 3;
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel, #2b2d31); color: var(--text);
+  font: 500 12px/1 var(--ui); cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
+.composer__fim:hover { filter: brightness(1.15); }
 .composer__box {
   /* `flex-end` e nao `center`: com o campo a crescer para varias linhas, o cadeado e o +
      ficavam a meio da altura, longe da linha onde se escreve. */

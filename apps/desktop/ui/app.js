@@ -378,7 +378,7 @@ async function desenharMensagens() {
   const canal = s && s.canais.find(c => c.id === canalAtual);
 
   if (!s) {
-    stream.textContent = '';
+    limparStream(stream);
     const v = elemento('div', 'vazio');
     v.append(elemento('h3', null, 'Ainda não tens servidores'));
     v.append(elemento('p', null,
@@ -392,7 +392,7 @@ async function desenharMensagens() {
   }
 
   if (!canal) {
-    stream.textContent = '';
+    limparStream(stream);
     const v = elemento('div', 'vazio');
     v.append(elemento('h3', null, 'Escolhe um canal'));
     v.append(elemento('p', null, 'Ou cria um novo com o + ao lado de Texto.'));
@@ -402,7 +402,7 @@ async function desenharMensagens() {
   }
 
   if (canal.tipo === 'voz') {
-    stream.textContent = '';
+    limparStream(stream);
     stream.hidden = true;
     $('#composer').hidden = true;
     desenharVoz();
@@ -419,8 +419,8 @@ async function desenharMensagens() {
   // Se entretanto se navegou para outro sítio, este desenho é de um canal que já ninguém
   // quer ver (#162): nem toca no stream, nem pede para marcar nada como lido.
   if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
-  stream.textContent = '';
   if (!msgs.length) {
+    limparStream(stream);
     const v = elemento('div', 'vazio');
     v.append(elemento('h3', null, `#${canal.nome}`));
     v.append(elemento('p', null, 'Ainda não há nada aqui. Escreve a primeira mensagem.'));
@@ -466,9 +466,87 @@ const marcarPedidos = [];
 // Medição: o último pedido de leitura feito pelo FOCO da janela (#27).
 let ultimoMarcarPorFoco = null;
 
+// O QUE JÁ ESTÁ DESENHADO NO STREAM (#98): o canal, os ids por ordem, a última mensagem
+// real, e se a linha «novas mensagens» já foi posta. Quando a lista nova é a antiga mais
+// cauda, só se ACRESCENTA — antes, cada mensagem que chegava reconstruía o DOM inteiro:
+// tudo reanimava, a selecção morria, e o scroll ia parar onde calhava.
+let desenhado = { onde: null, ids: [], ultima: null, linhaPosta: false, linha: null };
+// Medição: <article> criados, e caminhos completos (limpar e reconstruir).
+let nosDeMensagem = 0;
+let reconstrucoesDoStream = 0;
+
+/** O stream fica vazio e o desenho esquece o que lá estava: a próxima abertura é completa. */
+function limparStream(stream) {
+  stream.textContent = '';
+  desenhado = { onde: null, ids: [], ultima: null, linhaPosta: false, linha: null };
+}
+
+function noFimDo(stream) {
+  return stream.scrollHeight - stream.scrollTop - stream.clientHeight < 40;
+}
+
+/** A primeira mensagem visível e a que distância está do topo (#23): é a ela que se volta
+ *  depois de reconstruir. Por ELEMENTO e não por píxel absoluto, porque as alturas variam. */
+function ancoraDo(stream) {
+  const topo = stream.getBoundingClientRect().top;
+  const primeira = [...stream.querySelectorAll('.msg[data-id]')]
+    .find(el => el.getBoundingClientRect().bottom > topo);
+  return primeira
+    ? { id: primeira.dataset.id, delta: primeira.getBoundingClientRect().top - topo }
+    : null;
+}
+
+function reporAncora(stream, ancora) {
+  const el = stream.querySelector(`.msg[data-id="${CSS.escape(ancora.id)}"]`);
+  if (!el) return false;
+  stream.scrollTop += el.getBoundingClientRect().top - stream.getBoundingClientRect().top - ancora.delta;
+  return true;
+}
+
+/** O dia de uma mensagem, no relógio local (#30). */
+const diaLocal = ms => new Date(ms).toDateString();
+
+function rotuloDoDia(ms) {
+  const d = new Date(ms);
+  const hoje = new Date();
+  if (d.toDateString() === hoje.toDateString()) return 'hoje';
+  const ontem = new Date(hoje); ontem.setDate(hoje.getDate() - 1);
+  if (d.toDateString() === ontem.toDateString()) return 'ontem';
+  const opcoes = { weekday: 'long', day: 'numeric', month: 'long' };
+  if (d.getFullYear() !== hoje.getFullYear()) opcoes.year = 'numeric';
+  return d.toLocaleDateString([], opcoes);
+}
+
+function dataCompleta(ms) {
+  return new Date(ms).toLocaleString([], { dateStyle: 'full', timeStyle: 'short' });
+}
+
+/** O botão «ir para o fim» (#29): aparece quando se está a ler mais acima, e conta as
+ *  mensagens depois da linha das novas — todas as que ficam depois dela, estável ao scroll. */
+function actualizarBotaoDoFim() {
+  const btn = $('#ir-ao-fim');
+  const stream = $('#stream');
+  if (!btn || !stream) return;
+  btn.hidden = noFimDo(stream) || stream.hidden || $('#composer').hidden;
+  if (btn.hidden) return;
+  const linha = stream.querySelector('.novas-aqui');
+  let n = 0;
+  if (linha) {
+    let el = linha.nextElementSibling;
+    while (el && n < 100) {
+      if (el.classList.contains('msg')) n += 1;
+      el = el.nextElementSibling;
+    }
+  }
+  btn.textContent = n > 0 ? `↓ ${n > 99 ? '99+' : n} novas abaixo` : '↓ ir para o fim';
+}
+
 async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = geracaoDaVista) {
   const onde = `${servidorId}/${canalId}`;
-  if (marcaDaVista.onde !== onde) marcaDaVista = { onde, antes: null };
+  // «Acabei de abrir este canal» lê-se ANTES de a marca ser reposta: é o que decide se a
+  // linha das novas vai ao centro e se o scroll vai ao fim.
+  const abriuAgora = marcaDaVista.onde !== onde;
+  if (abriuAgora) marcaDaVista = { onde, antes: null };
 
   // MARCAR COMO LIDO SÓ COM A JANELA À FRENTE.
   //
@@ -501,17 +579,55 @@ async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = g
   if (marcaDaVista.antes === null && antes !== null) marcaDaVista.antes = antes;
   const corte = marcaDaVista.antes || 0;
 
+  // As etiquetas de dia envelhecem («hoje» passa a «ontem») no redesenho seguinte à
+  // meia-noite — sem mensagens novas ficam velhas até haver uma; está assumido.
+  for (const d of stream.querySelectorAll('.daybreak[data-em]')) d.textContent = rotuloDoDia(+d.dataset.em);
+
   // Estava eu no fim antes de redesenhar? Se estava a ler mais acima, saltar para o fim
   // seria a app a puxar-me a página das mãos de cada vez que alguém escreve.
-  const estavaNoFim = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 40;
+  const estavaNoFim = noFimDo(stream);
 
-  stream.textContent = '';
-  let anterior = null;
+  // A REGRA (#98): se a lista nova é a antiga mais cauda, só se acrescenta. Comparam-se
+  // TODOS os ids e não só o último: a ordem sai do relógio lógico e um `merge` pode inserir
+  // uma entrada antiga no MEIO — aí reconstrói-se, que é o certo. O agrupamento
+  // `msg--cont` só olha à mensagem anterior, portanto o último nó já desenhado nunca muda.
+  const k = desenhado.onde === onde ? desenhado.ids.length : -1;
+  const incremental = k >= 0 && msgs.length >= k
+    && desenhado.ids.every((id, i) => msgs[i].id === id);
+  const linhaJaPosta = desenhado.onde === onde && desenhado.linhaPosta;
+
+  let anterior = null;      // para o agrupamento (é posto a null a seguir a separadores)
+  let ultimaReal = null;    // a anterior verdadeira, para o dia
   let linhaPosta = false;
-  for (const m of msgs) {
+  let linha = null;
+  let desde = 0;
+  let ancora = null;
+  if (incremental) {
+    anterior = desenhado.ultima;
+    ultimaReal = desenhado.ultima;
+    linhaPosta = desenhado.linhaPosta;
+    linha = desenhado.linha;
+    desde = k;
+  } else {
+    reconstrucoesDoStream += 1;
+    // A ÂNCORA (#23): a primeira mensagem visível, guardada antes de limpar.
+    ancora = estavaNoFim ? null : ancoraDo(stream);
+    stream.textContent = '';
+  }
+  for (let i = desde; i < msgs.length; i++) {
+    const m = msgs[i];
+    // O DIA (#30): um separador quando a data muda, e a mensagem a seguir leva cabeçalho
+    // completo — o mesmo autor às 23:59 e às 00:01 não é uma continuação.
+    if (!ultimaReal || diaLocal(ultimaReal.ts_ms) !== diaLocal(m.ts_ms)) {
+      const d = elemento('div', 'daybreak', rotuloDoDia(m.ts_ms));
+      d.dataset.em = m.ts_ms;
+      stream.append(d);
+      anterior = null;
+    }
     // A minha própria mensagem nunca puxa a linha: eu sei o que escrevi.
     if (!linhaPosta && corte > 0 && m.ts_ms > corte && m.autor !== vista.chave) {
-      stream.append(elemento('div', 'novas-aqui', 'novas mensagens'));
+      linha = elemento('div', 'novas-aqui', 'novas mensagens');
+      stream.append(linha);
       linhaPosta = true;
       // E a primeira a seguir à linha leva cabeçalho completo, senão fica agarrada por cima
       // dela como se fosse continuação de quem falou antes.
@@ -519,8 +635,27 @@ async function escreverMensagens(stream, msgs, servidorId, canalId, minhaVez = g
     }
     stream.append(umaMensagem(m, anterior));
     anterior = m;
+    ultimaReal = m;
   }
-  if (estavaNoFim || marcaDaVista.antes === antes) stream.scrollTop = stream.scrollHeight;
+  desenhado = {
+    onde, ids: msgs.map(m => m.id), ultima: msgs.length ? msgs[msgs.length - 1] : null,
+    linhaPosta, linha,
+  };
+
+  // O SCROLL. Incremental: só segue se se estava no fim. Completo: a linha das novas ao
+  // centro quando acaba de aparecer (#29), o fim quando se abriu o canal ou se estava no
+  // fim, e a âncora — a mesma mensagem no mesmo sítio — em todos os outros casos (#23).
+  const linhaNova = !incremental && linha && !linhaJaPosta;
+  if (incremental) {
+    if (estavaNoFim) stream.scrollTop = stream.scrollHeight;
+  } else if (linhaNova) {
+    linha.scrollIntoView({ block: 'center' });
+  } else if (abriuAgora || estavaNoFim || !ancora) {
+    stream.scrollTop = stream.scrollHeight;
+  } else if (!reporAncora(stream, ancora)) {
+    stream.scrollTop = stream.scrollHeight;
+  }
+  actualizarBotaoDoFim();
 
   if (aFrente) await esquecerPorLer(servidorId, canalId);
 }
@@ -577,6 +712,13 @@ async function refrescarBolhas() {
 function umaMensagem(m, anterior) {
   const seguida = anterior && anterior.autor === m.autor && m.ts_ms - anterior.ts_ms < 5 * 60_000;
   const art = elemento('article', seguida ? 'msg msg--cont' : 'msg');
+  // O id é o que permite acrescentar em vez de reconstruir (#98) e voltar à mesma mensagem
+  // depois de reconstruir (#23); a data completa vive no `title` (#30): as continuações
+  // não mostram hora nenhuma, e com o `title` toda a mensagem diz de que dia é.
+  art.dataset.id = m.id;
+  art.dataset.ts = m.ts_ms;
+  art.title = dataCompleta(m.ts_ms);
+  nosDeMensagem += 1;
   if (!seguida) {
     const av = elemento('span', 'ident ident--lg');
     pintar(av, m.autor);
@@ -602,7 +744,7 @@ async function desenharMensagensPrivadas() {
   stream.hidden = false;
 
   if (!c) {
-    stream.textContent = '';
+    limparStream(stream);
     $('#composer').hidden = true;
     await desenharAmigos(stream);
     return;
@@ -615,7 +757,6 @@ async function desenharMensagensPrivadas() {
   // escrever — e só se ninguém navegou entretanto (#162).
   const msgs = await invoke('mensagens', { servidor: c.id, canal: c.canal }).catch(() => []);
   if (minhaVez !== geracaoDaVista) { chegadasTarde += 1; return; }
-  stream.textContent = '';
   await escreverMensagens(stream, msgs, c.id, c.canal, minhaVez);
   pintarAvisos();
 }
@@ -789,6 +930,14 @@ function alertar(e) {
 }
 
 /* ---------- ações ---------- */
+
+// O botão «ir para o fim» (#29) segue o scroll do stream; o clique leva ao fim.
+$('#stream').addEventListener('scroll', () => requestAnimationFrame(actualizarBotaoDoFim), { passive: true });
+$('#ir-ao-fim').onclick = () => {
+  const stream = $('#stream');
+  stream.scrollTop = stream.scrollHeight;
+  actualizarBotaoDoFim();
+};
 
 $('#btn-novo').onclick = () => { erroEm('erro-novo', ''); abrir('veu-novo'); };
 $('#fechar-novo').onclick = () => fechar('veu-novo');
@@ -5759,13 +5908,15 @@ function pintarAvisos() {
   const aberto = modo === 'privado' ? conversaAtual : servidorAtual;
   const fila = avisosPendentes.get(aberto);
   if (!fila || !fila.length) return;
+  const noFim = noFimDo(zona);
   for (const texto of fila) {
     // Não se repete o mesmo aviso: um redesenho a meio podia trazer a fila outra vez.
     if ([...zona.querySelectorAll('.aviso-sistema')].some(n => n.textContent === texto)) continue;
     zona.append(elemento('div', 'aviso-sistema', texto));
   }
   avisosPendentes.set(aberto, []);
-  zona.scrollTop = zona.scrollHeight;
+  // Um aviso do sistema não puxa a página das mãos de quem está a ler mais acima (#23).
+  if (noFim) zona.scrollTop = zona.scrollHeight;
 }
 
 /* A RECUSA DITA (#131).
@@ -8720,6 +8871,127 @@ async function segundoCanalDeTexto(servidorId) {
     diz(`ui camara parada sem redesenhar: redesenhos-em-2.6s=${redesenhos} rotulo="${rotulo}"`);
   } catch (e) {
     diz(`ui camara parada sem redesenhar: REBENTOU ${e && e.message ? e.message : e}`);
+  }
+
+  // ---- O STREAM QUE NAO SE RECONSTROI (#98, #23, #29, #30) ----
+  try {
+    const alvo = (vista.servidores || []).find(x => x.canais.some(c => c.tipo === 'texto'));
+    const canal = alvo && alvo.canais.find(c => c.tipo === 'texto');
+    if (!alvo || !canal) throw new Error('sem servidor/canal de texto para medir');
+    const espera = ms => new Promise(r => setTimeout(r, ms));
+    const stream = $('#stream');
+    // Enche-se ate 60 mensagens de tres linhas: o stream transborda de certeza.
+    let msgs = await invoke('mensagens', { servidor: alvo.id, canal: canal.id }).catch(() => []);
+    for (let i = msgs.length; i < 60; i++) {
+      await invoke('enviar', { servidor: alvo.id, canal: canal.id, texto: `linha ${i}\n\n\n` }).catch(() => {});
+    }
+    msgs = await invoke('mensagens', { servidor: alvo.id, canal: canal.id }).catch(() => []);
+    const guardadoFoco = janelaComFoco;
+    janelaComFoco = true;
+    escolherServidor(alvo.id);
+    escolherCanal(canal.id);
+    await espera(500);
+
+    // #98: uma mensagem nova = um no novo, zero reconstrucoes, a seleccao sobrevive.
+    const p = stream.querySelector('.msg p');
+    if (p) getSelection().selectAllChildren(p);
+    const n0 = nosDeMensagem; const r0 = reconstrucoesDoStream;
+    await invoke('enviar', { servidor: alvo.id, canal: canal.id, texto: 'mais uma' }).catch(() => {});
+    await desenharMensagens();
+    await new Promise(r => requestAnimationFrame(r));
+    const nosNova = nosDeMensagem - n0;
+    const recNova = reconstrucoesDoStream - r0;
+    const seleccao = String(getSelection()).length > 0;
+    const semMovimento = document.documentElement.classList.contains('sem-movimento');
+    const animacoes = semMovimento ? 'nao-mensuravel'
+      : stream.getAnimations({ subtree: true }).filter(a => a.playState === 'running').length;
+    // Trocar de canal e voltar: o caminho completo continua a existir quando tem de existir.
+    const segundo = await segundoCanalDeTexto(alvo.id);
+    const n1 = nosDeMensagem; const r1 = reconstrucoesDoStream;
+    if (segundo) { escolherCanal(segundo.id); await espera(400); }
+    escolherCanal(canal.id); await espera(500);
+    msgs = await invoke('mensagens', { servidor: alvo.id, canal: canal.id }).catch(() => []);
+    const nosAoTrocar = nosDeMensagem - n1;
+    const recAoTrocar = reconstrucoesDoStream - r1;
+    // Uma insercao no MEIO (um merge com uma entrada antiga) tem de reconstruir.
+    const r2 = reconstrucoesDoStream;
+    const falsa = { id: 'inserida-no-meio', autor: 'x', autor_nome: 'x', canal: canal.id, ts_ms: msgs[30].ts_ms, texto: 'inserida' };
+    janelaComFoco = false;
+    await escreverMensagens(stream, [...msgs.slice(0, 30), falsa, ...msgs.slice(30)], alvo.id, canal.id);
+    const recMeio = reconstrucoesDoStream - r2;
+    desenhado.onde = null; await desenharMensagens(); await espera(200);
+    diz(`ui stream incremental: msgs=${msgs.length} nos-por-mensagem-nova=${nosNova} reconstrucoes=${recNova}`
+      + ` seleccao-sobrevive=${seleccao} animacoes-a-correr=${animacoes}`
+      + ` nos-ao-trocar=${nosAoTrocar} (msgs=${msgs.length}) reconstrucoes-ao-trocar=${recAoTrocar}`
+      + ` insercao-no-meio-reconstroi=${recMeio}`);
+
+    // #23: a ancora. Incremental nao mexe; o caminho completo volta a mesma mensagem.
+    stream.scrollTop = Math.round(stream.scrollHeight / 3);
+    await new Promise(r => requestAnimationFrame(r));
+    const antes = stream.scrollTop;
+    const a = ancoraDo(stream);
+    janelaComFoco = true;
+    await invoke('enviar', { servidor: alvo.id, canal: canal.id, texto: 'a chegar enquanto leio' }).catch(() => {});
+    await desenharMensagens();
+    const mexeuIncremental = stream.scrollTop !== antes;
+    desenhado.onde = null;   // forca o caminho completo SEM ser uma abertura
+    await desenharMensagens();
+    await new Promise(r => requestAnimationFrame(r));
+    const b = ancoraDo(stream);
+    diz(`ui stream ancora: antes=${antes} incremental-mexeu=${mexeuIncremental}`
+      + ` completa-mesmo-id=${!!a && !!b && a.id === b.id} desvio-px=${a && b ? Math.round(Math.abs(a.delta - b.delta)) : '?'}`
+      + ` scroll-depois=${stream.scrollTop}`);
+
+    // #29: a linha das novas ao centro e o botao. Numa instancia so as mensagens sao todas
+    // minhas e a linha nunca aparece: finge-se que sou outro.
+    msgs = await invoke('mensagens', { servidor: alvo.id, canal: canal.id }).catch(() => []);
+    const chaveReal = vista.chave;
+    vista.chave = 'ninguem';
+    marcaDaVista = { onde: `${alvo.id}/${canal.id}`, antes: msgs[29].ts_ms };
+    desenhado.onde = null;
+    janelaComFoco = false;
+    await desenharMensagens();
+    await new Promise(r => requestAnimationFrame(r));
+    const linha = stream.querySelector('.novas-aqui');
+    const rs = stream.getBoundingClientRect();
+    const rl = linha ? linha.getBoundingClientRect() : null;
+    const centro = rl ? (rl.top + rl.height / 2 - rs.top) / rs.height : -1;
+    const centrada = centro >= 0.25 && centro <= 0.75;
+    const btn = $('#ir-ao-fim');
+    const botaoVisivel = !!btn && !btn.hidden;
+    const rotulo = btn ? btn.textContent : '';
+    const depoisDaLinha = linha ? [...stream.querySelectorAll('.msg')].filter(el => linha.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING).length : -1;
+    if (btn) btn.click();
+    await new Promise(r => requestAnimationFrame(r));
+    const escondidoDepois = !!btn && btn.hidden;
+    vista.chave = chaveReal;
+    marcaDaVista = { onde: null, antes: null };
+    diz(`ui stream novas: linha-existe=${!!linha} centro=${centro.toFixed(2)} centrada=${centrada}`
+      + ` botao-visivel=${botaoVisivel} rotulo="${rotulo}" depois-da-linha=${depoisDaLinha}`
+      + ` depois-do-clique-escondido=${escondidoDepois}`);
+
+    // #30: os separadores de dia, com mensagens fabricadas em tres dias.
+    const agora = Date.now();
+    const falsas = [];
+    for (let i = 0; i < 60; i++) {
+      const dia = i < 20 ? 15 : i < 40 ? 1 : 0;
+      falsas.push({ id: `f${i}`, autor: i % 2 ? 'x' : 'y', autor_nome: 'x', canal: 'canal-falso',
+        ts_ms: agora - dia * 86400000 - (60 - i) * 60000, texto: `falsa ${i}` });
+    }
+    janelaComFoco = false;
+    desenhado.onde = null;
+    await escreverMensagens(stream, falsas, alvo.id, 'canal-falso');
+    const separadores = [...stream.querySelectorAll('.daybreak')].map(d => d.textContent);
+    const comTitulo = stream.querySelectorAll('.msg[title]').length;
+    const contDepoisDeSeparador = stream.querySelectorAll('.daybreak + .msg--cont').length;
+    desenhado.onde = null;
+    janelaComFoco = guardadoFoco;
+    escolherCanal(canal.id);
+    await espera(400);
+    diz(`ui stream dia: separadores=${separadores.length} rotulos=${JSON.stringify(separadores)}`
+      + ` titulos=${comTitulo}/${falsas.length} continuacao-depois-de-separador=${contDepoisDeSeparador}`);
+  } catch (e) {
+    diz(`ui stream: REBENTOU ${e && e.message ? e.message : e}`);
   }
 
   // ---- O PAINEL DE REDE FORA DE UMA CHAMADA (#48, #49, #54) ----
