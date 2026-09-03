@@ -46,6 +46,24 @@ instalações existentes têm de descarregar o instalador novo à mão — e é 
 aviso de versão no protocolo (`Ola.versao`) existe: os pares dizem uns aos outros que há
 coisa mais nova.
 
+## A v0.23.0 muda o significado de `ApagarCanal` *(03/09/2026)*
+
+A Fase 8 transformou «apagar um canal» em «arquivar»: o canal sai da barra, o log fica, e um
+`CriarCanal` posterior com o MESMO id reabre-o. As duas versões reconstroem listas
+DIFERENTES do mesmo log:
+
+| Do mesmo log | ≤ v0.22.0 vê | ≥ v0.23.0 vê |
+|---|---|---|
+| Criar c1, Apagar c1 | sem c1 | c1 em «Arquivados», a ler-se |
+| Criar c1, Apagar c1, Criar c1 | **sem c1** | c1 aberto outra vez |
+
+Consequência prática: **as duas máquinas têm de estar na v0.23.0 antes de alguém arquivar ou
+reabrir um canal.** Uma instalação antiga não vê o canal reaberto — e as mensagens escritas lá
+depois não lhe aparecem em sítio nenhum, sem um aviso. O `peer-versao` já mostra a versão do
+outro lado na lista de membros; é por lá que se confirma antes de mexer.
+
+Não há migração e não é preciso: o log não muda, só a leitura dele.
+
 ## Retirar uma versão má *(30/08/2026)*
 
 ```bash
