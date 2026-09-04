@@ -190,6 +190,9 @@ fn verificar_fontes(raiz: &std::path::Path) -> Result<()> {
         "apps/desktop/src",
         "apps/instalador/src",
         "spikes/spike-common/src",
+        // E as ferramentas: uma delas lista nomes de bandeiras, e um nome novo que lá fosse
+        // parar sem passar por aqui escapava a esta classificacao toda.
+        "ferramentas",
     ];
     let mut ficheiros = 0usize;
     let mut desconhecidos: Vec<(String, String)> = Vec::new();
@@ -348,10 +351,15 @@ mod testes {
         std::fs::create_dir_all(&fundo).unwrap();
         std::fs::create_dir_all(raiz.join("apps/instalador/src")).unwrap();
         std::fs::create_dir_all(raiz.join("spikes/spike-common/src")).unwrap();
-        std::fs::write(fundo.join("x.rs"), "var(\"BRUMA_ESCONDIDA\")").unwrap();
+        std::fs::create_dir_all(raiz.join("ferramentas")).unwrap();
+        // O nome é montado em pedaços de propósito: este ficheiro é ele próprio varrido
+        // (a pasta `ferramentas` entrou na lista), e um `BRUMA_…` literal aqui seria um
+        // nome por classificar no código verdadeiro.
+        let inventado = concat!("BRUMA", "_ESCONDIDA");
+        std::fs::write(fundo.join("x.rs"), format!("var(\"{inventado}\")")).unwrap();
         let erro = verificar_fontes(&raiz).expect_err("o nome na subpasta tinha de ser visto");
         assert!(
-            erro.to_string().contains("BRUMA_ESCONDIDA"),
+            erro.to_string().contains(inventado),
             "a queixa tem de dizer o nome: {erro}"
         );
         let _ = std::fs::remove_dir_all(&raiz);
@@ -359,7 +367,7 @@ mod testes {
 
     /// E as fontes REAIS deste repositório passam — com a lista de hoje.
     ///
-    /// Corre sobre o código verdadeiro: se alguém acrescentar um `BRUMA_QUALQUER` sem o
+    /// Corre sobre o código verdadeiro: se alguém acrescentar uma bandeira nova sem a
     /// classificar, isto falha no `cargo test` antes sequer de chegar ao portão da release.
     #[test]
     fn as_fontes_reais_estao_classificadas() {

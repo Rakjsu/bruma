@@ -8087,6 +8087,7 @@ async function segundoCanalDeTexto(servidorId) {
   if (modo === null || modo === undefined) return;
 
   const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  const { medida, naoCorri, fim } = contadorDeMedidas(modo === '' ? 'par-anfitriao' : 'par-convidado', diz);
   const esperar = ms => new Promise(r => setTimeout(r, ms));
 
   try {
@@ -8116,6 +8117,10 @@ async function segundoCanalDeTexto(servidorId) {
       // As cinco ficaram AQUI, e a interface di-lo (#94): por confirmar, e saiu para ninguem.
       escolherCanal(texto.id);
       await esperar(600);
+      const porConfirmar = document.querySelectorAll('#stream .msg--por-confirmar').length;
+      medida('escreveu-antes-de-haver-convidado',
+        porConfirmar === 5 && saiuPara === 0,
+        `por-confirmar=${porConfirmar} saiu-para=${saiuPara}`);
       diz(`par ANFITRIAO entregas antes do convidado: por-confirmar=${document.querySelectorAll('#stream .msg--por-confirmar').length}`
         + ` saiu-para=${saiuPara} nota="${($('#composer-nota') || {}).textContent}"`);
 
@@ -8198,9 +8203,15 @@ async function segundoCanalDeTexto(servidorId) {
             quantas = todas.filter(m => /^depois do atraso /.test(m.texto || '')).length;
           }
         }
+        medida('recebeu-o-que-veio-depois-do-atraso',
+          quantas === 5,
+          `recebeu=${quantas} de 5 escritas depois de o canal se atrasar`);
         diz(`par CONVIDADO recebeu ${quantas}/5 mensagens escritas DEPOIS do atraso`);
       })();
 
+      medida('recebeu-o-que-se-escreveu-sem-ele',
+        msgs.length >= 5,
+        `recebeu=${msgs.length} de 5 escritas antes de ele existir`);
       diz(`par CONVIDADO recebeu ${msgs.length}/5 mensagens escritas antes de ele entrar`
         + (msgs.length ? ` (primeira: "${msgs[0].texto}", última: "${msgs[msgs.length - 1].texto}")` : ''));
     }
@@ -8376,6 +8387,9 @@ async function segundoCanalDeTexto(servidorId) {
         // E as bolhas que a interface DESENHOU, e nao so os numeros: um contador certo com
         // uma bolha que ninguem pintou nao serve para nada.
         const bolhasAgora = document.querySelectorAll('.bolha').length;
+        medida('abrir-a-conversa-poe-o-por-ler-a-zero',
+          porLerAntes >= 1 && depoisDeSoLer === porLerAntes && porLerDepois === 0 && antesDeMarcar >= 0,
+          `antes=${porLerAntes} so-ler=${depoisDeSoLer} depois-de-abrir=${porLerDepois}`);
         diz(`par nao lido: antes=${porLerAntes} so-ler-nao-mexeu=${depoisDeSoLer}`
           + ` depois-de-abrir=${porLerDepois}`
           + ` marca-devolveu-anterior=${antesDeMarcar >= 0} bolhas-no-ecra=${bolhasAgora}`);
@@ -8561,6 +8575,8 @@ async function segundoCanalDeTexto(servidorId) {
     }
   } catch (e) {
     diz(`par FALHOU: ${e}`);
+  } finally {
+    fim();
   }
 })();
 
@@ -8627,12 +8643,49 @@ $('#entendi-bandeja').onclick = () => {
 };
 $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
 
+/* A GRAMÁTICA DAS MEDIÇÕES (#64).
+ *
+ * As três medições deste projecto — `--medir-ui`, `--par`, `--autoteste` — imprimem ~180
+ * linhas de factos, e a expectativa sobre cada uma vive na cabeça de quem as lê. Ninguém
+ * reprova nada: `par CONVIDADO recebeu 3/5` imprime-se e a corrida dá-se por boa.
+ *
+ * Não se convertem as linhas que já existem — continuam a ser a PROVA, e é nelas que se
+ * percebe o que aconteceu. Acrescenta-se, ao lado, o VEREDICTO, numa gramática que uma
+ * ferramenta lê: `MEDIDA <nome> ok|mau (<detalhe>)` e `MEDIDA <nome> NAO CORRI (<razão>)`.
+ *
+ * E uma espinha, `MEDICAO <guião> INICIO` … `FIM`, porque o pior caso não é uma medição má:
+ * é o guião morrer a meio e o registo acabar sem que nada o diga. Sem a marca de fim, um
+ * portão que só procure palavras más dá verde a meio guião.
+ *
+ * O `=== true` é deliberado: uma expressão que rebente e devolva `undefined` conta como MAU.
+ */
+function contadorDeMedidas(guiao, diz) {
+  const contas = { ok: 0, mau: 0, naoCorri: 0 };
+  diz(`MEDICAO ${guiao} INICIO`);
+  return {
+    medida(nome, condicao, detalhe = '') {
+      const bom = condicao === true;
+      contas[bom ? 'ok' : 'mau'] += 1;
+      diz(`MEDIDA ${nome} ${bom ? 'ok' : 'mau'} (${detalhe})`);
+      return bom;
+    },
+    naoCorri(nome, razao) {
+      contas.naoCorri += 1;
+      diz(`MEDIDA ${nome} NAO CORRI (${razao})`);
+    },
+    fim() {
+      diz(`MEDICAO ${guiao} FIM ok=${contas.ok} mau=${contas.mau} nao-corri=${contas.naoCorri}`);
+    },
+  };
+}
+
 /* ---------- medir a interface, para se poder verificar sem olhos ----------- */
 
 (async () => {
   if (!window.__TAURI__) return;
   if (!(await invoke('medir_ui_pedido').catch(() => false))) return;
   const diz = linha => invoke('capacidades', { linha }).catch(() => {});
+  const { medida, naoCorri, fim } = contadorDeMedidas('ui', diz);
   await new Promise(r => setTimeout(r, 1200));
 
   const medir = sel => {
@@ -9134,6 +9187,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const doUltimo = await invoke('numero_de_seguranca', { peer: 'cc'.repeat(32) }).catch(() => '');
       $('#fechar-verificar').click();
       diz(`ui verificacao dois cliques: palavras=${naCaixa.length} e-do-ultimo=${naCaixa.join(' ') === doUltimo}`);
+      medida('numero-de-seguranca-nao-e-a-semente',
+        noDom.length === 6 && noDom.join(' ') === palavras && janela === false,
+        `palavras=${noDom.length} janela-de-6-nas-24=${janela}`);
       diz(`ui verificacao: palavras=${noDom.length} iguais-ao-comando=${noDom.join(' ') === palavras}`
           + ` so-letras=${noDom.every(w => /^[a-z]+$/.test(w))} frase-nao-e-semente=${/não é a tua semente/.test(texto)}`
           + ` janela-de-6-nas-24=${janela} outra-chave-difere=${outra !== palavras && outra.split(' ').length === 6}`
@@ -9489,7 +9545,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const alvo = (vista.servidores || [])[0];
       const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
       if (!alvo || !canal) {
-        diz('ui varias linhas: sem servidor/canal para medir');
+        naoCorri('varias-linhas', 'sem servidor/canal para medir');
       } else {
         const chave = { servidor: alvo.id, canal: canal.id };
         const tresLinhas = 'primeira' + String.fromCharCode(10)
@@ -9537,7 +9593,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const alvo = (vista.servidores || [])[0];
       const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
       if (!alvo || !canal) {
-        diz('ui ler com a janela atras: sem servidor/canal para medir');
+        naoCorri('ler-com-a-janela-atras', 'sem servidor/canal para medir');
       } else {
         const chave = { servidor: alvo.id, canal: canal.id };
         const guardado = janelaComFoco;
@@ -9720,7 +9776,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const alvo = (vista.servidores || [])[0];
       const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
       if (!alvo || !canal) {
-        diz('ui entregas: sem servidor/canal para medir');
+        naoCorri('entregas', 'sem servidor/canal para medir');
       } else {
         fecharDefinicoes();
         escolherServidor(alvo.id);
@@ -9768,6 +9824,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         modo = antes.modo; conversaAtual = antes.conv;
         vista.conversas = vista.conversas.filter(c => c.id !== 'conversa-entregas');
         s.membros = s.membros.filter(m => m.chave !== 'outro1');
+        medida('entrega-por-confirmar',
+          saiuPara === 0 && marcada === true && marcaVisivel === true && saiu === true && mesmoNo === true,
+          `saiu-para=${saiuPara} marcada=${marcada} prova-tira-a-marca=${saiu} mesmo-no=${mesmoNo}`);
         diz(`ui entregas: saiu-para=${saiuPara} marcada=${marcada} marca-visivel=${marcaVisivel}`
           + ` titulo-sem-ninguem-diz-nao-saiu=${/não saiu deste computador/.test(tituloSemNinguem)}`
           + ` nota-sem-ninguem=${/ninguém desta sala está ligado/.test(notaSemNinguem)}`
@@ -9792,7 +9851,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const A = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
       const B = alvo ? await segundoCanalDeTexto(alvo.id) : null;
       if (!alvo || !A || !B) {
-        diz('ui rascunho por destino: sem dois canais de texto para medir');
+        naoCorri('rascunho-por-destino', 'sem dois canais de texto para medir');
       } else {
         fecharDefinicoes();
         const entrada = $('#entrada');
@@ -9969,8 +10028,12 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         + ` menu-copiar-endereco=${copiar}`);
       // As recusas do Rust pelo caminho real: nada disto abre coisa nenhuma.
       const tenta = async url => { try { await invoke('abrir_ligacao', { url }); return 'ABRIU'; } catch (e) { return 'recusou'; } };
-      diz(`ui ligacao recusa: file=${await tenta('file:///C:/x')} javascript=${await tenta('javascript:1')}`
-        + ` espaco=${await tenta('https://a b')} ftp=${await tenta('ftp://x')}`);
+      const recusas = [await tenta('file:///C:/x'), await tenta('javascript:1'),
+        await tenta('https://a b'), await tenta('ftp://x')];
+      diz(`ui ligacao recusa: file=${recusas[0]} javascript=${recusas[1]}`
+        + ` espaco=${recusas[2]} ftp=${recusas[3]}`);
+      medida('so-se-abrem-enderecos-http', recusas.every(r => r === 'recusou'),
+        `file/javascript/espaco/ftp=${recusas.join(',')}`);
     } catch (e) {
       diz(`ui ligacoes: REBENTOU ${e && e.message ? e.message : e}`);
     }
@@ -9999,7 +10062,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual };
       const alvo = (vista.servidores || [])[0];
       if (!alvo) {
-        diz('ui arquivar canal: sem servidor para medir');
+        naoCorri('arquivar-canal', 'sem servidor para medir');
       } else {
         fecharDefinicoes();
         escolherServidor(alvo.id);
@@ -10047,6 +10110,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         await invoke('reabrir_canal', { servidor: alvo.id, canal: ef.id }).catch(e => diz(`ui reabrir FALHOU: ${e}`));
         await pausa(900);
         const sv2 = acha();
+        medida('canal-reaberto-limpa-a-faixa',
+          sv2.canais.some(c => c.id === ef.id) && !$('#stream .faixa-arquivado'),
+          `nos-canais=${sv2.canais.some(c => c.id === ef.id)} faixa=${!!$('#stream .faixa-arquivado')}`);
         diz(`ui canal reaberto: nos-canais=${sv2.canais.some(c => c.id === ef.id)}`
           + ` fora-dos-arquivados=${!(sv2.arquivados || []).some(c => c.id === ef.id)}`
           + ` composer-visivel=${!$('#composer').hidden}`
@@ -10118,6 +10184,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
         const pediuEmAmigos = ultimoMarcarPorFoco;
         modo = modoAntes; conversaAtual = convAntes;
         janelaComFoco = guardado;
+        medida('foco-da-por-lido',
+          !!pediu && pediu.onde === alvo.id + '/' + canal.id && intacto === true && !pediuEmAmigos,
+          `pediu=${!!pediu} intacto=${intacto} em-amigos=${!!pediuEmAmigos}`);
         diz(`ui foco da por lido: pediu=${!!pediu}`
           + ` onde-certo=${!!pediu && pediu.onde === alvo.id + '/' + canal.id}`
           + ` stream-intacto=${intacto} em-amigos-pediu=${!!pediuEmAmigos}`);
@@ -10150,6 +10219,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
           const pedidos = marcarPedidos.filter(p => p.marcar).map(p => nomeDe(p.onde));
           const mostraB = [...$('#stream').querySelectorAll('.msg p')].some(p => /no segundo canal/.test(p.textContent));
           janelaComFoco = guardado;
+          medida('dois-cliques-o-segundo-ganha',
+            canalAtual === b.id && mostraB === true && pedidos.length === 1 && pedidos[0] === 'B',
+            `canal-actual-e-B=${canalAtual === b.id} stream-mostra-B=${mostraB} pedidos=[${pedidos.join(',')}]`);
           diz(`ui dois cliques: onde=${nomeDe(marcaDaVista.onde)} pedidos-marcar=[${pedidos.join(',')}]`
             + ` chegadas-tarde=${chegadasTarde - tardeAntes} stream-mostra-B=${mostraB}`
             + ` canal-actual-e-B=${canalAtual === b.id}`);
@@ -10219,7 +10291,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       diz('ui bandeja: vou fechar pelo X');
       await pedirParaFechar();
       await pausa(600);
-      diz(`ui bandeja: sobrevivi visivel=${await jan.isVisible()}`);
+      const visivelDepoisDoX = await jan.isVisible();
+      diz(`ui bandeja: sobrevivi visivel=${visivelDepoisDoX}`);
+      medida('o-x-esconde-e-nao-mata', visivelDepoisDoX === false, `visivel=${visivelDepoisDoX}`);
       await invoke('mostrar_janela');
       await pausa(400);
       diz(`ui bandeja: voltou visivel=${await jan.isVisible()} foco=${document.hasFocus()}`);
@@ -10270,6 +10344,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       const via = await invoke('avisar_do_sistema', { titulo: 'Bruma', corpo: 'por onde saiu', destino })
         .catch(e => `ERRO ${e}`);
       diz(`ui aviso via: ${via}`);
+      medida('aviso-clicado-abre-o-destino',
+        enviou === true && !!chegou && chegou.servidor === destino.servidor && chegou.canal === destino.canal,
+        `enviou=${enviou} chegou=${!!chegou}`);
       diz(`ui aviso clicado (rust): enviou=${enviou} chegou=${!!chegou}`
         + ` destino-certo=${!!chegou && chegou.servidor === destino.servidor && chegou.canal === destino.canal}`
         + ` foco=${document.hasFocus()}`);
@@ -10311,7 +10388,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
     const pausa = ms => new Promise(r => setTimeout(r, ms));
     const primeiro = (vista.servidores || [])[0];
     if (!primeiro) {
-      diz('ui ligados na lista: sem servidor para medir');
+      naoCorri('ligados-na-lista', 'sem servidor para medir');
     } else {
       const antes = { modo, srv: servidorAtual, cnl: canalAtual, conv: conversaAtual };
       fecharDefinicoes();
@@ -10806,6 +10883,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
     await escreverMensagens(stream, [...msgs.slice(0, 30), falsa, ...msgs.slice(30)], alvo.id, canal.id);
     const recMeio = reconstrucoesDoStream - r2;
     desenhado.onde = null; await desenharMensagens(); await espera(200);
+    medida('stream-incremental',
+      nosNova === 1 && recNova === 0 && seleccao === true && recMeio === 1,
+      `nos-por-mensagem-nova=${nosNova} reconstrucoes=${recNova} seleccao=${seleccao} insercao-no-meio=${recMeio}`);
     diz(`ui stream incremental: msgs=${msgs.length} nos-por-mensagem-nova=${nosNova} reconstrucoes=${recNova}`
       + ` seleccao-sobrevive=${seleccao} animacoes-a-correr=${animacoes}`
       + ` nos-ao-trocar=${nosAoTrocar} (msgs=${msgs.length}) reconstrucoes-ao-trocar=${recAoTrocar}`
@@ -10886,7 +10966,7 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
     const alvo = (vista.servidores || [])[0];
     const canal = alvo && (alvo.canais || []).find(c => c.tipo === 'texto');
     if (!alvo || !canal) {
-      diz('ui rajada: sem servidor/canal de texto para medir');
+      naoCorri('rajada', 'sem servidor/canal de texto para medir');
     } else {
       const pausa = ms => new Promise(r => setTimeout(r, ms));
       fecharDefinicoes();
@@ -10948,6 +11028,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       avisosMostrados.delete(alvo.id);
       document.querySelectorAll('.aviso-sistema').forEach(n => n.remove());
 
+      medida('uma-rajada-um-redesenho',
+        chegaram >= 20 && aFrenteDesenhos === 1 && outroDesenhos === 0,
+        `eventos=${chegaram} desenhos=${aFrenteDesenhos} noutro-servidor=${outroDesenhos}`);
       diz(`ui rajada: via=${via} eventos=${chegaram} desenhos-completos=${aFrenteDesenhos}`
         + ` refrescos=${aFrenteRefrescos}`
         + ` outro-servidor: desenhos=${outroDesenhos} refrescos=${outroRefrescos}`
@@ -10967,6 +11050,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
     const c1 = await invoke('contadores').catch(() => null);
     await invoke('criar_servidor', { nome: 'medir provados' }).catch(() => null);
     const c2 = await invoke('contadores').catch(() => null);
+    medida('arranque-nao-decifra-nada',
+      !!c0 && c0.decifragens === 0 && !!c1 && !!c2 && c2.decifragens - c1.decifragens === 0,
+      `antes-da-primeira-vista=${c0 ? c0.decifragens : 'n/a'} ao-criar-servidor=${c1 && c2 ? c2.decifragens - c1.decifragens : 'n/a'}`);
     diz(`ui arranque: ms-ate-script=${rel(arranque.script)} ms-ate-casca=${rel(arranque.casca)}`
       + ` ms-ate-poder-escrever=${rel(arranque.escrever)}`
       + ` ate-setup=${t ? t.ate_setup_ms : 'n/a'} nucleo=${t ? t.nucleo_ms : 'n/a'} rede=${t ? t.rede_ms : 'n/a'}`
@@ -11442,4 +11528,9 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
   } catch (e) {
     diz(`ui folga: REBENTOU ${e && e.message ? e.message : e}`);
   }
+
+  // A MARCA DE FIM (#64). Se o guião morrer antes daqui — um `throw` fora de um `try`, a
+  // janela a fechar-se, o processo morto pelo prazo — esta linha não sai, e é assim que o
+  // portão distingue «acabou» de «parou a meio».
+  fim();
 })();

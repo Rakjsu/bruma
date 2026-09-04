@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ferramentas/verificar-assinatura", "ferramentas/so-o-que-vai-na-release", "ferramentas/sonda-do-porteiro", "apps/desktop", "spikes/spike-common", "spikes/spike1-net", "spikes/spike2-screen", "spikes/spike3-ghost", "spikes/spike4-captura", "apps/instalador"]
+members = ["ferramentas/verificar-assinatura", "ferramentas/so-o-que-vai-na-release", "ferramentas/o-que-falhou", "ferramentas/sonda-do-porteiro", "apps/desktop", "spikes/spike-common", "spikes/spike1-net", "spikes/spike2-screen", "spikes/spike3-ghost", "spikes/spike4-captura", "apps/instalador"]
 
 [workspace.package]
 edition = "2021"
