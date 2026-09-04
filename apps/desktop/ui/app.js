@@ -8666,6 +8666,12 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
   const caixaF = document.querySelector('.caixa--fontes');
   const grelha = document.querySelector('.fontes');
   const cartoes = document.querySelectorAll('.fonte');
+  // O SELETOR DE FONTES NÃO PODE LEVAR O GUIÃO INTEIRO COM ELE (#72).
+  //
+  // Este `if` embrulhava 96 das 147 medições: uma janela de fontes que não abrisse —
+  // um seletor lento, uma WebView2 diferente, um ecrã que o `escolherFonte` não apanha
+  // — e o guião imprimia «NAO ABRIU» e saltava a interface toda, sem que nada
+  // distinguisse isso de uma corrida boa. Cá dentro ficam só as medições DO SELETOR.
   if (caixaF && grelha) {
     const colunas = getComputedStyle(grelha).gridTemplateColumns.split(' ').length;
     const c1 = cartoes[0] ? cartoes[0].getBoundingClientRect() : null;
@@ -8699,6 +8705,14 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
       diz(`ui sub ${nome}: ${document.querySelectorAll('#sub-' + nome + ' .menu-trans__opcao').length} opções`
         + ` abre=${aberto} fecha=${fechado}`);
     }
+  } else {
+    diz('ui seletor: NAO ABRIU');
+  }
+
+  // O resto do guião, que não depende do seletor para nada. Fica num bloco só para
+  // manter o ÂMBITO que o `if` dava: as secções aqui dentro reutilizam nomes (`antes`,
+  // `alvo`, `pausa`) e sem um bloco colidiam umas com as outras.
+  {
     // ---- o palco da transmissão ------------------------------------------------
     //
     // Mede-se com estado FABRICADO: finge-se uma sala com duas pessoas, uma a transmitir,
@@ -10289,8 +10303,6 @@ $('#sair-mesmo').onclick = () => invoke('sair').catch(() => {});
 
     document.querySelector('[data-modo="pers"]').click();
     $('#btn-qualidade').click();
-  } else {
-    diz('ui seletor: NAO ABRIU');
   }
   fechar('veu-fontes');
 
